@@ -1,0 +1,35 @@
+# Local git hooks for amber. Install: `lefthook install` (after `go install
+# github.com/evilmartians/lefthook@latest`). Mirrors what CI runs so issues
+# are caught before push.
+
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: |
+        unformatted=$(gofmt -l {staged_files})
+        if [ -n "$unformatted" ]; then
+          echo "gofmt: not formatted:"
+          echo "$unformatted"
+          echo "run: gofmt -w {staged_files}"
+          exit 1
+        fi
+    govet:
+      glob: "*.go"
+      run: go vet ./...
+    tidy:
+      glob: "{go.mod,go.sum}"
+      run: |
+        go mod tidy
+        if ! git diff --quiet go.mod go.sum; then
+          echo "go.mod/go.sum not tidy; commit the result of go mod tidy"
+          exit 1
+        fi
+
+pre-push:
+  commands:
+    golangci-lint:
+      run: golangci-lint run --timeout=5m
+    test:
+      run: go test ./... -race -count=1 -timeout=10m

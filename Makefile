@@ -1,4 +1,4 @@
-.PHONY: build test bench lint fmt tidy clean run docker docker-run
+.PHONY: build test bench lint fmt tidy clean run docker docker-run hooks
 
 BINARY := amber
 BUILD_FLAGS := -ldflags="-s -w"
@@ -35,3 +35,7 @@ docker:
 
 docker-run:
 	docker run -p 8080:8080 -p 4317:4317 -v amber-data:/data amber:latest
+
+hooks:
+	@which lefthook >/dev/null 2>&1 || go install github.com/evilmartians/lefthook@latest
+	lefthook install
