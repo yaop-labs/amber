@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -17,6 +19,11 @@ const (
 	walFileName = "amber.wal"
 
 	walHeaderSize = 12
+
+	// maxWALRecordBytes caps the per-record payload size accepted by Replay.
+	// Guards against OOM on a corrupt WAL whose length field decodes to garbage
+	// before we have a chance to verify the CRC.
+	maxWALRecordBytes = 64 << 20
 )
 
 var (
@@ -30,10 +37,26 @@ type WALRecord struct {
 }
 
 type WAL struct {
-	mu   sync.Mutex
-	file *os.File
-	buf  *bufio.Writer
-	path string
+	mu           sync.Mutex
+	file         *os.File
+	buf          *bufio.Writer
+	path         string
+	log          *slog.Logger
+	corruptCount atomic.Uint64
+}
+
+// SetLogger attaches a logger used to surface WAL replay corruption events.
+// Safe to call once after construction; not safe for concurrent use with replay.
+func (w *WAL) SetLogger(log *slog.Logger) {
+	if log != nil {
+		w.log = log
+	}
+}
+
+// CorruptRecords returns the number of malformed records observed during the
+// most recent (or any prior) Replay. Useful for surfacing as a metric.
+func (w *WAL) CorruptRecords() uint64 {
+	return w.corruptCount.Load()
 }
 
 func OpenWAL(dir string) (*WAL, error) {
@@ -51,6 +74,7 @@ func OpenWAL(dir string) (*WAL, error) {
 		file: f,
 		buf:  bufio.NewWriterSize(f, 64*1024),
 		path: path,
+		log:  slog.Default(),
 	}, nil
 }
 
@@ -137,11 +161,20 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 
 		magic := binary.LittleEndian.Uint32(header[0:4])
 		if magic != walMagic {
+			w.corruptCount.Add(1)
+			w.log.Warn("wal: bad magic, stopping replay", "offset_records", count)
 			break
 		}
 
 		expectedCRC := binary.LittleEndian.Uint32(header[4:8])
 		length := binary.LittleEndian.Uint32(header[8:12])
+
+		if length > maxWALRecordBytes {
+			w.corruptCount.Add(1)
+			w.log.Warn("wal: record length exceeds cap, stopping replay",
+				"length", length, "cap", uint32(maxWALRecordBytes), "offset_records", count)
+			break
+		}
 
 		payload := make([]byte, length)
 		_, err = io.ReadFull(r, payload)
@@ -154,6 +187,8 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 
 		actualCRC := crc32.ChecksumIEEE(payload)
 		if actualCRC != expectedCRC {
+			w.corruptCount.Add(1)
+			w.log.Warn("wal: crc mismatch, stopping replay", "offset_records", count)
 			break
 		}
 
