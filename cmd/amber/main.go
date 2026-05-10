@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -140,21 +140,40 @@ func run() error {
 		}()
 	}
 
-	go func() {
-		log.Info("pprof listening", "addr", "localhost:6060")
+	if cfg.Debug.Pprof {
+		pprofAddr := cfg.Debug.PprofAddr
+		if pprofAddr == "" {
+			pprofAddr = "localhost:6060"
+		}
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		pprofServer := &http.Server{
-			Addr:              "localhost:6060",
+			Addr:              pprofAddr,
+			Handler:           pprofMux,
 			ReadHeaderTimeout: 5 * time.Second,
 		}
-		if err := pprofServer.ListenAndServe(); err != nil {
-			log.Error("pprof server error", "err", err)
-		}
-	}()
+		go func() {
+			log.Info("pprof listening", "addr", pprofAddr)
+			if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("pprof server error", "err", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = pprofServer.Shutdown(shutdownCtx)
+		}()
+	}
 
 	mux := http.NewServeMux()
 	amberhttp.RegisterRoutes(mux, batcher, exec, logManager, logSparse, cfg.API.APIKey, log)
 
-	httpServer := amberhttp.NewServer(cfg.API.HTTPAddr, mux, cfg.API.ReadTimeout, cfg.API.WriteTimeout, log)
+	httpServer := amberhttp.NewServer(cfg.API.HTTPAddr, mux, cfg.API.ReadTimeout, cfg.API.ReadHeaderTimeout, cfg.API.WriteTimeout, cfg.API.IdleTimeout, log)
 	httpServer.Start()
 
 	<-ctx.Done()
@@ -167,7 +186,20 @@ func run() error {
 		log.Error("http server shutdown error", "err", err)
 	}
 
-	batcher.Wait()
+	batcherTimeout := cfg.Ingest.ShutdownTimeout
+	if batcherTimeout <= 0 {
+		batcherTimeout = 30 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		batcher.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(batcherTimeout):
+		log.Error("batcher shutdown timed out, abandoning in-flight items", "timeout", batcherTimeout)
+	}
 
 	if err := logSparse.Save(logDir); err != nil {
 		log.Error("failed to save log sparse index", "err", err)

@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -12,9 +13,15 @@ func APIKeyMiddleware(apiKey string, next http.Handler) http.Handler {
 	if apiKey == "" {
 		return next
 	}
+	expected := []byte(apiKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != apiKey {
+		if !strings.HasPrefix(auth, "Bearer ") {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		got := []byte(auth[len("Bearer "):])
+		if subtle.ConstantTimeCompare(got, expected) != 1 {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}

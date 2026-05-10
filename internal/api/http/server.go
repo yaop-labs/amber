@@ -13,13 +13,15 @@ type Server struct {
 	log    *slog.Logger
 }
 
-func NewServer(addr string, handler http.Handler, readTimeout, writeTimeout time.Duration, log *slog.Logger) *Server {
+func NewServer(addr string, handler http.Handler, readTimeout, readHeaderTimeout, writeTimeout, idleTimeout time.Duration, log *slog.Logger) *Server {
 	return &Server{
 		server: &http.Server{
-			Addr:         addr,
-			Handler:      handler,
-			ReadTimeout:  readTimeout,
-			WriteTimeout: writeTimeout,
+			Addr:              addr,
+			Handler:           handler,
+			ReadTimeout:       readTimeout,
+			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
 		},
 		log: log,
 	}
