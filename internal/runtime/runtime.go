@@ -182,24 +182,45 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	}, nil
 }
 
-// Close drains the batcher (caller must cancel ctx first), saves sparse
-// indexes, and closes both segment managers. Returns the first error
-// encountered but always attempts every step.
-func (s *Stack) Close() error {
-	s.Batcher.Wait()
+// Close drains the batcher and shuts down storage under ctx's deadline.
+// Callers MUST cancel the parent context that fed New() before calling
+// Close, so the batcher's run goroutine is already winding down. If ctx
+// expires before drain or filesystem ops complete, Close returns ctx.Err();
+// background goroutines may still be running against frozen disks, but the
+// process can exit. Aggregates all encountered errors via errors.Join.
+func (s *Stack) Close(ctx context.Context) error {
+	waitDone := make(chan struct{})
+	go func() {
+		s.Batcher.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		return fmt.Errorf("runtime: batcher drain: %w", ctx.Err())
+	}
 
-	var firstErr error
-	if err := s.LogSparse.Save(s.LogDir); err != nil {
-		firstErr = fmt.Errorf("runtime: save log sparse: %w", err)
+	closeDone := make(chan error, 1)
+	go func() {
+		var errs []error
+		if err := s.LogSparse.Save(s.LogDir); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: save log sparse: %w", err))
+		}
+		if err := s.SpanSparse.Save(s.SpanDir); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: save span sparse: %w", err))
+		}
+		if err := s.LogManager.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close log manager: %w", err))
+		}
+		if err := s.SpanManager.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close span manager: %w", err))
+		}
+		closeDone <- errors.Join(errs...)
+	}()
+	select {
+	case err := <-closeDone:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("runtime: shutdown: %w", ctx.Err())
 	}
-	if err := s.SpanSparse.Save(s.SpanDir); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("runtime: save span sparse: %w", err)
-	}
-	if err := s.LogManager.Close(); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("runtime: close log manager: %w", err)
-	}
-	if err := s.SpanManager.Close(); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("runtime: close span manager: %w", err)
-	}
-	return firstErr
 }
