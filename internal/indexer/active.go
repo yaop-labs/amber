@@ -14,15 +14,21 @@ import (
 	"github.com/hnlbs/amber/internal/storage"
 )
 
+// kindSlot pairs an in-memory bitmap with the segment filename it indexes;
+// when the manager rotates to a new active segment, the slot's name diverges
+// from the manager's and the bitmap is replaced lazily on next ensure().
+type kindSlot struct {
+	bitmap *index.MultiFieldIndex
+	name   string
+}
+
 type ActiveIndex struct {
 	logManager  *storage.SegmentManager
 	spanManager *storage.SegmentManager
 
-	mu         sync.RWMutex
-	logBitmap  *index.MultiFieldIndex
-	logName    string
-	spanBitmap *index.MultiFieldIndex
-	spanName   string
+	mu   sync.RWMutex
+	log  kindSlot
+	span kindSlot
 }
 
 func New(logManager, spanManager *storage.SegmentManager) *ActiveIndex {
@@ -32,72 +38,57 @@ func New(logManager, spanManager *storage.SegmentManager) *ActiveIndex {
 	}
 }
 
-// LookupLog returns the active bitmap if name matches the currently active
-// log segment. Read-side fall-through for queries hitting unsealed segments.
-func (a *ActiveIndex) LookupLog(name string) (*index.MultiFieldIndex, bool) {
+// lookup returns the bitmap if it indexes the given segment name. Read-side
+// fall-through for queries hitting an unsealed segment.
+func (a *ActiveIndex) lookup(slot *kindSlot, name string) (*index.MultiFieldIndex, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.logName == name && a.logBitmap != nil {
-		return a.logBitmap, true
+	if slot.name == name && slot.bitmap != nil {
+		return slot.bitmap, true
 	}
 	return nil, false
+}
+
+// ensure returns the slot's bitmap, lazily rotating to a fresh one when the
+// manager has moved to a new active segment.
+func (a *ActiveIndex) ensure(mgr *storage.SegmentManager, slot *kindSlot) *index.MultiFieldIndex {
+	activeMeta, ok := mgr.ActiveSegmentMeta()
+	if !ok {
+		return nil
+	}
+	a.mu.RLock()
+	if slot.name == activeMeta.FileName && slot.bitmap != nil {
+		idx := slot.bitmap
+		a.mu.RUnlock()
+		return idx
+	}
+	a.mu.RUnlock()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if slot.name == activeMeta.FileName && slot.bitmap != nil {
+		return slot.bitmap
+	}
+	fresh := index.NewMultiFieldIndex()
+	slot.bitmap = fresh
+	slot.name = activeMeta.FileName
+	return fresh
+}
+
+func (a *ActiveIndex) LookupLog(name string) (*index.MultiFieldIndex, bool) {
+	return a.lookup(&a.log, name)
 }
 
 func (a *ActiveIndex) LookupSpan(name string) (*index.MultiFieldIndex, bool) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.spanName == name && a.spanBitmap != nil {
-		return a.spanBitmap, true
-	}
-	return nil, false
+	return a.lookup(&a.span, name)
 }
 
 func (a *ActiveIndex) activeLog() *index.MultiFieldIndex {
-	activeMeta, ok := a.logManager.ActiveSegmentMeta()
-	if !ok {
-		return nil
-	}
-	a.mu.RLock()
-	if a.logName == activeMeta.FileName && a.logBitmap != nil {
-		idx := a.logBitmap
-		a.mu.RUnlock()
-		return idx
-	}
-	a.mu.RUnlock()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.logName == activeMeta.FileName && a.logBitmap != nil {
-		return a.logBitmap
-	}
-	fresh := index.NewMultiFieldIndex()
-	a.logBitmap = fresh
-	a.logName = activeMeta.FileName
-	return fresh
+	return a.ensure(a.logManager, &a.log)
 }
 
 func (a *ActiveIndex) activeSpan() *index.MultiFieldIndex {
-	activeMeta, ok := a.spanManager.ActiveSegmentMeta()
-	if !ok {
-		return nil
-	}
-	a.mu.RLock()
-	if a.spanName == activeMeta.FileName && a.spanBitmap != nil {
-		idx := a.spanBitmap
-		a.mu.RUnlock()
-		return idx
-	}
-	a.mu.RUnlock()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.spanName == activeMeta.FileName && a.spanBitmap != nil {
-		return a.spanBitmap
-	}
-	fresh := index.NewMultiFieldIndex()
-	a.spanBitmap = fresh
-	a.spanName = activeMeta.FileName
-	return fresh
+	return a.ensure(a.spanManager, &a.span)
 }
 
 func (a *ActiveIndex) IndexLogEntry(entry model.LogEntry) {
