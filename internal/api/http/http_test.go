@@ -200,7 +200,7 @@ func TestParseLogQuery_InvalidLimit(t *testing.T) {
 }
 
 func TestIngestHandler_EmptyArray(t *testing.T) {
-	h := &IngestHandler{batcher: nil, log: nil}
+	h := &IngestHandler{batcher: &ingest.Batcher{}, log: nil}
 	req := httptest.NewRequest("POST", "/api/v1/logs", strings.NewReader("[]"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -211,7 +211,7 @@ func TestIngestHandler_EmptyArray(t *testing.T) {
 }
 
 func TestIngestHandler_InvalidJSON(t *testing.T) {
-	h := &IngestHandler{batcher: nil, log: nil}
+	h := &IngestHandler{batcher: &ingest.Batcher{}, log: nil}
 	req := httptest.NewRequest("POST", "/api/v1/logs", strings.NewReader("{invalid"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -237,7 +237,7 @@ func TestIngestHandler_Returns503WhenQueueIsFull(t *testing.T) {
 	}
 	defer spanManager.Close()
 
-	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, log)
+	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, 0, log)
 	h := NewIngestHandler(batcher, log)
 
 	req := httptest.NewRequest("POST", "/api/v1/logs", strings.NewReader(`[
@@ -276,7 +276,7 @@ func TestBatcher_SendLogReturnsQueueFull(t *testing.T) {
 	}
 	defer spanManager.Close()
 
-	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, log)
+	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, 0, log)
 	entry1, _ := model.NewLogEntry(model.LevelInfo, "a", "", "one")
 	entry2, _ := model.NewLogEntry(model.LevelInfo, "b", "", "two")
 

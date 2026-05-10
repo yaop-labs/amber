@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hnlbs/amber/internal/index"
@@ -19,19 +20,24 @@ type item struct {
 	span *model.SpanEntry
 }
 
-var ErrQueueFull = errors.New("ingest queue full")
+var (
+	ErrQueueFull   = errors.New("ingest queue full")
+	ErrBreakerOpen = errors.New("ingest circuit breaker open")
+)
 
 type Batcher struct {
-	logManager   *storage.SegmentManager
-	spanManager  *storage.SegmentManager
-	logSparse    *index.SparseIndex
-	spanSparse   *index.SparseIndex
-	indexer      ActiveIndexer
-	batchSize    int
-	batchTimeout time.Duration
-	queue        chan item
-	log          *slog.Logger
-	wg           sync.WaitGroup
+	logManager       *storage.SegmentManager
+	spanManager      *storage.SegmentManager
+	logSparse        *index.SparseIndex
+	spanSparse       *index.SparseIndex
+	indexer          ActiveIndexer
+	batchSize        int
+	batchTimeout     time.Duration
+	queue            chan item
+	log              *slog.Logger
+	wg               sync.WaitGroup
+	breakerThreshold uint64
+	consecFailures   atomic.Uint64
 }
 
 func NewBatcher(
@@ -43,19 +49,29 @@ func NewBatcher(
 	batchSize int,
 	batchTimeout time.Duration,
 	queueSize int,
+	breakerThreshold int,
 	log *slog.Logger,
 ) *Batcher {
-	return &Batcher{
-		logManager:   logManager,
-		spanManager:  spanManager,
-		logSparse:    logSparse,
-		spanSparse:   spanSparse,
-		indexer:      indexer,
-		batchSize:    batchSize,
-		batchTimeout: batchTimeout,
-		queue:        make(chan item, queueSize),
-		log:          log,
+	var threshold uint64
+	if breakerThreshold > 0 {
+		threshold = uint64(breakerThreshold)
 	}
+	return &Batcher{
+		logManager:       logManager,
+		spanManager:      spanManager,
+		logSparse:        logSparse,
+		spanSparse:       spanSparse,
+		indexer:          indexer,
+		batchSize:        batchSize,
+		batchTimeout:     batchTimeout,
+		queue:            make(chan item, queueSize),
+		log:              log,
+		breakerThreshold: threshold,
+	}
+}
+
+func (b *Batcher) IsBreakerOpen() bool {
+	return b.breakerThreshold > 0 && b.consecFailures.Load() >= b.breakerThreshold
 }
 
 func (b *Batcher) Start(ctx context.Context) {
@@ -68,6 +84,10 @@ func (b *Batcher) Wait() {
 }
 
 func (b *Batcher) SendLog(entry model.LogEntry) error {
+	if b.IsBreakerOpen() {
+		metrics.IngestDropped.WithLabelValues("log", "breaker_open").Inc()
+		return ErrBreakerOpen
+	}
 	select {
 	case b.queue <- item{log: &entry}:
 		return nil
@@ -82,6 +102,10 @@ func (b *Batcher) SendLog(entry model.LogEntry) error {
 }
 
 func (b *Batcher) SendSpan(span model.SpanEntry) error {
+	if b.IsBreakerOpen() {
+		metrics.IngestDropped.WithLabelValues("span", "breaker_open").Inc()
+		return ErrBreakerOpen
+	}
 	select {
 	case b.queue <- item{span: &span}:
 		return nil
@@ -210,8 +234,12 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 		}
 	}
 
+	anyAttempted := len(logItems) > 0 || len(spanItems) > 0
+	anyFailed := false
+
 	if len(logItems) > 0 {
 		if err := b.logManager.WriteBatch(logItems); err != nil {
+			anyFailed = true
 			metrics.IngestDropped.WithLabelValues("log", "write_failed").Add(float64(len(logItems)))
 			b.log.Error("log batch write failed", "err", err, "count", len(logItems))
 		} else {
@@ -228,6 +256,7 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 
 	if len(spanItems) > 0 {
 		if err := b.spanManager.WriteBatch(spanItems); err != nil {
+			anyFailed = true
 			metrics.IngestDropped.WithLabelValues("span", "write_failed").Add(float64(len(spanItems)))
 			b.log.Error("span batch write failed", "err", err, "count", len(spanItems))
 		} else {
@@ -240,6 +269,18 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 				b.log.Warn("span segment flush failed", "err", err)
 			}
 		}
+	}
+
+	if !anyAttempted {
+		return
+	}
+	if anyFailed {
+		n := b.consecFailures.Add(1)
+		if b.breakerThreshold > 0 && n == b.breakerThreshold {
+			b.log.Error("ingest breaker tripped", "consecutive_failures", n)
+		}
+	} else if b.consecFailures.Swap(0) >= b.breakerThreshold && b.breakerThreshold > 0 {
+		b.log.Info("ingest breaker reset")
 	}
 }
 

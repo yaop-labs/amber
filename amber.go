@@ -47,6 +47,7 @@ type Options struct {
 	BatchSize         int
 	BatchTimeout      time.Duration
 	QueueSize         int
+	BreakerThreshold  int
 	IndexCacheSize    int
 	Logger            *slog.Logger
 }
@@ -71,6 +72,9 @@ func (o *Options) withDefaults() Options {
 	}
 	if out.QueueSize == 0 {
 		out.QueueSize = 10_000
+	}
+	if out.BreakerThreshold == 0 {
+		out.BreakerThreshold = 10
 	}
 	if out.Logger == nil {
 		out.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -152,6 +156,7 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 		cfg.BatchSize,
 		cfg.BatchTimeout,
 		cfg.QueueSize,
+		cfg.BreakerThreshold,
 		log,
 	)
 	batcher.Start(ctx)

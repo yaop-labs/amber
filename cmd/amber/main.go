@@ -107,12 +107,19 @@ func run() error {
 		cfg.Ingest.BatchSize,
 		cfg.Ingest.BatchTimeout,
 		cfg.Ingest.QueueSize,
+		cfg.Ingest.BreakerThreshold,
 		log,
 	)
 	batcher.Start(ctx)
 
 	metrics.RegisterGaugeFunc("amber_ingest_queue_length", "Items currently buffered in the ingest queue.", func() float64 {
 		return float64(batcher.QueueLen())
+	})
+	metrics.RegisterGaugeFunc("amber_ingest_breaker_open", "1 if the ingest circuit breaker is currently open.", func() float64 {
+		if batcher.IsBreakerOpen() {
+			return 1
+		}
+		return 0
 	})
 	metrics.RegisterGaugeFunc("amber_segments_total", "Number of segments tracked by a manager.", func() float64 {
 		return float64(logManager.SegmentCount() + spanManager.SegmentCount())

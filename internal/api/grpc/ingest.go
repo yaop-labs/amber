@@ -7,6 +7,8 @@ import (
 
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/hnlbs/amber/internal/ingest"
 )
@@ -18,6 +20,9 @@ type logsServer struct {
 }
 
 func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsServiceRequest) (*collectorlogs.ExportLogsServiceResponse, error) {
+	if s.batcher.IsBreakerOpen() {
+		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
+	}
 	var rejected int64
 	var firstErr error
 	for _, rl := range req.ResourceLogs {
@@ -53,6 +58,9 @@ type tracesServer struct {
 }
 
 func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
+	if s.batcher.IsBreakerOpen() {
+		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
+	}
 	var rejected int64
 	var firstErr error
 	for _, rs := range req.ResourceSpans {
