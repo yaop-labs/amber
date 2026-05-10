@@ -147,18 +147,19 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	batcher := ingest.NewBatcher(
-		logManager,
-		spanManager,
-		logSparse,
-		spanSparse,
-		exec,
-		cfg.BatchSize,
-		cfg.BatchTimeout,
-		cfg.QueueSize,
-		cfg.BreakerThreshold,
-		log,
-	)
+	batcher := ingest.NewBatcher(ingest.Deps{
+		LogManager:  logManager,
+		SpanManager: spanManager,
+		LogSparse:   logSparse,
+		SpanSparse:  spanSparse,
+		Indexer:     exec,
+		Logger:      log,
+	}, ingest.Config{
+		BatchSize:        cfg.BatchSize,
+		BatchTimeout:     cfg.BatchTimeout,
+		QueueSize:        cfg.QueueSize,
+		BreakerThreshold: cfg.BreakerThreshold,
+	})
 	batcher.Start(ctx)
 
 	return &DB{

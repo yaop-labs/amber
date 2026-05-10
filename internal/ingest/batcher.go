@@ -44,32 +44,37 @@ type Batcher struct {
 
 func (b *Batcher) SetCardinalityGuard(g *CardinalityGuard) { b.guard = g }
 
-func NewBatcher(
-	logManager *storage.SegmentManager,
-	spanManager *storage.SegmentManager,
-	logSparse *index.SparseIndex,
-	spanSparse *index.SparseIndex,
-	indexer ActiveIndexer,
-	batchSize int,
-	batchTimeout time.Duration,
-	queueSize int,
-	breakerThreshold int,
-	log *slog.Logger,
-) *Batcher {
+type Deps struct {
+	LogManager  *storage.SegmentManager
+	SpanManager *storage.SegmentManager
+	LogSparse   *index.SparseIndex
+	SpanSparse  *index.SparseIndex
+	Indexer     ActiveIndexer
+	Logger      *slog.Logger
+}
+
+type Config struct {
+	BatchSize        int
+	BatchTimeout     time.Duration
+	QueueSize        int
+	BreakerThreshold int
+}
+
+func NewBatcher(deps Deps, cfg Config) *Batcher {
 	var threshold uint64
-	if breakerThreshold > 0 {
-		threshold = uint64(breakerThreshold)
+	if cfg.BreakerThreshold > 0 {
+		threshold = uint64(cfg.BreakerThreshold)
 	}
 	return &Batcher{
-		logManager:       logManager,
-		spanManager:      spanManager,
-		logSparse:        logSparse,
-		spanSparse:       spanSparse,
-		indexer:          indexer,
-		batchSize:        batchSize,
-		batchTimeout:     batchTimeout,
-		queue:            make(chan item, queueSize),
-		log:              log,
+		logManager:       deps.LogManager,
+		spanManager:      deps.SpanManager,
+		logSparse:        deps.LogSparse,
+		spanSparse:       deps.SpanSparse,
+		indexer:          deps.Indexer,
+		batchSize:        cfg.BatchSize,
+		batchTimeout:     cfg.BatchTimeout,
+		queue:            make(chan item, cfg.QueueSize),
+		log:              deps.Logger,
 		breakerThreshold: threshold,
 	}
 }

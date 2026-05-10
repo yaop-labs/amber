@@ -119,7 +119,7 @@ func BenchmarkIngestLog_Parallel(b *testing.B) {
 	spanSparse := index.NewSparseIndex()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	batcher := ingest.NewBatcher(logManager, spanManager, sparse, spanSparse, nil, 500, 50*time.Millisecond, 10000, 0, log)
+	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: sparse, SpanSparse: spanSparse, Logger: log}, ingest.Config{BatchSize: 500, BatchTimeout: 50 * time.Millisecond, QueueSize: 10000})
 	batcher.Start(ctx)
 
 	b.ResetTimer()
@@ -235,7 +235,7 @@ func BenchmarkIngestLog_Parallel_Indexed(b *testing.B) {
 	exec := query.NewExecutor(logManager, spanManager, sparse, spanSparse)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	batcher := ingest.NewBatcher(logManager, spanManager, sparse, spanSparse, exec, 500, 50*time.Millisecond, 10000, 0, log)
+	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: sparse, SpanSparse: spanSparse, Indexer: exec, Logger: log}, ingest.Config{BatchSize: 500, BatchTimeout: 50 * time.Millisecond, QueueSize: 10000})
 	batcher.Start(ctx)
 
 	b.ResetTimer()

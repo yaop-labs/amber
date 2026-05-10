@@ -98,18 +98,19 @@ func run() error {
 		log.Info("sealed indexes loaded")
 	}()
 
-	batcher := ingest.NewBatcher(
-		logManager,
-		spanManager,
-		logSparse,
-		spanSparse,
-		exec,
-		cfg.Ingest.BatchSize,
-		cfg.Ingest.BatchTimeout,
-		cfg.Ingest.QueueSize,
-		cfg.Ingest.BreakerThreshold,
-		log,
-	)
+	batcher := ingest.NewBatcher(ingest.Deps{
+		LogManager:  logManager,
+		SpanManager: spanManager,
+		LogSparse:   logSparse,
+		SpanSparse:  spanSparse,
+		Indexer:     exec,
+		Logger:      log,
+	}, ingest.Config{
+		BatchSize:        cfg.Ingest.BatchSize,
+		BatchTimeout:     cfg.Ingest.BatchTimeout,
+		QueueSize:        cfg.Ingest.QueueSize,
+		BreakerThreshold: cfg.Ingest.BreakerThreshold,
+	})
 	batcher.SetCardinalityGuard(ingest.NewCardinalityGuard(
 		cfg.Ingest.MaxAttrsPerEntry,
 		cfg.Ingest.MaxAttrValueBytes,

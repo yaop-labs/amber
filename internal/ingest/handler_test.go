@@ -126,7 +126,7 @@ func TestBatcher_SendAndDrain(t *testing.T) {
 	defer spanManager.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	batcher := NewBatcher(logManager, spanManager, sparse, spanSparse, nil, 50, 10*time.Millisecond, 1000, 0, log)
+	batcher := NewBatcher(Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: sparse, SpanSparse: spanSparse, Logger: log}, Config{BatchSize: 50, BatchTimeout: 10 * time.Millisecond, QueueSize: 1000})
 	batcher.Start(ctx)
 
 	for i := 0; i < 200; i++ {

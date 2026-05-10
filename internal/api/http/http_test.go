@@ -237,7 +237,7 @@ func TestIngestHandler_Returns503WhenQueueIsFull(t *testing.T) {
 	}
 	defer spanManager.Close()
 
-	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, 0, log)
+	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log}, ingest.Config{BatchSize: 10, BatchTimeout: time.Second, QueueSize: 1})
 	h := NewIngestHandler(batcher, log)
 
 	req := httptest.NewRequest("POST", "/api/v1/logs", strings.NewReader(`[
@@ -276,7 +276,7 @@ func TestBatcher_SendLogReturnsQueueFull(t *testing.T) {
 	}
 	defer spanManager.Close()
 
-	batcher := ingest.NewBatcher(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), nil, 10, time.Second, 1, 0, log)
+	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log}, ingest.Config{BatchSize: 10, BatchTimeout: time.Second, QueueSize: 1})
 	entry1, _ := model.NewLogEntry(model.LevelInfo, "a", "", "one")
 	entry2, _ := model.NewLogEntry(model.LevelInfo, "b", "", "two")
 
