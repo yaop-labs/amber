@@ -197,6 +197,65 @@ func TestSegmentManager_WALRecovery(t *testing.T) {
 	}
 }
 
+// Regression test for the bug where appendSegmentWriter created a fresh
+// writer with empty blockOffsets, so a rotate after restart wrote a footer
+// pointing only at the post-restart blocks and orphaned everything written
+// before the crash.
+func TestSegmentManager_AppendRecovery_PreservesPreCrashBlocks(t *testing.T) {
+	dir := t.TempDir()
+	policy := RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 0}
+
+	sm1, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Force tiny blocks so flushBlock fires repeatedly within the test.
+	sm1.active.blockSize = 64
+
+	const preCrash = 20
+	writeN(t, sm1, preCrash)
+	if err := sm1.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// Simulate crash: drop sm1 without Close so the footer is never written
+	// and meta is not rewritten. The OS still holds the active segment file
+	// open via sm1.active.file; that's fine for the reopen below on Linux.
+
+	sm2, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got := sm2.active.recordCount; got != preCrash {
+		t.Fatalf("recovered recordCount: want %d, got %d", preCrash, got)
+	}
+	if len(sm2.active.blockOffsets) == 0 {
+		t.Fatalf("recovered blockOffsets is empty; pre-crash blocks would be orphaned on rotate")
+	}
+
+	const postCrash = 5
+	writeN(t, sm2, postCrash)
+	if err := sm2.Rotate(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := sm2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	sm3, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen post-rotate: %v", err)
+	}
+	defer sm3.Close()
+
+	var total uint64
+	for _, seg := range sm3.Segments() {
+		total += seg.RecordCount
+	}
+	if want := uint64(preCrash + postCrash); total != want {
+		t.Errorf("sealed total: want %d, got %d", want, total)
+	}
+}
+
 func TestSegmentManager_SegmentPath(t *testing.T) {
 	sm, dir := newTestManager(t)
 	writeN(t, sm, 5)
