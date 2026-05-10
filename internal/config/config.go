@@ -14,6 +14,12 @@ type Config struct {
 	API       APIConfig       `yaml:"api"`
 	Log       LogConfig       `yaml:"log"`
 	Retention RetentionConfig `yaml:"retention"`
+	Debug     DebugConfig     `yaml:"debug"`
+}
+
+type DebugConfig struct {
+	Pprof     bool   `yaml:"pprof"`
+	PprofAddr string `yaml:"pprof_addr"`
 }
 
 type RetentionConfig struct {
@@ -31,17 +37,20 @@ type StorageConfig struct {
 }
 
 type IngestConfig struct {
-	BatchSize    int           `yaml:"batch_size"`
-	BatchTimeout time.Duration `yaml:"batch_timeout"`
-	QueueSize    int           `yaml:"queue_size"`
+	BatchSize       int           `yaml:"batch_size"`
+	BatchTimeout    time.Duration `yaml:"batch_timeout"`
+	QueueSize       int           `yaml:"queue_size"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
 type APIConfig struct {
-	HTTPAddr     string        `yaml:"http_addr"`
-	ReadTimeout  time.Duration `yaml:"read_timeout"`
-	WriteTimeout time.Duration `yaml:"write_timeout"`
-	APIKey       string        `yaml:"api_key"`
-	GRPCAddr     string        `yaml:"grpc_addr"`
+	HTTPAddr          string        `yaml:"http_addr"`
+	ReadTimeout       time.Duration `yaml:"read_timeout"`
+	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	WriteTimeout      time.Duration `yaml:"write_timeout"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+	APIKey            string        `yaml:"api_key"`
+	GRPCAddr          string        `yaml:"grpc_addr"`
 }
 
 type LogConfig struct {
@@ -57,14 +66,20 @@ func Default() *Config {
 			SegmentMaxBytes:   512 << 20,
 		},
 		Ingest: IngestConfig{
-			BatchSize:    1000,
-			BatchTimeout: 100 * time.Millisecond,
-			QueueSize:    100_000,
+			BatchSize:       1000,
+			BatchTimeout:    100 * time.Millisecond,
+			QueueSize:       100_000,
+			ShutdownTimeout: 30 * time.Second,
 		},
 		API: APIConfig{
-			HTTPAddr:     ":8080",
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
+			HTTPAddr:          ":8080",
+			ReadTimeout:       30 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		},
+		Debug: DebugConfig{
+			PprofAddr: "localhost:6060",
 		},
 		Log: LogConfig{
 			Level:  "info",
