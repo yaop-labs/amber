@@ -302,13 +302,16 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 }
 
 func updateSparseFromBatch(sparse *index.SparseIndex, manager *storage.SegmentManager, items []storage.BatchItem) {
+	if len(items) == 0 {
+		return
+	}
 	activeMeta, ok := manager.ActiveSegmentMeta()
 	if !ok {
 		return
 	}
-	var minTS, maxTS int64
-	for _, it := range items {
-		if minTS == 0 || it.TS < minTS {
+	minTS, maxTS := items[0].TS, items[0].TS
+	for _, it := range items[1:] {
+		if it.TS < minTS {
 			minTS = it.TS
 		}
 		if it.TS > maxTS {

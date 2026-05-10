@@ -412,6 +412,7 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 	var stats []BlockStat
 	pos := int64(segHeaderSize)
 	var minTS, maxTS int64
+	var seenTS bool
 	var totalRecords uint64
 
 	for {
@@ -457,11 +458,17 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 				}
 				if len(recData) >= 8 {
 					ts := int64(binary.LittleEndian.Uint64(recData[:8]))
-					if minTS == 0 || ts < minTS {
+					if !seenTS {
 						minTS = ts
-					}
-					if ts > maxTS {
 						maxTS = ts
+						seenTS = true
+					} else {
+						if ts < minTS {
+							minTS = ts
+						}
+						if ts > maxTS {
+							maxTS = ts
+						}
 					}
 				}
 				if len(recData) >= 10 {

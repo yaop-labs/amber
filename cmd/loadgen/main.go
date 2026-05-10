@@ -270,9 +270,7 @@ type otlpSpan struct {
 
 func sendOTLPTraces(client *http.Client, addr string, spans []otlpSpan) error {
 	byService := make(map[string][]otlpSpan)
-	for _, sp := range spans {
-		byService["mixed"] = append(byService["mixed"], sp)
-	}
+	byService["mixed"] = append(byService["mixed"], spans...)
 
 	type scopeSpans struct {
 		Spans []otlpSpan `json:"spans"`
