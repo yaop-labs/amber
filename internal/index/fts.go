@@ -71,15 +71,12 @@ func (f *FTSIndex) Search(ctx context.Context, query string, limit int) ([]uint6
 }
 
 func (f *FTSIndex) Save(path string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("fts: save: %w", err)
-	}
-	defer file.Close()
-	if err := f.svc.SaveSnapshot(file, "slicedradix", ""); err != nil {
-		return fmt.Errorf("fts: save: %w", err)
-	}
-	return nil
+	return atomicWrite(path, func(file *os.File) error {
+		if err := f.svc.SaveSnapshot(file, "slicedradix", ""); err != nil {
+			return fmt.Errorf("fts: save: %w", err)
+		}
+		return nil
+	})
 }
 
 func LoadFTSIndex(path string) (*FTSIndex, error) {

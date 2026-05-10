@@ -31,5 +31,4 @@ go.work.sum
 # .idea/
 # .vscode/
 
-/amber
-/graphify-out
+/honey

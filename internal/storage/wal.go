@@ -15,10 +15,16 @@ import (
 )
 
 const (
-	walMagic    = uint32(0xABCD1234)
+	// walMagic identifies the v2 WAL record format. v2 adds an 8-byte
+	// monotonic seq field to the header so SegmentManager can skip records
+	// already durable in a sealed/checkpointed segment, which closes the
+	// "wrote segment + crashed before truncating WAL" duplication window.
+	// Files written by the v1 format (magic 0xABCD1234) are no longer read.
+	walMagic    = uint32(0xABCD1235)
 	walFileName = "amber.wal"
 
-	walHeaderSize = 12
+	// walHeaderSize layout: magic(4) | crc(4) | length(4) | seq(8) = 20 bytes.
+	walHeaderSize = 20
 
 	// maxWALRecordBytes caps the per-record payload size accepted by Replay.
 	// Guards against OOM on a corrupt WAL whose length field decodes to garbage
@@ -43,6 +49,10 @@ type WAL struct {
 	path         string
 	log          *slog.Logger
 	corruptCount atomic.Uint64
+	// nextSeq is the seq the next written record will receive. Callers
+	// (SegmentManager) seed it from durable state at startup so seqs stay
+	// monotonic across restarts.
+	nextSeq atomic.Uint64
 }
 
 // SetLogger attaches a logger used to surface WAL replay corruption events.
@@ -70,55 +80,84 @@ func OpenWAL(dir string) (*WAL, error) {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}
 
-	return &WAL{
+	w := &WAL{
 		file: f,
 		buf:  bufio.NewWriterSize(f, 64*1024),
 		path: path,
 		log:  slog.Default(),
-	}, nil
+	}
+	w.nextSeq.Store(1)
+	return w, nil
 }
 
-func (w *WAL) Write(payload []byte) error {
+// SetNextSeq seeds the seq counter; should be called once at startup before
+// any Write, after the manager has consulted durable meta and replayed.
+func (w *WAL) SetNextSeq(seq uint64) {
+	if seq < 1 {
+		seq = 1
+	}
+	w.nextSeq.Store(seq)
+}
+
+// NextSeq returns the seq the next write will receive.
+func (w *WAL) NextSeq() uint64 {
+	return w.nextSeq.Load()
+}
+
+// Write appends a single record and returns its assigned seq.
+func (w *WAL) Write(payload []byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.writeRecord(payload); err != nil {
-		return err
+	seq, err := w.writeRecord(payload)
+	if err != nil {
+		return 0, err
 	}
 
 	if err := w.buf.Flush(); err != nil {
-		return fmt.Errorf("wal: flush: %w", err)
+		return 0, fmt.Errorf("wal: flush: %w", err)
 	}
 
 	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("wal: sync: %w", err)
+		return 0, fmt.Errorf("wal: sync: %w", err)
 	}
 
-	return nil
+	return seq, nil
 }
 
-func (w *WAL) WriteBatch(payloads [][]byte) error {
+// WriteBatch appends a batch of records under a single fsync, returning the
+// seq of the first record (subsequent records are sequential).
+func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
+	if len(payloads) == 0 {
+		return 0, nil
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	for _, payload := range payloads {
-		if err := w.writeRecord(payload); err != nil {
-			return err
+	firstSeq, err := w.writeRecord(payloads[0])
+	if err != nil {
+		return 0, err
+	}
+	for _, payload := range payloads[1:] {
+		if _, err := w.writeRecord(payload); err != nil {
+			return 0, err
 		}
 	}
 
 	if err := w.buf.Flush(); err != nil {
-		return fmt.Errorf("wal: batch flush: %w", err)
+		return 0, fmt.Errorf("wal: batch flush: %w", err)
 	}
 
 	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("wal: batch sync: %w", err)
+		return 0, fmt.Errorf("wal: batch sync: %w", err)
 	}
 
-	return nil
+	return firstSeq, nil
 }
 
-func (w *WAL) writeRecord(payload []byte) error {
+func (w *WAL) writeRecord(payload []byte) (uint64, error) {
+	seq := w.nextSeq.Add(1) - 1
 	crc := crc32.ChecksumIEEE(payload)
 	length := uint32(len(payload))
 
@@ -126,19 +165,29 @@ func (w *WAL) writeRecord(payload []byte) error {
 	binary.LittleEndian.PutUint32(header[0:4], walMagic)
 	binary.LittleEndian.PutUint32(header[4:8], crc)
 	binary.LittleEndian.PutUint32(header[8:12], length)
+	binary.LittleEndian.PutUint64(header[12:20], seq)
 
 	if _, err := w.buf.Write(header[:]); err != nil {
-		return fmt.Errorf("wal: write header: %w", err)
+		return 0, fmt.Errorf("wal: write header: %w", err)
 	}
 
 	if _, err := w.buf.Write(payload); err != nil {
-		return fmt.Errorf("wal: write payload: %w", err)
+		return 0, fmt.Errorf("wal: write payload: %w", err)
 	}
 
-	return nil
+	return seq, nil
 }
 
+// Replay iterates payloads in order. Equivalent to ReplayWithSeq but ignores
+// the seq for callers that don't need it.
 func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
+	return w.ReplayWithSeq(func(_ uint64, p []byte) error { return fn(p) })
+}
+
+// ReplayWithSeq iterates each WAL record, calling fn with the record's seq
+// and payload. After replay, NextSeq is advanced past the largest seq seen
+// so subsequent writes stay monotonic.
+func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -148,6 +197,7 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 
 	r := bufio.NewReader(w.file)
 	count := 0
+	var maxSeq uint64
 
 	for {
 		var header [walHeaderSize]byte
@@ -168,6 +218,7 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 
 		expectedCRC := binary.LittleEndian.Uint32(header[4:8])
 		length := binary.LittleEndian.Uint32(header[8:12])
+		seq := binary.LittleEndian.Uint64(header[12:20])
 
 		if length > maxWALRecordBytes {
 			w.corruptCount.Add(1)
@@ -192,15 +243,22 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 			break
 		}
 
-		if err := fn(payload); err != nil {
+		if err := fn(seq, payload); err != nil {
 			return count, fmt.Errorf("wal: replay handler: %w", err)
 		}
 
+		if seq > maxSeq {
+			maxSeq = seq
+		}
 		count++
 	}
 
 	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
 		return count, fmt.Errorf("wal: replay seek to end: %w", err)
+	}
+
+	if maxSeq+1 > w.nextSeq.Load() {
+		w.nextSeq.Store(maxSeq + 1)
 	}
 
 	return count, nil

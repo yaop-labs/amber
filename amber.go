@@ -203,5 +203,7 @@ func (db *DB) Close() error {
 	return db.spanManager.Close()
 }
 
-var NewLogEntry = model.NewLogEntry
-var NewSpanEntry = model.NewSpanEntry
+var (
+	NewLogEntry  = model.NewLogEntry
+	NewSpanEntry = model.NewSpanEntry
+)

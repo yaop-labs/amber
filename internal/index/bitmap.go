@@ -309,12 +309,8 @@ func (m *MultiFieldIndex) Save(path string) error {
 		bi.mu.RUnlock()
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0600); err != nil {
-		return fmt.Errorf("bitmap: write %s: %w", path, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("bitmap: rename %s: %w", path, err)
+	if err := atomicWriteFile(path, buf.Bytes()); err != nil {
+		return fmt.Errorf("bitmap: %w", err)
 	}
 	return nil
 }

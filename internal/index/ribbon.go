@@ -42,14 +42,11 @@ func (f *RibbonFilter) Contains(key []byte) bool {
 
 func (f *RibbonFilter) Save(path string) error {
 	if f.inner == nil {
-		return os.WriteFile(path, nil, 0600)
+		return atomicWriteFile(path, nil)
 	}
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return f.inner.Serialize(file)
+	return atomicWrite(path, func(file *os.File) error {
+		return f.inner.Serialize(file)
+	})
 }
 
 func LoadRibbonFilter(path string) (*RibbonFilter, error) {

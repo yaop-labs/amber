@@ -313,7 +313,7 @@ func BenchmarkWAL_Write(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if err := wal.Write(payload); err != nil {
+		if _, err := wal.Write(payload); err != nil {
 			b.Fatalf("WAL.Write: %v", err)
 		}
 	}
