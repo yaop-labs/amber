@@ -128,9 +128,15 @@ func Handler() http.Handler {
 	})
 }
 
+// fprintf wraps fmt.Fprintf and intentionally drops the error: a scraper
+// disconnect mid-response is normal and there's nothing to recover.
+func fprintf(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
 func writeCounterVec(w io.Writer, cv *CounterVec) {
-	fmt.Fprintf(w, "# HELP %s %s\n", cv.name, cv.help)
-	fmt.Fprintf(w, "# TYPE %s counter\n", cv.name)
+	fprintf(w, "# HELP %s %s\n", cv.name, cv.help)
+	fprintf(w, "# TYPE %s counter\n", cv.name)
 
 	cv.mu.RLock()
 	keys := make([]string, 0, len(cv.children))
@@ -147,14 +153,14 @@ func writeCounterVec(w io.Writer, cv *CounterVec) {
 }
 
 func writeFunc(w io.Writer, fm funcMetric) {
-	fmt.Fprintf(w, "# HELP %s %s\n", fm.name, fm.help)
-	fmt.Fprintf(w, "# TYPE %s %s\n", fm.name, fm.typ)
-	fmt.Fprintf(w, "%s %s\n", fm.name, formatFloat(fm.fn()))
+	fprintf(w, "# HELP %s %s\n", fm.name, fm.help)
+	fprintf(w, "# TYPE %s %s\n", fm.name, fm.typ)
+	fprintf(w, "%s %s\n", fm.name, formatFloat(fm.fn()))
 }
 
 func writeSample(w io.Writer, name string, labels, values []string, value string) {
 	if len(labels) == 0 {
-		fmt.Fprintf(w, "%s %s\n", name, value)
+		fprintf(w, "%s %s\n", name, value)
 		return
 	}
 	var b strings.Builder
