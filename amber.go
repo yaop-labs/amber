@@ -107,9 +107,16 @@ func (db *DB) QuerySpans(ctx context.Context, q *SpanQuery) (*SpanResult, error)
 	return db.stack.Executor.ExecSpan(ctx, q)
 }
 
+// shutdownTimeout caps how long Close waits for batcher drain + storage
+// flush. 30s matches the standalone binary default and is enough for any
+// realistic in-flight batch; longer hangs are an FS pathology, not work.
+const shutdownTimeout = 30 * time.Second
+
 func (db *DB) Close() error {
 	db.cancel()
-	return db.stack.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return db.stack.Close(ctx)
 }
 
 var (

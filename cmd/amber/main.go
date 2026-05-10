@@ -192,17 +192,10 @@ func run() error {
 	if batcherTimeout <= 0 {
 		batcherTimeout = 30 * time.Second
 	}
-	done := make(chan struct{})
-	go func() {
-		if err := stack.Close(); err != nil {
-			log.Error("stack close error", "err", err)
-		}
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(batcherTimeout):
-		log.Error("batcher shutdown timed out, abandoning in-flight items", "timeout", batcherTimeout)
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), batcherTimeout)
+	defer closeCancel()
+	if err := stack.Close(closeCtx); err != nil {
+		log.Error("stack close error", "err", err)
 	}
 
 	log.Info("amber stopped")
