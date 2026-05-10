@@ -137,12 +137,22 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		cfg.Logger.Info("sealed indexes loaded")
 	}()
 
+	var guard *ingest.CardinalityGuard
+	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 {
+		guard = ingest.NewCardinalityGuard(
+			cfg.Cardinality.MaxAttrsPerEntry,
+			cfg.Cardinality.MaxAttrValueBytes,
+			cfg.Cardinality.MaxAttrKeysPerService,
+		)
+	}
+
 	batcher := ingest.NewBatcher(ingest.Deps{
 		LogManager:  logManager,
 		SpanManager: spanManager,
 		LogSparse:   logSparse,
 		SpanSparse:  spanSparse,
 		Indexer:     exec.ActiveIndex(),
+		Guard:       guard,
 		Logger:      cfg.Logger,
 	}, ingest.Config{
 		BatchSize:        cfg.Ingest.BatchSize,
@@ -150,14 +160,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		QueueSize:        cfg.Ingest.QueueSize,
 		BreakerThreshold: cfg.Ingest.BreakerThreshold,
 	})
-
-	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 {
-		batcher.SetCardinalityGuard(ingest.NewCardinalityGuard(
-			cfg.Cardinality.MaxAttrsPerEntry,
-			cfg.Cardinality.MaxAttrValueBytes,
-			cfg.Cardinality.MaxAttrKeysPerService,
-		))
-	}
 
 	batcher.Start(ctx)
 

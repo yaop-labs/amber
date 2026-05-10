@@ -42,14 +42,13 @@ type Batcher struct {
 	guard            *CardinalityGuard
 }
 
-func (b *Batcher) SetCardinalityGuard(g *CardinalityGuard) { b.guard = g }
-
 type Deps struct {
 	LogManager  *storage.SegmentManager
 	SpanManager *storage.SegmentManager
 	LogSparse   *index.SparseIndex
 	SpanSparse  *index.SparseIndex
 	Indexer     ActiveIndexer
+	Guard       *CardinalityGuard
 	Logger      *slog.Logger
 }
 
@@ -76,6 +75,7 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		queue:            make(chan item, cfg.QueueSize),
 		log:              deps.Logger,
 		breakerThreshold: threshold,
+		guard:            deps.Guard,
 	}
 }
 
