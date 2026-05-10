@@ -259,10 +259,10 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 	if len(logItems) > 0 {
 		if err := b.logManager.WriteBatch(logItems); err != nil {
 			anyFailed = true
-			metrics.IngestDropped.WithLabelValues("log", "write_failed").Add(float64(len(logItems)))
+			metrics.IngestDropped.WithLabelValues("log", "write_failed").Add(uint64(len(logItems)))
 			b.log.Error("log batch write failed", "err", err, "count", len(logItems))
 		} else {
-			metrics.IngestAccepted.WithLabelValues("log").Add(float64(len(logItems)))
+			metrics.IngestAccepted.WithLabelValues("log").Add(uint64(len(logItems)))
 			updateSparseFromBatch(b.logSparse, b.logManager, logItems)
 			if b.indexer != nil && len(logEntries) > 0 {
 				b.indexer.IndexLogEntries(logEntries)
@@ -276,10 +276,10 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 	if len(spanItems) > 0 {
 		if err := b.spanManager.WriteBatch(spanItems); err != nil {
 			anyFailed = true
-			metrics.IngestDropped.WithLabelValues("span", "write_failed").Add(float64(len(spanItems)))
+			metrics.IngestDropped.WithLabelValues("span", "write_failed").Add(uint64(len(spanItems)))
 			b.log.Error("span batch write failed", "err", err, "count", len(spanItems))
 		} else {
-			metrics.IngestAccepted.WithLabelValues("span").Add(float64(len(spanItems)))
+			metrics.IngestAccepted.WithLabelValues("span").Add(uint64(len(spanItems)))
 			updateSparseFromBatch(b.spanSparse, b.spanManager, spanItems)
 			if b.indexer != nil && len(spanEntries) > 0 {
 				b.indexer.IndexSpanEntries(spanEntries)

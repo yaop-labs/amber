@@ -1,59 +1,207 @@
-// Package metrics owns Amber's Prometheus registry. Registry is private so
-// callers cannot accidentally pollute it; live-state gauges are registered via
-// callbacks at wire-up time.
+// Package metrics is a hand-rolled Prometheus text-exposition exporter for
+// Amber. It keeps the dependency surface to stdlib only — runtime/process
+// collectors are intentionally omitted; add them only when an operator
+// asks for them by name and we know what we're paying for.
 package metrics
 
 import (
+	"fmt"
+	"io"
 	"net/http"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 )
 
-var registry = prometheus.NewRegistry()
+// Counter is a monotonic integer counter. All Amber counters are integer
+// events (entries dropped, builds failed); float storage would just hide
+// truncation bugs.
+type Counter struct {
+	v atomic.Uint64
+}
+
+func (c *Counter) Inc()         { c.v.Add(1) }
+func (c *Counter) Add(n uint64) { c.v.Add(n) }
+func (c *Counter) Get() uint64  { return c.v.Load() }
+
+// CounterVec shards a counter by a fixed list of label keys. Children are
+// created on first WithLabelValues call.
+type CounterVec struct {
+	name   string
+	help   string
+	labels []string
+
+	mu       sync.RWMutex
+	children map[string]*Counter
+}
+
+func NewCounterVec(name, help string, labels ...string) *CounterVec {
+	return &CounterVec{
+		name:     name,
+		help:     help,
+		labels:   labels,
+		children: make(map[string]*Counter),
+	}
+}
+
+func (cv *CounterVec) WithLabelValues(values ...string) *Counter {
+	if len(values) != len(cv.labels) {
+		panic(fmt.Sprintf("metrics: %s expects %d labels, got %d", cv.name, len(cv.labels), len(values)))
+	}
+	// NUL is illegal inside Prom label values, so it's a safe key separator.
+	key := strings.Join(values, "\x00")
+
+	cv.mu.RLock()
+	if c, ok := cv.children[key]; ok {
+		cv.mu.RUnlock()
+		return c
+	}
+	cv.mu.RUnlock()
+
+	cv.mu.Lock()
+	defer cv.mu.Unlock()
+	if c, ok := cv.children[key]; ok {
+		return c
+	}
+	c := &Counter{}
+	cv.children[key] = c
+	return c
+}
+
+type funcMetric struct {
+	name string
+	help string
+	typ  string // "counter" | "gauge"
+	fn   func() float64
+}
 
 var (
-	IngestAccepted = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "amber_ingest_accepted_total",
-		Help: "Entries successfully written to a segment.",
-	}, []string{"kind"})
+	regMu       sync.RWMutex
+	counterVecs []*CounterVec
+	funcMetrics []funcMetric
+)
 
-	IngestDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "amber_ingest_dropped_total",
-		Help: "Entries dropped before reaching storage.",
-	}, []string{"kind", "reason"})
+func RegisterCounterVec(cv *CounterVec) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	counterVecs = append(counterVecs, cv)
+}
 
-	SealIndexErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "amber_seal_index_errors_total",
-		Help: "Index builds that failed during segment seal, after retries.",
-	}, []string{"kind", "index"})
+func RegisterGaugeFunc(name, help string, fn func() float64) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	funcMetrics = append(funcMetrics, funcMetric{name, help, "gauge", fn})
+}
+
+func RegisterCounterFunc(name, help string, fn func() float64) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	funcMetrics = append(funcMetrics, funcMetric{name, help, "counter", fn})
+}
+
+// Pre-declared counters used directly from ingest/bootstrap hot paths.
+var (
+	IngestAccepted  = NewCounterVec("amber_ingest_accepted_total", "Entries successfully written to a segment.", "kind")
+	IngestDropped   = NewCounterVec("amber_ingest_dropped_total", "Entries dropped before reaching storage.", "kind", "reason")
+	SealIndexErrors = NewCounterVec("amber_seal_index_errors_total", "Index builds that failed during segment seal, after retries.", "kind", "index")
 )
 
 func init() {
-	registry.MustRegister(
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		IngestAccepted,
-		IngestDropped,
-		SealIndexErrors,
-	)
-}
-
-func RegisterGaugeFunc(name, help string, f func() float64) {
-	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: name,
-		Help: help,
-	}, f))
-}
-
-func RegisterCounterFunc(name, help string, f func() float64) {
-	registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
-		Name: name,
-		Help: help,
-	}, f))
+	RegisterCounterVec(IngestAccepted)
+	RegisterCounterVec(IngestDropped)
+	RegisterCounterVec(SealIndexErrors)
 }
 
 func Handler() http.Handler {
-	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		regMu.RLock()
+		defer regMu.RUnlock()
+		for _, cv := range counterVecs {
+			writeCounterVec(w, cv)
+		}
+		for _, fm := range funcMetrics {
+			writeFunc(w, fm)
+		}
+	})
+}
+
+func writeCounterVec(w io.Writer, cv *CounterVec) {
+	fmt.Fprintf(w, "# HELP %s %s\n", cv.name, cv.help)
+	fmt.Fprintf(w, "# TYPE %s counter\n", cv.name)
+
+	cv.mu.RLock()
+	keys := make([]string, 0, len(cv.children))
+	for k := range cv.children {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		c := cv.children[k]
+		values := strings.Split(k, "\x00")
+		writeSample(w, cv.name, cv.labels, values, strconv.FormatUint(c.Get(), 10))
+	}
+	cv.mu.RUnlock()
+}
+
+func writeFunc(w io.Writer, fm funcMetric) {
+	fmt.Fprintf(w, "# HELP %s %s\n", fm.name, fm.help)
+	fmt.Fprintf(w, "# TYPE %s %s\n", fm.name, fm.typ)
+	fmt.Fprintf(w, "%s %s\n", fm.name, formatFloat(fm.fn()))
+}
+
+func writeSample(w io.Writer, name string, labels, values []string, value string) {
+	if len(labels) == 0 {
+		fmt.Fprintf(w, "%s %s\n", name, value)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(name)
+	b.WriteByte('{')
+	for i, l := range labels {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(l)
+		b.WriteString(`="`)
+		b.WriteString(escapeLabel(values[i]))
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	b.WriteByte(' ')
+	b.WriteString(value)
+	b.WriteByte('\n')
+	_, _ = io.WriteString(w, b.String())
+}
+
+func formatFloat(v float64) string {
+	if v == float64(int64(v)) {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}
+
+// escapeLabel applies the Prom text-format escape rules: backslash, quote,
+// newline. Anything else passes through verbatim.
+func escapeLabel(s string) string {
+	if !strings.ContainsAny(s, "\\\"\n") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
