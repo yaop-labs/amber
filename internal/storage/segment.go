@@ -275,6 +275,34 @@ func (sw *SegmentWriter) RecordCount() uint64 {
 	return sw.recordCount
 }
 
+// BlockCount returns the number of blocks already flushed (compressed and
+// handed off to the bufio writer). Used by SegmentManager to detect whether
+// the latest WriteRecord triggered a block flush and therefore needs a sync.
+func (sw *SegmentWriter) BlockCount() int {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return len(sw.blockOffsets)
+}
+
+// Sync flushes the bufio writer and fsyncs the underlying file, returning
+// the durable file offset. Records still buffered in blockBuf (i.e. not yet
+// part of a flushed block) are NOT covered by this sync; only blocks already
+// handed off to the bufio writer become durable.
+func (sw *SegmentWriter) Sync() (int64, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if sw.closed {
+		return sw.fileOffset, nil
+	}
+	if err := sw.bw.Flush(); err != nil {
+		return 0, fmt.Errorf("segment: sync flush: %w", err)
+	}
+	if err := sw.file.Sync(); err != nil {
+		return 0, fmt.Errorf("segment: sync fsync: %w", err)
+	}
+	return sw.fileOffset, nil
+}
+
 type BlockIndexHint struct {
 	Offsets     []int64
 	Stats       []BlockStat

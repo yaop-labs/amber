@@ -134,17 +134,10 @@ func (s *SparseIndex) Save(dir string) error {
 		return fmt.Errorf("sparse: marshal: %w", err)
 	}
 
-	tmp := dir + "/" + sparseIndexFile + ".tmp"
 	dst := dir + "/" + sparseIndexFile
-
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("sparse: write tmp: %w", err)
+	if err := atomicWriteFile(dst, data); err != nil {
+		return fmt.Errorf("sparse: %w", err)
 	}
-
-	if err := os.Rename(tmp, dst); err != nil {
-		return fmt.Errorf("sparse: rename: %w", err)
-	}
-
 	return nil
 }
 

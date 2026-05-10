@@ -73,7 +73,7 @@ func TestOpenWAL_Idempotent(t *testing.T) {
 func TestWAL_Write_Single(t *testing.T) {
 	wal, _ := newTestWAL(t)
 
-	if err := wal.Write([]byte("hello amber")); err != nil {
+	if _, err := wal.Write([]byte("hello amber")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestWAL_Write_Multiple(t *testing.T) {
 	}
 
 	for _, p := range payloads {
-		if err := wal.Write(p); err != nil {
+		if _, err := wal.Write(p); err != nil {
 			t.Fatalf("Write %q: %v", p, err)
 		}
 	}
@@ -118,7 +118,7 @@ func TestWAL_Write_Multiple(t *testing.T) {
 func TestWAL_Write_Empty(t *testing.T) {
 	wal, _ := newTestWAL(t)
 
-	if err := wal.Write([]byte{}); err != nil {
+	if _, err := wal.Write([]byte{}); err != nil {
 		t.Fatalf("Write empty: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestWAL_Write_LargePayload(t *testing.T) {
 		payload[i] = byte(i % 256)
 	}
 
-	if err := wal.Write(payload); err != nil {
+	if _, err := wal.Write(payload); err != nil {
 		t.Fatalf("Write large: %v", err)
 	}
 
@@ -326,7 +326,7 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 		go func(id int) {
 			for j := 0; j < perGoroutine; j++ {
 				payload := []byte(fmt.Sprintf("g%d-r%d", id, j))
-				if err := wal.Write(payload); err != nil {
+				if _, err := wal.Write(payload); err != nil {
 					t.Errorf("concurrent Write: %v", err)
 				}
 			}

@@ -197,6 +197,87 @@ func TestSegmentManager_WALRecovery(t *testing.T) {
 	}
 }
 
+// Verifies the WAL-checkpoint contract: writes are durable across a
+// simulated crash (no Close), no records lost, no duplicates surface after
+// reopen and seal. Mixes records that trigger flushBlock+checkpoint with
+// records that ride along in the WAL only.
+func TestSegmentManager_Checkpoint_NoLossNoDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	policy := RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 0}
+
+	sm1, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Tiny block size so flushBlock fires repeatedly within the workload.
+	sm1.active.blockSize = 256
+
+	const n = 300
+	for i := 0; i < n; i++ {
+		data := []byte(fmt.Sprintf("rec-%05d", i))
+		ts := int64(i + 1)
+		if err := sm1.Write(data, ts); err != nil {
+			t.Fatalf("Write[%d]: %v", i, err)
+		}
+	}
+	// Simulate crash: drop sm1 without Close (no footer, possibly some
+	// records still only in WAL).
+
+	sm2, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if err := sm2.Rotate(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := sm2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Scan all sealed segments and collect payloads.
+	sm3, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("final reopen: %v", err)
+	}
+	defer sm3.Close()
+
+	seen := make(map[string]int)
+	for _, seg := range sm3.Segments() {
+		path := filepath.Join(dir, seg.FileName)
+		sr, err := OpenSegmentReader(path, nil)
+		if err != nil {
+			t.Fatalf("reader %s: %v", path, err)
+		}
+		err = sr.Scan(func(data []byte) error {
+			seen[string(data)]++
+			return nil
+		})
+		_ = sr.Close()
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+	}
+
+	if len(seen) != n {
+		t.Errorf("unique records: want %d, got %d", n, len(seen))
+	}
+	dupes := 0
+	for k, c := range seen {
+		if c != 1 {
+			dupes++
+			t.Logf("duplicated %q × %d", k, c)
+		}
+	}
+	if dupes > 0 {
+		t.Errorf("%d records duplicated after recovery", dupes)
+	}
+	for i := 0; i < n; i++ {
+		if seen[fmt.Sprintf("rec-%05d", i)] == 0 {
+			t.Errorf("record %d lost", i)
+		}
+	}
+}
+
 // Regression test for the bug where appendSegmentWriter created a fresh
 // writer with empty blockOffsets, so a rotate after restart wrote a footer
 // pointing only at the post-restart blocks and orphaned everything written

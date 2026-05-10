@@ -83,6 +83,7 @@ func (sm *SegmentManager) replayWAL() error {
 	}
 
 	if activeMeta == nil {
+		// No unsealed segment to replay into. Drop any orphan WAL records.
 		count, err := sm.wal.Replay(func([]byte) error { return nil })
 		if err != nil {
 			return err
@@ -93,10 +94,28 @@ func (sm *SegmentManager) replayWAL() error {
 		return nil
 	}
 
+	// Seed the WAL seq counter from the durable watermark so subsequent writes
+	// stay strictly monotonic across the restart, even if the WAL is empty.
+	if activeMeta.LastSyncedSeq > 0 {
+		sm.wal.SetNextSeq(activeMeta.LastSyncedSeq + 1)
+	}
+
 	segPath := filepath.Join(sm.dir, activeMeta.FileName)
 
 	if _, err := os.Stat(segPath); os.IsNotExist(err) {
 		return sm.wal.Truncate()
+	}
+
+	// Truncate the segment file back to the last fsync'd offset. Any bytes
+	// past that point came from a bw.Flush + OS page-cache write that never
+	// reached fsync, so they may be partial or torn; drop them and let WAL
+	// replay rebuild the missing tail.
+	if activeMeta.LastSyncedSize > 0 {
+		if info, err := os.Stat(segPath); err == nil && info.Size() > activeMeta.LastSyncedSize {
+			if err := os.Truncate(segPath, activeMeta.LastSyncedSize); err != nil {
+				return fmt.Errorf("segmgr: truncate to last synced size: %w", err)
+			}
+		}
 	}
 
 	writer, fileSize, err := appendSegmentWriter(segPath)
@@ -108,7 +127,14 @@ func (sm *SegmentManager) replayWAL() error {
 		sm.activeSize = 0
 	}
 
-	count, err := sm.wal.Replay(func(payload []byte) error {
+	syncedSeq := activeMeta.LastSyncedSeq
+	count, err := sm.wal.ReplayWithSeq(func(seq uint64, payload []byte) error {
+		// Records with seq <= syncedSeq are already durable in the segment.
+		// Re-applying them would double-write after a crash that landed in
+		// the saveMeta-then-truncate window.
+		if seq <= syncedSeq {
+			return nil
+		}
 		if len(payload) < 8 {
 			return fmt.Errorf("segmgr: replay: payload too short")
 		}
@@ -118,23 +144,11 @@ func (sm *SegmentManager) replayWAL() error {
 		data := payload[8:]
 		return writer.WriteRecord(data, ts)
 	})
-
 	if err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("segmgr: replay records: %w", err)
 	}
-
-	if count > 0 {
-		activeMeta.RecordCount = writer.RecordCount()
-		if err := saveMeta(sm.dir, sm.meta); err != nil {
-			_ = writer.Close()
-			return err
-		}
-		if err := sm.wal.Truncate(); err != nil {
-			_ = writer.Close()
-			return err
-		}
-	}
+	_ = count
 
 	sm.active = writer
 	return nil
@@ -197,17 +211,24 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 
 	payload := makeWALPayload(ts, data)
 
-	if err := sm.wal.Write(payload); err != nil {
+	seq, err := sm.wal.Write(payload)
+	if err != nil {
 		return fmt.Errorf("segmgr: wal write: %w", err)
 	}
 
+	blocksBefore := sm.active.BlockCount()
 	if err := sm.active.WriteRecord(data, ts); err != nil {
 		return fmt.Errorf("segmgr: segment write: %w", err)
 	}
 	sm.activeSize += int64(len(data))
 
-	if err := sm.wal.Truncate(); err != nil {
-		return fmt.Errorf("segmgr: wal truncate: %w", err)
+	// If WriteRecord just flushed a block, sync the segment and drop the WAL
+	// records that are now durable. Otherwise the records stay in the WAL
+	// (the only durable copy) and ride along to the next block flush.
+	if sm.active.BlockCount() > blocksBefore {
+		if err := sm.checkpoint(seq); err != nil {
+			return fmt.Errorf("segmgr: checkpoint: %w", err)
+		}
 	}
 
 	if sm.shouldRotate() {
@@ -232,19 +253,31 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 		payloads[i] = makeWALPayload(item.TS, item.Data)
 	}
 
-	if err := sm.wal.WriteBatch(payloads); err != nil {
+	firstSeq, err := sm.wal.WriteBatch(payloads)
+	if err != nil {
 		return fmt.Errorf("segmgr: wal batch: %w", err)
 	}
 
-	for _, item := range items {
+	var (
+		sawFlush     bool
+		lastFlushSeq uint64
+	)
+	for i, item := range items {
+		before := sm.active.BlockCount()
 		if err := sm.active.WriteRecord(item.Data, item.TS); err != nil {
 			return fmt.Errorf("segmgr: segment write: %w", err)
 		}
 		sm.activeSize += int64(len(item.Data))
+		if sm.active.BlockCount() > before {
+			sawFlush = true
+			lastFlushSeq = firstSeq + uint64(i)
+		}
 	}
 
-	if err := sm.wal.Truncate(); err != nil {
-		return fmt.Errorf("segmgr: wal truncate: %w", err)
+	if sawFlush {
+		if err := sm.checkpoint(lastFlushSeq); err != nil {
+			return fmt.Errorf("segmgr: checkpoint: %w", err)
+		}
 	}
 
 	if sm.shouldRotate() {
@@ -254,6 +287,40 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	}
 
 	return nil
+}
+
+// checkpoint syncs the active segment so that all blocks flushed up to and
+// including the record with seq=lastSyncedSeq are durably on disk, persists
+// the new sync watermark in meta, and truncates the WAL.
+//
+// Order: file.Sync → saveMeta → wal.Truncate. A crash between saveMeta and
+// wal.Truncate leaves WAL records whose seq <= LastSyncedSeq; on next start
+// replayWAL skips them, which is what avoids duplication. A crash between
+// Sync and saveMeta leaves stale meta and a longer file; replay truncates
+// the file back to LastSyncedSize and re-applies WAL.
+func (sm *SegmentManager) checkpoint(lastSyncedSeq uint64) error {
+	if sm.active == nil {
+		return sm.wal.Truncate()
+	}
+	syncedOffset, err := sm.active.Sync()
+	if err != nil {
+		return err
+	}
+
+	for i := range sm.meta.Segments {
+		if !sm.meta.Segments[i].Sealed {
+			sm.meta.Segments[i].LastSyncedSize = syncedOffset
+			sm.meta.Segments[i].LastSyncedSeq = lastSyncedSeq
+			sm.meta.Segments[i].RecordCount = sm.active.RecordCount()
+			break
+		}
+	}
+
+	if err := saveMeta(sm.dir, sm.meta); err != nil {
+		return err
+	}
+
+	return sm.wal.Truncate()
 }
 
 type BatchItem struct {
@@ -308,7 +375,14 @@ func (sm *SegmentManager) rotate() error {
 		go sm.onSeal(sealedMeta)
 	}
 
-	return sm.createNewSegment()
+	if err := sm.createNewSegment(); err != nil {
+		return err
+	}
+
+	// Old segment is sealed and fsync'd via SegmentWriter.Close, so every WAL
+	// record that fed it is now durable. The new active is empty. Drop the
+	// WAL so it stays bounded.
+	return sm.wal.Truncate()
 }
 
 func (sm *SegmentManager) Rotate() error {
@@ -435,6 +509,9 @@ func (sm *SegmentManager) Close() error {
 		}
 		sm.active = nil
 		_ = saveMeta(sm.dir, sm.meta)
+		// Active segment is now sealed and fsync'd; the WAL records that fed
+		// it are durable on disk, so drop them before closing.
+		_ = sm.wal.Truncate()
 	}
 
 	return sm.wal.Close()
