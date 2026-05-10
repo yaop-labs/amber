@@ -99,9 +99,13 @@ func (sm *SegmentManager) replayWAL() error {
 		return sm.wal.Truncate()
 	}
 
-	writer, err := appendSegmentWriter(segPath)
+	writer, fileSize, err := appendSegmentWriter(segPath)
 	if err != nil {
 		return fmt.Errorf("segmgr: replay: open segment for append: %w", err)
+	}
+	sm.activeSize = fileSize - segHeaderSize
+	if sm.activeSize < 0 {
+		sm.activeSize = 0
 	}
 
 	count, err := sm.wal.Replay(func(payload []byte) error {
@@ -144,11 +148,15 @@ func (sm *SegmentManager) openActiveSegment() error {
 	for i := range sm.meta.Segments {
 		if !sm.meta.Segments[i].Sealed {
 			segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
-			writer, err := appendSegmentWriter(segPath)
+			writer, fileSize, err := appendSegmentWriter(segPath)
 			if err != nil {
 				return fmt.Errorf("segmgr: open active: %w", err)
 			}
 			sm.active = writer
+			sm.activeSize = fileSize - segHeaderSize
+			if sm.activeSize < 0 {
+				sm.activeSize = 0
+			}
 			return nil
 		}
 	}
@@ -446,31 +454,51 @@ func makeWALPayload(ts int64, data []byte) []byte {
 	return payload
 }
 
-func appendSegmentWriter(path string) (*SegmentWriter, error) {
+func appendSegmentWriter(path string) (*SegmentWriter, int64, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("append segment: open %s: %w", path, err)
+		return nil, 0, fmt.Errorf("append segment: open %s: %w", path, err)
 	}
 
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("append segment: zstd encoder: %w", err)
+		return nil, 0, fmt.Errorf("append segment: zstd encoder: %w", err)
 	}
 
 	info, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("append segment: stat: %w", err)
+		return nil, 0, fmt.Errorf("append segment: stat: %w", err)
 	}
+	fileSize := info.Size()
 
 	sw := &SegmentWriter{
 		file:       f,
 		bw:         bufio.NewWriterSize(f, 256*1024),
 		encoder:    enc,
 		blockSize:  DefaultBlockSize,
-		fileOffset: info.Size(),
+		fileOffset: fileSize,
 	}
 
-	return sw, nil
+	// Restore writer state from blocks already on disk. Without this, a rotate
+	// after a crash-and-replay would write a footer pointing only at the
+	// post-replay blocks, orphaning everything written before the crash.
+	if fileSize > segHeaderSize {
+		sr, err := OpenSegmentReader(path, nil)
+		if err != nil {
+			_ = f.Close()
+			return nil, 0, fmt.Errorf("append segment: scan existing blocks: %w", err)
+		}
+		footer := sr.Footer()
+		_ = sr.Close()
+
+		sw.minTS = footer.MinTS
+		sw.maxTS = footer.MaxTS
+		sw.recordCount = footer.RecordCount
+		sw.blockOffsets = append([]int64(nil), footer.BlockOffsets...)
+		sw.blockStats = append([]BlockStat(nil), footer.BlockStats...)
+	}
+
+	return sw, fileSize, nil
 }
