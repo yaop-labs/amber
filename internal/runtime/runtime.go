@@ -80,7 +80,6 @@ type Stack struct {
 	SpanDir     string
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
-	Logger      *slog.Logger
 
 	ready *atomic.Bool
 }
@@ -179,7 +178,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		SpanDir:     spanDir,
 		Executor:    exec,
 		Batcher:     batcher,
-		Logger:      cfg.Logger,
 		ready:       ready,
 	}, nil
 }
