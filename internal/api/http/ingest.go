@@ -30,6 +30,10 @@ type ingestRequest struct {
 }
 
 func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.batcher.IsBreakerOpen() {
+		writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
+		return
+	}
 	var req []ingestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())

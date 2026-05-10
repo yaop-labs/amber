@@ -60,7 +60,7 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 	exec := query.NewExecutorWithCache(logManager, spanManager, logSparse, spanSparse, logDir, spanDir, 32)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	batcher := ingest.NewBatcher(logManager, spanManager, logSparse, spanSparse, exec, 16, 2*time.Millisecond, 256, log)
+	batcher := ingest.NewBatcher(logManager, spanManager, logSparse, spanSparse, exec, 16, 2*time.Millisecond, 256, 0, log)
 	batcher.Start(ctx)
 
 	mux := http.NewServeMux()

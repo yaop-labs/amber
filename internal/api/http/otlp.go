@@ -30,6 +30,10 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if h.batcher.IsBreakerOpen() {
+		writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
+		return
+	}
 	switch r.URL.Path {
 	case "/v1/logs":
 		h.handleLogs(w, r)
