@@ -199,7 +199,17 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.Handler())
-	amberhttp.RegisterRoutes(mux, batcher, exec, logManager, logSparse, cfg.API.APIKey, cfg.API.MaxRequestBytes, &ready, log)
+	amberhttp.RegisterRoutes(mux, amberhttp.RoutesDeps{
+		Batcher:    batcher,
+		Executor:   exec,
+		LogManager: logManager,
+		LogSparse:  logSparse,
+		Ready:      &ready,
+		Logger:     log,
+	}, amberhttp.RoutesConfig{
+		APIKey:          cfg.API.APIKey,
+		MaxRequestBytes: cfg.API.MaxRequestBytes,
+	})
 
 	httpServer := &http.Server{
 		Addr:              cfg.API.HTTPAddr,

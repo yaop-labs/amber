@@ -66,7 +66,7 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 	mux := http.NewServeMux()
 	var ready atomic.Bool
 	ready.Store(true)
-	RegisterRoutes(mux, batcher, exec, logManager, logSparse, "secret", 32<<20, &ready, log)
+	RegisterRoutes(mux, RoutesDeps{Batcher: batcher, Executor: exec, LogManager: logManager, LogSparse: logSparse, Ready: &ready, Logger: log}, RoutesConfig{APIKey: "secret", MaxRequestBytes: 32 << 20})
 
 	t.Cleanup(func() {
 		cancel()
