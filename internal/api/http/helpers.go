@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
-func ReadyHandler(ready *atomic.Bool) http.Handler {
+func ReadyHandler(isReady func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ready != nil && !ready.Load() {
+		if isReady != nil && !isReady() {
 			writeError(w, http.StatusServiceUnavailable, "indexes loading")
 			return
 		}

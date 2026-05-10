@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"sync/atomic"
 
 	"github.com/hnlbs/amber/internal/index"
 	"github.com/hnlbs/amber/internal/ingest"
@@ -18,7 +17,7 @@ type RoutesDeps struct {
 	Executor   *query.Executor
 	LogManager *storage.SegmentManager
 	LogSparse  *index.SparseIndex
-	Ready      *atomic.Bool
+	IsReady    func() bool
 	Logger     *slog.Logger
 }
 
@@ -33,7 +32,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	mux.Handle("GET /readyz", ReadyHandler(deps.Ready))
+	mux.Handle("GET /readyz", ReadyHandler(deps.IsReady))
 
 	auth := func(h http.Handler) http.Handler {
 		return APIKeyMiddleware(cfg.APIKey, h)

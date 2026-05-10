@@ -81,8 +81,13 @@ type Stack struct {
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
 	Logger      *slog.Logger
-	Ready       *atomic.Bool
+
+	ready *atomic.Bool
 }
+
+// IsReady reports whether bootstrap finished loading sealed indexes.
+// Exposed as a method so callers can't flip the flag externally.
+func (s *Stack) IsReady() bool { return s.ready.Load() }
 
 func New(ctx context.Context, opts Options) (*Stack, error) {
 	if opts.DataDir == "" {
@@ -175,7 +180,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		Executor:    exec,
 		Batcher:     batcher,
 		Logger:      cfg.Logger,
-		Ready:       ready,
+		ready:       ready,
 	}, nil
 }
 
