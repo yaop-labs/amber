@@ -591,6 +591,9 @@ func (sr *SegmentReader) ScanWithBlockSkip(
 	for i, offset := range sr.footer.BlockOffsets {
 		if stats != nil && i < len(stats) {
 			s := stats[i]
+			// {0,0} means the block had no valid ID range (no parseable
+			// records or legacy footer). Skip the optimization — fall
+			// through to a full block scan rather than risk dropping data.
 			if s.MinID != 0 || s.MaxID != 0 {
 				if skip(s.MinID, s.MaxID) {
 					continue
@@ -617,6 +620,9 @@ func (sr *SegmentReader) ScanReverseWithBlockSkip(
 		offset := offsets[i]
 		if stats != nil && i < len(stats) {
 			s := stats[i]
+			// {0,0} means the block had no valid ID range (no parseable
+			// records or legacy footer). Skip the optimization — fall
+			// through to a full block scan rather than risk dropping data.
 			if s.MinID != 0 || s.MaxID != 0 {
 				if skip(s.MinID, s.MaxID) {
 					continue
