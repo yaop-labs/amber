@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"time"
@@ -96,7 +96,12 @@ type logEntry struct {
 
 func randHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	for i := 0; i < n; i += 8 {
+		u := rand.Uint64()
+		for j := 0; j < 8 && i+j < n; j++ {
+			b[i+j] = byte(u >> (j * 8))
+		}
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -116,7 +121,7 @@ func main() {
 	fmt.Println("[ok] amber is up")
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 
 	fmt.Printf("\n-> generating %d traces...\n", *traces)
 
@@ -125,9 +130,9 @@ func main() {
 
 	for i := range *traces {
 		traceID := randHex(16)
-		hasError := rng.Intn(5) == 0
-		rootSvc := services[rng.Intn(3)]
-		spans, logs := buildTrace(rng, traceID, rootSvc, "", now.Add(-time.Duration(rng.Intn(3600))*time.Second), 0, hasError)
+		hasError := rng.IntN(5) == 0
+		rootSvc := services[rng.IntN(3)]
+		spans, logs := buildTrace(rng, traceID, rootSvc, "", now.Add(-time.Duration(rng.IntN(3600))*time.Second), 0, hasError)
 
 		if err := sendOTLPTraces(client, *addr, spans); err != nil {
 			fmt.Fprintf(os.Stderr, "  trace %d error: %v\n", i+1, err)
@@ -151,13 +156,13 @@ func main() {
 		size := min(*batchSize, *count-sent)
 		batch := make([]logEntry, size)
 		for i := range batch {
-			tpl := logTemplates[rng.Intn(len(logTemplates))]
+			tpl := logTemplates[rng.IntN(len(logTemplates))]
 			batch[i] = logEntry{
 				Level:   tpl.level,
-				Service: services[rng.Intn(len(services))],
-				Host:    hosts[rng.Intn(len(hosts))],
+				Service: services[rng.IntN(len(services))],
+				Host:    hosts[rng.IntN(len(hosts))],
 				Body:    tpl.body,
-				Attrs:   attrs[rng.Intn(len(attrs))],
+				Attrs:   attrs[rng.IntN(len(attrs))],
 			}
 		}
 		if err := sendBatch(client, *addr, batch); err != nil {
@@ -178,18 +183,18 @@ func buildTrace(rng *rand.Rand, traceID, service, parentSpanID string, startAt t
 	}
 
 	spanID := randHex(8)
-	dur := time.Duration(10+rng.Intn(490)) * time.Millisecond
+	dur := time.Duration(10+rng.IntN(490)) * time.Millisecond
 	if depth == 0 {
-		dur = time.Duration(200+rng.Intn(1800)) * time.Millisecond
+		dur = time.Duration(200+rng.IntN(1800)) * time.Millisecond
 	}
 
 	ops := operations[service]
 	if len(ops) == 0 {
 		ops = []string{"process"}
 	}
-	op := ops[rng.Intn(len(ops))]
+	op := ops[rng.IntN(len(ops))]
 
-	isError := forceError && depth == 0 || rng.Intn(20) == 0
+	isError := forceError && depth == 0 || rng.IntN(20) == 0
 
 	sp := otlpSpan{
 		TraceID:           hexToBase64(traceID),
@@ -207,10 +212,10 @@ func buildTrace(rng *rand.Rand, traceID, service, parentSpanID string, startAt t
 		sp.Status = otlpStatus{Code: 2, Message: "internal error"}
 	}
 
-	logCount := 1 + rng.Intn(3)
+	logCount := 1 + rng.IntN(3)
 	var logs []logEntry
 	for i := range logCount {
-		tpl := logTemplates[rng.Intn(len(logTemplates))]
+		tpl := logTemplates[rng.IntN(len(logTemplates))]
 		lvl := tpl.level
 		body := tpl.body
 		if isError && i == logCount-1 {
@@ -220,11 +225,11 @@ func buildTrace(rng *rand.Rand, traceID, service, parentSpanID string, startAt t
 		logs = append(logs, logEntry{
 			Level:   lvl,
 			Service: service,
-			Host:    hosts[rng.Intn(len(hosts))],
+			Host:    hosts[rng.IntN(len(hosts))],
 			Body:    body,
 			TraceID: traceID,
 			SpanID:  spanID,
-			Attrs:   attrs[rng.Intn(len(attrs))],
+			Attrs:   attrs[rng.IntN(len(attrs))],
 		})
 	}
 
@@ -232,14 +237,14 @@ func buildTrace(rng *rand.Rand, traceID, service, parentSpanID string, startAt t
 
 	deps := callTree[service]
 	if len(deps) > 0 && depth < 2 {
-		childCount := 1 + rng.Intn(min(2, len(deps)))
-		childStart := startAt.Add(time.Duration(10+rng.Intn(50)) * time.Millisecond)
+		childCount := 1 + rng.IntN(min(2, len(deps)))
+		childStart := startAt.Add(time.Duration(10+rng.IntN(50)) * time.Millisecond)
 		for i := range childCount {
 			dep := deps[i%len(deps)]
 			childSpans, childLogs := buildTrace(rng, traceID, dep, spanID, childStart, depth+1, false)
 			allSpans = append(allSpans, childSpans...)
 			logs = append(logs, childLogs...)
-			childStart = childStart.Add(time.Duration(30+rng.Intn(100)) * time.Millisecond)
+			childStart = childStart.Add(time.Duration(30+rng.IntN(100)) * time.Millisecond)
 		}
 	}
 
