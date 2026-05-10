@@ -142,7 +142,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		SpanManager: spanManager,
 		LogSparse:   logSparse,
 		SpanSparse:  spanSparse,
-		Indexer:     exec,
+		Indexer:     exec.ActiveIndex(),
 		Logger:      cfg.Logger,
 	}, ingest.Config{
 		BatchSize:        cfg.Ingest.BatchSize,
