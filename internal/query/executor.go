@@ -16,6 +16,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 
 	"github.com/hnlbs/amber/internal/index"
+	"github.com/hnlbs/amber/internal/indexer"
 	"github.com/hnlbs/amber/internal/model"
 	"github.com/hnlbs/amber/internal/storage"
 )
@@ -80,14 +81,12 @@ type Executor struct {
 	logDir      string
 	spanDir     string
 
-	indexMu             sync.RWMutex
-	activeLogBitmap     *index.MultiFieldIndex
-	activeLogBitmapName string
-	activeSpanBitmap    *index.MultiFieldIndex
-	activeSpanName      string
-	logRibbons          map[string]*index.RibbonFilter
-	logFTSRibbons       map[string]*index.RibbonFilter
-	spanRibbons         map[string]*index.RibbonFilter
+	active *indexer.ActiveIndex
+
+	sealedMu      sync.RWMutex
+	logRibbons    map[string]*index.RibbonFilter
+	logFTSRibbons map[string]*index.RibbonFilter
+	spanRibbons   map[string]*index.RibbonFilter
 
 	logBitmapCache  *indexLRU[*index.MultiFieldIndex]
 	spanBitmapCache *indexLRU[*index.MultiFieldIndex]
@@ -347,6 +346,7 @@ func NewExecutorWithCache(
 		planner:         NewPlanner(logSparse),
 		logDir:          logDir,
 		spanDir:         spanDir,
+		active:          indexer.New(logManager, spanManager),
 		logRibbons:      make(map[string]*index.RibbonFilter),
 		logFTSRibbons:   make(map[string]*index.RibbonFilter),
 		spanRibbons:     make(map[string]*index.RibbonFilter),
@@ -359,16 +359,21 @@ func NewExecutorWithCache(
 	}
 }
 
+// ActiveIndex exposes the writer-side bitmap so wire-up code (runtime.New)
+// can hand it to Batcher as the ActiveIndexer. Read-side query paths use it
+// internally via LookupLog/LookupSpan.
+func (e *Executor) ActiveIndex() *indexer.ActiveIndex { return e.active }
+
 func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 	if e.logReaders != nil {
 		e.logReaders.invalidate(e.logManager.SegmentPath(seg))
 	}
 	e.logBitmapCache.delete(seg.FileName)
 	e.ftsCache.delete(seg.FileName)
-	e.indexMu.Lock()
+	e.sealedMu.Lock()
 	delete(e.logRibbons, seg.FileName)
 	delete(e.logFTSRibbons, seg.FileName)
-	e.indexMu.Unlock()
+	e.sealedMu.Unlock()
 	e.resultCache.clear()
 }
 
@@ -377,9 +382,9 @@ func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
 		e.spanReaders.invalidate(e.spanManager.SegmentPath(seg))
 	}
 	e.spanBitmapCache.delete(seg.FileName)
-	e.indexMu.Lock()
+	e.sealedMu.Lock()
 	delete(e.spanRibbons, seg.FileName)
-	e.indexMu.Unlock()
+	e.sealedMu.Unlock()
 	e.resultCache.clear()
 }
 
@@ -405,31 +410,27 @@ func (e *Executor) RegisterFTSIndex(segmentFile string, idx *index.FTSIndex) {
 }
 
 func (e *Executor) RegisterLogRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.indexMu.Lock()
+	e.sealedMu.Lock()
 	e.logRibbons[segmentFile] = f
-	e.indexMu.Unlock()
+	e.sealedMu.Unlock()
 }
 
 func (e *Executor) RegisterLogFTSRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.indexMu.Lock()
+	e.sealedMu.Lock()
 	e.logFTSRibbons[segmentFile] = f
-	e.indexMu.Unlock()
+	e.sealedMu.Unlock()
 }
 
 func (e *Executor) RegisterSpanRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.indexMu.Lock()
+	e.sealedMu.Lock()
 	e.spanRibbons[segmentFile] = f
-	e.indexMu.Unlock()
+	e.sealedMu.Unlock()
 }
 
 func (e *Executor) logBitmap(name string) (*index.MultiFieldIndex, bool) {
-	e.indexMu.RLock()
-	if e.activeLogBitmapName == name && e.activeLogBitmap != nil {
-		idx := e.activeLogBitmap
-		e.indexMu.RUnlock()
+	if idx, ok := e.active.LookupLog(name); ok {
 		return idx, true
 	}
-	e.indexMu.RUnlock()
 	if idx, ok := e.logBitmapCache.get(name); ok {
 		return idx, true
 	}
@@ -445,13 +446,9 @@ func (e *Executor) logBitmap(name string) (*index.MultiFieldIndex, bool) {
 }
 
 func (e *Executor) spanBitmap(name string) (*index.MultiFieldIndex, bool) {
-	e.indexMu.RLock()
-	if e.activeSpanName == name && e.activeSpanBitmap != nil {
-		idx := e.activeSpanBitmap
-		e.indexMu.RUnlock()
+	if idx, ok := e.active.LookupSpan(name); ok {
 		return idx, true
 	}
-	e.indexMu.RUnlock()
 	if idx, ok := e.spanBitmapCache.get(name); ok {
 		return idx, true
 	}
@@ -482,212 +479,24 @@ func (e *Executor) fts(name string) (*index.FTSIndex, bool) {
 }
 
 func (e *Executor) logRibbon(name string) (*index.RibbonFilter, bool) {
-	e.indexMu.RLock()
+	e.sealedMu.RLock()
 	f, ok := e.logRibbons[name]
-	e.indexMu.RUnlock()
+	e.sealedMu.RUnlock()
 	return f, ok
 }
 
 func (e *Executor) logFTSRibbon(name string) (*index.RibbonFilter, bool) {
-	e.indexMu.RLock()
+	e.sealedMu.RLock()
 	f, ok := e.logFTSRibbons[name]
-	e.indexMu.RUnlock()
+	e.sealedMu.RUnlock()
 	return f, ok
 }
 
 func (e *Executor) spanRibbon(name string) (*index.RibbonFilter, bool) {
-	e.indexMu.RLock()
+	e.sealedMu.RLock()
 	f, ok := e.spanRibbons[name]
-	e.indexMu.RUnlock()
+	e.sealedMu.RUnlock()
 	return f, ok
-}
-
-func (e *Executor) IndexLogEntry(entry model.LogEntry) {
-	idx := e.activeLogIndex()
-	if idx == nil {
-		return
-	}
-	entryID := model.EntryIDToUint64(entry.ID)
-	idx.Add("level", entry.Level.String(), entryID)
-	if entry.Service != "" {
-		idx.Add("service", entry.Service, entryID)
-	}
-	if entry.Host != "" {
-		idx.Add("host", entry.Host, entryID)
-	}
-	if !model.IsZeroTraceID(entry.TraceID) {
-		var traceHex [32]byte
-		hex.Encode(traceHex[:], entry.TraceID[:])
-		idx.Add("trace_id", string(traceHex[:]), entryID)
-	}
-}
-
-func (e *Executor) IndexSpanEntry(span model.SpanEntry) {
-	idx := e.activeSpanIndex()
-	if idx == nil {
-		return
-	}
-	entryID := model.EntryIDToUint64(span.ID)
-	if span.Service != "" {
-		idx.Add("service", span.Service, entryID)
-	}
-	if !model.IsZeroTraceID(span.TraceID) {
-		var traceHex [32]byte
-		hex.Encode(traceHex[:], span.TraceID[:])
-		idx.Add("trace_id", string(traceHex[:]), entryID)
-	}
-}
-
-func (e *Executor) activeLogIndex() *index.MultiFieldIndex {
-	activeMeta, ok := e.logManager.ActiveSegmentMeta()
-	if !ok {
-		return nil
-	}
-	e.indexMu.RLock()
-	if e.activeLogBitmapName == activeMeta.FileName && e.activeLogBitmap != nil {
-		idx := e.activeLogBitmap
-		e.indexMu.RUnlock()
-		return idx
-	}
-	e.indexMu.RUnlock()
-
-	e.indexMu.Lock()
-	defer e.indexMu.Unlock()
-	if e.activeLogBitmapName == activeMeta.FileName && e.activeLogBitmap != nil {
-		return e.activeLogBitmap
-	}
-	fresh := index.NewMultiFieldIndex()
-	e.activeLogBitmap = fresh
-	e.activeLogBitmapName = activeMeta.FileName
-	return fresh
-}
-
-func (e *Executor) activeSpanIndex() *index.MultiFieldIndex {
-	activeMeta, ok := e.spanManager.ActiveSegmentMeta()
-	if !ok {
-		return nil
-	}
-	e.indexMu.RLock()
-	if e.activeSpanName == activeMeta.FileName && e.activeSpanBitmap != nil {
-		idx := e.activeSpanBitmap
-		e.indexMu.RUnlock()
-		return idx
-	}
-	e.indexMu.RUnlock()
-
-	e.indexMu.Lock()
-	defer e.indexMu.Unlock()
-	if e.activeSpanName == activeMeta.FileName && e.activeSpanBitmap != nil {
-		return e.activeSpanBitmap
-	}
-	fresh := index.NewMultiFieldIndex()
-	e.activeSpanBitmap = fresh
-	e.activeSpanName = activeMeta.FileName
-	return fresh
-}
-
-func (e *Executor) IndexLogEntries(entries []*model.LogEntry) {
-	if len(entries) == 0 {
-		return
-	}
-	idx := e.activeLogIndex()
-	if idx == nil {
-		return
-	}
-
-	levelGroups := make(map[string][]uint64, 4)
-	serviceGroups := make(map[string][]uint64, 4)
-	hostGroups := make(map[string][]uint64, 8)
-	traceGroups := make(map[string][]uint64)
-
-	var traceHexCache map[model.TraceID]string
-
-	for _, entry := range entries {
-		entryID := model.EntryIDToUint64(entry.ID)
-
-		levelGroups[entry.Level.String()] = append(levelGroups[entry.Level.String()], entryID)
-		if entry.Service != "" {
-			serviceGroups[entry.Service] = append(serviceGroups[entry.Service], entryID)
-		}
-		if entry.Host != "" {
-			hostGroups[entry.Host] = append(hostGroups[entry.Host], entryID)
-		}
-		if !model.IsZeroTraceID(entry.TraceID) {
-			if traceHexCache == nil {
-				traceHexCache = make(map[model.TraceID]string)
-			}
-			th, ok := traceHexCache[entry.TraceID]
-			if !ok {
-				var buf [32]byte
-				hex.Encode(buf[:], entry.TraceID[:])
-				th = string(buf[:])
-				traceHexCache[entry.TraceID] = th
-			}
-			traceGroups[th] = append(traceGroups[th], entryID)
-		}
-	}
-
-	flush := func(field string, groups map[string][]uint64) {
-		if len(groups) == 0 {
-			return
-		}
-		bi := idx.GetOrCreate(field)
-		for value, ids := range groups {
-			bi.AddMany(value, ids)
-		}
-	}
-	flush("level", levelGroups)
-	flush("service", serviceGroups)
-	flush("host", hostGroups)
-	flush("trace_id", traceGroups)
-}
-
-func (e *Executor) IndexSpanEntries(spans []*model.SpanEntry) {
-	if len(spans) == 0 {
-		return
-	}
-	idx := e.activeSpanIndex()
-	if idx == nil {
-		return
-	}
-
-	serviceGroups := make(map[string][]uint64, 4)
-	traceGroups := make(map[string][]uint64)
-	var traceHexCache map[model.TraceID]string
-
-	for _, span := range spans {
-		entryID := model.EntryIDToUint64(span.ID)
-
-		if span.Service != "" {
-			serviceGroups[span.Service] = append(serviceGroups[span.Service], entryID)
-		}
-		if !model.IsZeroTraceID(span.TraceID) {
-			if traceHexCache == nil {
-				traceHexCache = make(map[model.TraceID]string)
-			}
-			th, ok := traceHexCache[span.TraceID]
-			if !ok {
-				var buf [32]byte
-				hex.Encode(buf[:], span.TraceID[:])
-				th = string(buf[:])
-				traceHexCache[span.TraceID] = th
-			}
-			traceGroups[th] = append(traceGroups[th], entryID)
-		}
-	}
-
-	if len(serviceGroups) > 0 {
-		bi := idx.GetOrCreate("service")
-		for value, ids := range serviceGroups {
-			bi.AddMany(value, ids)
-		}
-	}
-	if len(traceGroups) > 0 {
-		bi := idx.GetOrCreate("trace_id")
-		for value, ids := range traceGroups {
-			bi.AddMany(value, ids)
-		}
-	}
 }
 
 func (e *Executor) Services() []string {
@@ -708,18 +517,20 @@ func (e *Executor) Services() []string {
 		}
 	}
 
-	e.indexMu.RLock()
-	if e.activeLogBitmap != nil {
-		for _, s := range e.activeLogBitmap.FieldValues("service") {
-			seen[s] = struct{}{}
+	if activeMeta, ok := e.logManager.ActiveSegmentMeta(); ok {
+		if idx, ok := e.active.LookupLog(activeMeta.FileName); ok {
+			for _, s := range idx.FieldValues("service") {
+				seen[s] = struct{}{}
+			}
 		}
 	}
-	if e.activeSpanBitmap != nil {
-		for _, s := range e.activeSpanBitmap.FieldValues("service") {
-			seen[s] = struct{}{}
+	if activeMeta, ok := e.spanManager.ActiveSegmentMeta(); ok {
+		if idx, ok := e.active.LookupSpan(activeMeta.FileName); ok {
+			for _, s := range idx.FieldValues("service") {
+				seen[s] = struct{}{}
+			}
 		}
 	}
-	e.indexMu.RUnlock()
 
 	e.scanActiveServices(seen)
 
