@@ -173,8 +173,20 @@ func run() error {
 	mux := http.NewServeMux()
 	amberhttp.RegisterRoutes(mux, batcher, exec, logManager, logSparse, cfg.API.APIKey, log)
 
-	httpServer := amberhttp.NewServer(cfg.API.HTTPAddr, mux, cfg.API.ReadTimeout, cfg.API.ReadHeaderTimeout, cfg.API.WriteTimeout, cfg.API.IdleTimeout, log)
-	httpServer.Start()
+	httpServer := &http.Server{
+		Addr:              cfg.API.HTTPAddr,
+		Handler:           mux,
+		ReadTimeout:       cfg.API.ReadTimeout,
+		ReadHeaderTimeout: cfg.API.ReadHeaderTimeout,
+		WriteTimeout:      cfg.API.WriteTimeout,
+		IdleTimeout:       cfg.API.IdleTimeout,
+	}
+	go func() {
+		log.Info("http server listening", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("http server error", "err", err)
+		}
+	}()
 
 	<-ctx.Done()
 	log.Info("shutdown signal received")
