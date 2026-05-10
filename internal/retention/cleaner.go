@@ -3,6 +3,7 @@ package retention
 import (
 	"log/slog"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/hnlbs/amber/internal/index"
@@ -84,6 +85,14 @@ func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []storage.Se
 	}
 
 	remaining := filterOut(segments, toDelete)
+
+	// MaxSegments and MaxTotalBytes both evict from the oldest end. Sort by
+	// MaxTS ascending so segments[0] is the oldest. Without this we relied on
+	// the manager returning segments in insertion order — true today, fragile
+	// to assume forever.
+	sort.SliceStable(remaining, func(i, j int) bool {
+		return remaining[i].MaxTS < remaining[j].MaxTS
+	})
 
 	if c.policy.MaxSegments > 0 && len(remaining) > c.policy.MaxSegments {
 		excess := len(remaining) - c.policy.MaxSegments

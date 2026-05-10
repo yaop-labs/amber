@@ -275,6 +275,12 @@ func (sw *SegmentWriter) RecordCount() uint64 {
 	return sw.recordCount
 }
 
+func (sw *SegmentWriter) TimeRange() (int64, int64) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.minTS, sw.maxTS
+}
+
 // BlockCount returns the number of blocks already flushed (compressed and
 // handed off to the bufio writer). Used by SegmentManager to detect whether
 // the latest WriteRecord triggered a block flush and therefore needs a sync.

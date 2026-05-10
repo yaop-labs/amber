@@ -23,6 +23,11 @@ var (
 		Name: "amber_ingest_dropped_total",
 		Help: "Entries dropped before reaching storage.",
 	}, []string{"kind", "reason"})
+
+	SealIndexErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "amber_seal_index_errors_total",
+		Help: "Index builds that failed during segment seal, after retries.",
+	}, []string{"kind", "index"})
 )
 
 func init() {
@@ -31,6 +36,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		IngestAccepted,
 		IngestDropped,
+		SealIndexErrors,
 	)
 }
 

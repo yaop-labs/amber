@@ -41,7 +41,7 @@ func (s *SparseIndex) Touch(segmentID uint32, fileName string, ts int64) {
 	defer s.mu.Unlock()
 	for i := range s.ranges {
 		if s.ranges[i].SegmentID == segmentID {
-			if s.ranges[i].MinTS == 0 || ts < s.ranges[i].MinTS {
+			if ts < s.ranges[i].MinTS {
 				s.ranges[i].MinTS = ts
 			}
 			if ts > s.ranges[i].MaxTS {
@@ -63,7 +63,7 @@ func (s *SparseIndex) TouchRange(segmentID uint32, fileName string, minTS, maxTS
 	defer s.mu.Unlock()
 	for i := range s.ranges {
 		if s.ranges[i].SegmentID == segmentID {
-			if s.ranges[i].MinTS == 0 || minTS < s.ranges[i].MinTS {
+			if minTS < s.ranges[i].MinTS {
 				s.ranges[i].MinTS = minTS
 			}
 			if maxTS > s.ranges[i].MaxTS {

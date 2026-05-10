@@ -339,6 +339,11 @@ func (sm *SegmentManager) shouldRotate() bool {
 }
 
 func (sm *SegmentManager) rotate() error {
+	// Take metadata snapshots from the live writer before Close so we don't
+	// have to reopen the file as a SegmentReader under the write lock.
+	recordCount := sm.active.RecordCount()
+	minTS, maxTS := sm.active.TimeRange()
+
 	if err := sm.active.Close(); err != nil {
 		return fmt.Errorf("segmgr: rotate close: %w", err)
 	}
@@ -347,18 +352,13 @@ func (sm *SegmentManager) rotate() error {
 	for i := range sm.meta.Segments {
 		if !sm.meta.Segments[i].Sealed {
 			sm.meta.Segments[i].Sealed = true
-			sm.meta.Segments[i].RecordCount = sm.active.RecordCount()
+			sm.meta.Segments[i].RecordCount = recordCount
+			sm.meta.Segments[i].MinTS = minTS
+			sm.meta.Segments[i].MaxTS = maxTS
 
 			segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
 			if info, err := os.Stat(segPath); err == nil {
 				sm.meta.Segments[i].SizeBytes = info.Size()
-			}
-
-			if sr, err := OpenSegmentReader(segPath, nil); err == nil {
-				footer := sr.Footer()
-				sm.meta.Segments[i].MinTS = footer.MinTS
-				sm.meta.Segments[i].MaxTS = footer.MaxTS
-				_ = sr.Close()
 			}
 			sealedMeta = sm.meta.Segments[i]
 			break
