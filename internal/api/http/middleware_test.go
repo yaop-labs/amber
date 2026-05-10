@@ -58,7 +58,7 @@ func TestMaxBytesMiddleware_ZeroLimitDisablesGuard(t *testing.T) {
 
 func TestReadyHandler(t *testing.T) {
 	var ready atomic.Bool
-	h := ReadyHandler(&ready)
+	h := ReadyHandler(ready.Load)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))

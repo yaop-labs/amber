@@ -156,7 +156,7 @@ func run() error {
 		Executor:   stack.Executor,
 		LogManager: stack.LogManager,
 		LogSparse:  stack.LogSparse,
-		Ready:      stack.Ready,
+		IsReady:    stack.IsReady,
 		Logger:     log,
 	}, amberhttp.RoutesConfig{
 		APIKey:          cfg.API.APIKey,
