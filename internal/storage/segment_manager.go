@@ -250,12 +250,7 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	payloads := make([][]byte, len(items))
-	for i, item := range items {
-		payloads[i] = makeWALPayload(item.TS, item.Data)
-	}
-
-	firstSeq, err := sm.wal.WriteBatch(payloads)
+	firstSeq, err := sm.wal.WriteBatchTS(items)
 	if err != nil {
 		return fmt.Errorf("segmgr: wal batch: %w", err)
 	}

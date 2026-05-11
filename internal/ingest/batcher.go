@@ -42,6 +42,52 @@ type Batcher struct {
 	breakerThreshold uint64
 	consecFailures   atomic.Uint64
 	guard            *CardinalityGuard
+
+	logM, spanM kindMetrics
+}
+
+// kindMetrics holds precomputed metric handles for one entry kind ("log" or
+// "span"). Resolving the CounterVec child via WithLabelValues each call adds
+// a strings.Join allocation per metric event (~50ns + 16B garbage). For
+// success paths this fires on every accepted entry. Bind once at NewBatcher
+// time and store pointers.
+type kindMetrics struct {
+	accepted     *metrics.Counter
+	breakerOpen  *metrics.Counter
+	queueFull    *metrics.Counter
+	serializeErr *metrics.Counter
+	writeFailed  *metrics.Counter
+	cardAttrs    *metrics.Counter
+	cardValueLen *metrics.Counter
+	cardKeys     *metrics.Counter
+}
+
+func newKindMetrics(kind string) kindMetrics {
+	return kindMetrics{
+		accepted:     metrics.IngestAccepted.WithLabelValues(kind),
+		breakerOpen:  metrics.IngestDropped.WithLabelValues(kind, "breaker_open"),
+		queueFull:    metrics.IngestDropped.WithLabelValues(kind, "queue_full"),
+		serializeErr: metrics.IngestDropped.WithLabelValues(kind, "serialize_error"),
+		writeFailed:  metrics.IngestDropped.WithLabelValues(kind, "write_failed"),
+		cardAttrs:    metrics.IngestDropped.WithLabelValues(kind, "attrs_per_entry"),
+		cardValueLen: metrics.IngestDropped.WithLabelValues(kind, "attr_value_too_long"),
+		cardKeys:     metrics.IngestDropped.WithLabelValues(kind, "key_cardinality"),
+	}
+}
+
+// dropCardinality dispatches a guard.Check return string to the right
+// counter. Mirrors the reason strings defined in cardinality.go — keep in
+// sync. Returns nil for unknown reasons (defensive; caller checks).
+func (m *kindMetrics) dropCardinality(reason string) *metrics.Counter {
+	switch reason {
+	case "attrs_per_entry":
+		return m.cardAttrs
+	case "attr_value_too_long":
+		return m.cardValueLen
+	case "key_cardinality":
+		return m.cardKeys
+	}
+	return nil
 }
 
 type Deps struct {
@@ -78,6 +124,8 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		log:              deps.Logger,
 		breakerThreshold: threshold,
 		guard:            deps.Guard,
+		logM:             newKindMetrics("log"),
+		spanM:            newKindMetrics("span"),
 	}
 }
 
@@ -96,18 +144,20 @@ func (b *Batcher) Wait() {
 
 func (b *Batcher) SendLog(entry model.LogEntry) error {
 	if b.IsBreakerOpen() {
-		metrics.IngestDropped.WithLabelValues("log", "breaker_open").Inc()
+		b.logM.breakerOpen.Inc()
 		return ErrBreakerOpen
 	}
 	if reason := b.guard.Check(entry.Service, entry.Attrs); reason != "" {
-		metrics.IngestDropped.WithLabelValues("log", reason).Inc()
+		if c := b.logM.dropCardinality(reason); c != nil {
+			c.Inc()
+		}
 		return ErrCardinality
 	}
 	select {
 	case b.queue <- item{log: &entry}:
 		return nil
 	default:
-		metrics.IngestDropped.WithLabelValues("log", "queue_full").Inc()
+		b.logM.queueFull.Inc()
 		b.log.Warn("ingest queue full, dropping log entry",
 			"entry_id", entry.ID.String(),
 			"service", entry.Service,
@@ -118,18 +168,20 @@ func (b *Batcher) SendLog(entry model.LogEntry) error {
 
 func (b *Batcher) SendSpan(span model.SpanEntry) error {
 	if b.IsBreakerOpen() {
-		metrics.IngestDropped.WithLabelValues("span", "breaker_open").Inc()
+		b.spanM.breakerOpen.Inc()
 		return ErrBreakerOpen
 	}
 	if reason := b.guard.Check(span.Service, span.Attrs); reason != "" {
-		metrics.IngestDropped.WithLabelValues("span", reason).Inc()
+		if c := b.spanM.dropCardinality(reason); c != nil {
+			c.Inc()
+		}
 		return ErrCardinality
 	}
 	select {
 	case b.queue <- item{span: &span}:
 		return nil
 	default:
-		metrics.IngestDropped.WithLabelValues("span", "queue_full").Inc()
+		b.spanM.queueFull.Inc()
 		b.log.Warn("ingest queue full, dropping span",
 			"entry_id", span.ID.String(),
 			"service", span.Service,
@@ -219,11 +271,11 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 		}
 
 		if writeErr != nil {
-			kind := "log"
 			if it.span != nil {
-				kind = "span"
+				b.spanM.serializeErr.Inc()
+			} else {
+				b.logM.serializeErr.Inc()
 			}
-			metrics.IngestDropped.WithLabelValues(kind, "serialize_error").Inc()
 			b.log.Error("serialize entry", "err", writeErr)
 			bufPool.Put(buf)
 			continue
@@ -259,10 +311,10 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 	if len(logItems) > 0 {
 		if err := b.logManager.WriteBatch(logItems); err != nil {
 			anyFailed = true
-			metrics.IngestDropped.WithLabelValues("log", "write_failed").Add(uint64(len(logItems)))
+			b.logM.writeFailed.Add(uint64(len(logItems)))
 			b.log.Error("log batch write failed", "err", err, "count", len(logItems))
 		} else {
-			metrics.IngestAccepted.WithLabelValues("log").Add(uint64(len(logItems)))
+			b.logM.accepted.Add(uint64(len(logItems)))
 			updateSparseFromBatch(b.logSparse, b.logManager, logItems)
 			if b.indexer != nil && len(logEntries) > 0 {
 				b.indexer.IndexLogEntries(logEntries)
@@ -276,10 +328,10 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) {
 	if len(spanItems) > 0 {
 		if err := b.spanManager.WriteBatch(spanItems); err != nil {
 			anyFailed = true
-			metrics.IngestDropped.WithLabelValues("span", "write_failed").Add(uint64(len(spanItems)))
+			b.spanM.writeFailed.Add(uint64(len(spanItems)))
 			b.log.Error("span batch write failed", "err", err, "count", len(spanItems))
 		} else {
-			metrics.IngestAccepted.WithLabelValues("span").Add(uint64(len(spanItems)))
+			b.spanM.accepted.Add(uint64(len(spanItems)))
 			updateSparseFromBatch(b.spanSparse, b.spanManager, spanItems)
 			if b.indexer != nil && len(spanEntries) > 0 {
 				b.indexer.IndexSpanEntries(spanEntries)

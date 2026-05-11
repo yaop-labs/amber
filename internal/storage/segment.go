@@ -56,6 +56,7 @@ type SegmentWriter struct {
 	bw              *bufio.Writer
 	encoder         *zstd.Encoder
 	blockBuf        bytes.Buffer
+	compressedBuf   []byte // reused dst for zstd.EncodeAll across flushes
 	blockRecords    uint32
 	blockMinID      uint64
 	blockMaxID      uint64
@@ -165,7 +166,11 @@ func (sw *SegmentWriter) flushBlock() error {
 	uncompressed := sw.blockBuf.Bytes()
 	uncompressedSize := uint32(len(uncompressed))
 
-	compressed := sw.encoder.EncodeAll(uncompressed, nil)
+	// Reuse compressedBuf capacity across flushes. First flush allocates,
+	// subsequent ones append into existing storage. zstd's EncodeAll
+	// appends, so [:0] keeps capacity, drops length.
+	sw.compressedBuf = sw.encoder.EncodeAll(uncompressed, sw.compressedBuf[:0])
+	compressed := sw.compressedBuf
 	compressedSize := uint32(len(compressed))
 
 	sw.blockOffsets = append(sw.blockOffsets, sw.fileOffset)

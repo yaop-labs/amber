@@ -258,6 +258,10 @@ func (e *LogEntry) ReadFrom(r io.Reader) (int64, error) {
 	return n, nil
 }
 
+// writeString writes len-prefixed string. io.WriteString routes to
+// w.WriteString if w implements io.StringWriter (the bufPool *bytes.Buffer
+// does), avoiding the []byte(s) heap copy that `w.Write([]byte(s))` would
+// force. Caller paths in processBatch always use *bytes.Buffer.
 func writeString(w io.Writer, s string) (int64, error) {
 	if len(s) > 65535 {
 		return 0, fmt.Errorf("string too long: %d bytes", len(s))
@@ -269,7 +273,7 @@ func writeString(w io.Writer, s string) (int64, error) {
 	if err != nil {
 		return n, err
 	}
-	nn, err = w.Write([]byte(s))
+	nn, err = io.WriteString(w, s)
 	n += int64(nn)
 	return n, err
 }
@@ -282,7 +286,7 @@ func writeLargeString(w io.Writer, s string) (int64, error) {
 	if err != nil {
 		return n, err
 	}
-	nn, err = w.Write([]byte(s))
+	nn, err = io.WriteString(w, s)
 	n += int64(nn)
 	return n, err
 }

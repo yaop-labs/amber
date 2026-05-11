@@ -125,6 +125,64 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 	return seq, nil
 }
 
+// WriteBatchTS appends (ts, data) records under a single fsync without
+// allocating per-record (ts||data) payloads. CRC is computed incrementally
+// over the two parts. On-disk format is identical to WriteBatch with a
+// payload of (8-byte LE ts || data) — replay code is unchanged.
+//
+// Hot path for SegmentManager.WriteBatch: the old path allocated a
+// []byte{8+len(data)} per record via makeWALPayload (~8% of processBatch
+// allocs at batch=256).
+func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Reserve len(items) sequential seqs in a single atomic op.
+	n := uint64(len(items))
+	firstSeq := w.nextSeq.Add(n) - n
+
+	var tsBuf [8]byte
+	var header [walHeaderSize]byte
+
+	for i, item := range items {
+		binary.LittleEndian.PutUint64(tsBuf[:], uint64(item.TS))
+		// Incremental CRC: ts then data. crc32.Update with IEEETable is
+		// the same poly as crc32.ChecksumIEEE — bytes hashed in order
+		// produce the same digest as one-shot over the concat.
+		crc := crc32.Update(0, crc32.IEEETable, tsBuf[:])
+		crc = crc32.Update(crc, crc32.IEEETable, item.Data)
+		length := uint32(8 + len(item.Data))
+
+		binary.LittleEndian.PutUint32(header[0:4], walMagic)
+		binary.LittleEndian.PutUint32(header[4:8], crc)
+		binary.LittleEndian.PutUint32(header[8:12], length)
+		binary.LittleEndian.PutUint64(header[12:20], firstSeq+uint64(i))
+
+		if _, err := w.buf.Write(header[:]); err != nil {
+			return 0, fmt.Errorf("wal: write header: %w", err)
+		}
+		if _, err := w.buf.Write(tsBuf[:]); err != nil {
+			return 0, fmt.Errorf("wal: write ts: %w", err)
+		}
+		if _, err := w.buf.Write(item.Data); err != nil {
+			return 0, fmt.Errorf("wal: write data: %w", err)
+		}
+	}
+
+	if err := w.buf.Flush(); err != nil {
+		return 0, fmt.Errorf("wal: batch flush: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return 0, fmt.Errorf("wal: batch sync: %w", err)
+	}
+
+	return firstSeq, nil
+}
+
 // WriteBatch appends a batch of records under a single fsync, returning the
 // seq of the first record (subsequent records are sequential).
 func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
