@@ -8,7 +8,9 @@
 // Usage:
 //
 //	go run ./cmd/loadbench -n 10000000 -tmpdir /mnt/scratch
-//	go run ./cmd/loadbench -n 100000 -o smoke.txt   # smoke run
+//	go run ./cmd/loadbench -n 100000 -o smoke.txt                     # smoke run
+//	go run ./cmd/loadbench -n 10000000 -restart                       # cold-start RSS
+//	go run ./cmd/loadbench -n 10000000 -warmup-iters 10               # stable p99
 package main
 
 import (
@@ -33,17 +35,19 @@ import (
 )
 
 var (
-	flagN          = flag.Int("n", 10_000_000, "number of records to ingest")
-	flagBatch      = flag.Int("batch", 1024, "Batcher.BatchSize (records flushed per WriteBatch)")
-	flagQueue      = flag.Int("queue", 64*1024, "Batcher.QueueSize")
-	flagTmpDir     = flag.String("tmpdir", "", "data dir (default: OS tmpdir, removed at exit)")
-	flagQueryIters = flag.Int("query-iters", 100, "iterations per query scenario")
-	flagSeed       = flag.Uint64("seed", 42, "PRNG seed for record content")
-	flagServices   = flag.Int("services", 5, "cardinality of service field")
-	flagHosts      = flag.Int("hosts", 20, "cardinality of host field")
-	flagSealWait   = flag.Duration("seal-wait", 60*time.Second, "max wait for all sealed segments to have indexes built")
-	flagOut        = flag.String("o", "", "output file (default: stdout)")
-	flagKeep       = flag.Bool("keep", false, "do not delete tmpdir at exit")
+	flagN           = flag.Int("n", 10_000_000, "number of records to ingest")
+	flagBatch       = flag.Int("batch", 1024, "Batcher.BatchSize (records flushed per WriteBatch)")
+	flagQueue       = flag.Int("queue", 64*1024, "Batcher.QueueSize")
+	flagTmpDir      = flag.String("tmpdir", "", "data dir (default: OS tmpdir, removed at exit)")
+	flagQueryIters  = flag.Int("query-iters", 100, "iterations per query scenario")
+	flagSeed        = flag.Uint64("seed", 42, "PRNG seed for record content")
+	flagServices    = flag.Int("services", 5, "cardinality of service field")
+	flagHosts       = flag.Int("hosts", 20, "cardinality of host field")
+	flagSealWait    = flag.Duration("seal-wait", 60*time.Second, "max wait for all sealed segments to have indexes built")
+	flagOut         = flag.String("o", "", "output file (default: stdout)")
+	flagKeep        = flag.Bool("keep", false, "do not delete tmpdir at exit")
+	flagRestart     = flag.Bool("restart", false, "close+reopen engine before M/R phases; reports cold-start RSS instead of post-ingest RSS")
+	flagWarmupIters = flag.Int("warmup-iters", 5, "dry-run query iterations before timing; primes segment reader handles and settles GC")
 )
 
 const (
@@ -94,16 +98,15 @@ func main() {
 	}
 
 	report := &reporter{w: out}
-	report.printf("loadbench: n=%d batch=%d queue=%d services=%d hosts=%d seed=%d\n",
-		*flagN, *flagBatch, *flagQueue, *flagServices, *flagHosts, *flagSeed)
+	report.printf("loadbench: n=%d batch=%d queue=%d services=%d hosts=%d seed=%d restart=%v warmup=%d\n",
+		*flagN, *flagBatch, *flagQueue, *flagServices, *flagHosts, *flagSeed, *flagRestart, *flagWarmupIters)
 	report.printf("data dir: %s (keep=%v)\n\n", dir, *flagKeep)
 
 	// Logger discards everything except warnings/errors so we don't pollute
 	// stdout. Errors still surface for triage.
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	stack, err := rt.New(ctx, rt.Options{
+	opts := rt.Options{
 		DataDir: dir,
 		Logger:  logger,
 		Ingest: rt.IngestOptions{
@@ -111,7 +114,10 @@ func main() {
 			BatchTimeout: 100 * time.Millisecond,
 			QueueSize:    *flagQueue,
 		},
-	})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stack, err := rt.New(ctx, opts)
 	if err != nil {
 		cancel()
 		fatal("rt.New: %v", err)
@@ -129,12 +135,34 @@ func main() {
 	waited, sealedSegs := waitForSealing(stack, *flagSealWait)
 	report.printf("seal wait: %v across %d sealed segments\n\n", waited.Round(time.Millisecond), sealedSegs)
 
+	// -restart: close and reopen the engine so bootstrap re-loads indexes from
+	// disk. M and R then reflect cold-start state, not the post-ingest process
+	// that already has everything in memory from the write phase. Without this,
+	// VmRSS is dominated by ingest-time allocations that have not been GC'd yet.
+	if *flagRestart {
+		cancel()
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := stack.Close(closeCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "restart close: %v\n", err)
+		}
+		cancelClose()
+
+		var newErr error
+		ctx, cancel = context.WithCancel(context.Background())
+		stack, newErr = rt.New(ctx, opts)
+		if newErr != nil {
+			cancel()
+			fatal("rt.New (restart): %v", newErr)
+		}
+		report.printf("restart: engine reopened (cold-start RSS follows)\n\n")
+	}
+
 	// M — Storage + idle RSS after GC.
-	m := measureMemory(stack, dir)
+	m := measureMemory(stack, dir, *flagRestart)
 	report.section("M — Storage and idle memory", m.lines())
 
 	// R — Read latency p50/p99 across 5 scenarios.
-	r := runReads(stack, *flagQueryIters, w)
+	r := runReads(stack, *flagQueryIters, *flagWarmupIters, w)
 	report.section("R — Read latency", r.lines())
 
 	cancel()
@@ -313,6 +341,10 @@ type memResult struct {
 	vmRSS        uint64
 	gcCycles     uint32
 	gcPauseTotal time.Duration
+	// cold is true when measured after a close+reopen cycle (-restart flag).
+	// False means post-ingest: bootstrap indexes are still hot from the write
+	// phase and VmRSS is inflated relative to a real cold start.
+	cold bool
 }
 
 func (m memResult) lines() []string {
@@ -325,13 +357,17 @@ func (m memResult) lines() []string {
 		fmt.Sprintf("sys total:  %s", humanBytes(int64(m.sysBytes))),
 	}
 	if m.vmRSS > 0 {
-		out = append(out, fmt.Sprintf("VmRSS:      %s (linux /proc)", humanBytes(int64(m.vmRSS))))
+		rssLabel := "post-ingest"
+		if m.cold {
+			rssLabel = "cold-start"
+		}
+		out = append(out, fmt.Sprintf("VmRSS:      %s (%s, linux /proc)", humanBytes(int64(m.vmRSS)), rssLabel))
 	}
 	out = append(out, fmt.Sprintf("gc:         %d cycles, %v total pause", m.gcCycles, m.gcPauseTotal.Round(time.Microsecond)))
 	return out
 }
 
-func measureMemory(stack *rt.Stack, dir string) memResult {
+func measureMemory(stack *rt.Stack, dir string, cold bool) memResult {
 	// Two GCs are the standard idiom for "settle" — the first frees young
 	// garbage, the second sweeps newly-promoted objects. FreeOSMemory hints to
 	// the OS to return pages so VmRSS reflects live state, not high-water.
@@ -349,6 +385,7 @@ func measureMemory(stack *rt.Stack, dir string) memResult {
 		gcCycles:     ms.NumGC,
 		gcPauseTotal: time.Duration(ms.PauseTotalNs),
 		vmRSS:        readRSS(),
+		cold:         cold,
 	}
 
 	// Walk dir to size segments / indexes / WAL.
@@ -423,7 +460,7 @@ func (r readsResult) lines() []string {
 	return out
 }
 
-func runReads(stack *rt.Stack, iters int, w writeResult) readsResult {
+func runReads(stack *rt.Stack, iters, warmup int, w writeResult) readsResult {
 	// Dataset spans [baseTS, baseTS + n*spacingNs]. Take a 1h window from the
 	// middle so R2 actually exercises pruning instead of covering everything
 	// or nothing.
@@ -448,18 +485,26 @@ func runReads(stack *rt.Stack, iters int, w writeResult) readsResult {
 
 	out := readsResult{scenarios: make([]queryStats, 0, len(scenarios))}
 	for _, sc := range scenarios {
-		out.scenarios = append(out.scenarios, runScenario(stack, sc.name, sc.q, iters))
+		out.scenarios = append(out.scenarios, runScenario(stack, sc.name, sc.q, iters, warmup))
 	}
 	return out
 }
 
-func runScenario(stack *rt.Stack, name string, q *query.LogQuery, iters int) queryStats {
+// runScenario measures query latency over iters cold executions.
+//
+// warmup dry-run iterations run first (with ClearResultCache each time) to
+// prime segment reader handles and let Go's allocator reach steady state.
+// These iterations are discarded. The measured iters still clear the result
+// cache between each run so they reflect cold query execution, not cache hits.
+func runScenario(stack *rt.Stack, name string, q *query.LogQuery, iters, warmup int) queryStats {
+	for i := 0; i < warmup; i++ {
+		stack.Executor.ClearResultCache()
+		_, _ = stack.Executor.ExecLog(context.Background(), q)
+	}
+
 	samples := make([]time.Duration, 0, iters)
 	var lastResult *query.LogResult
 	for i := 0; i < iters; i++ {
-		// Clear cache between iterations — we want cold execution latency,
-		// not result-cache lookup. Same skew that ClearResultCache fixed in
-		// the bench suite.
 		stack.Executor.ClearResultCache()
 		t0 := time.Now()
 		res, err := stack.Executor.ExecLog(context.Background(), q)
