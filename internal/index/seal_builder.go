@@ -3,7 +3,6 @@ package index
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"log/slog"
 
 	"github.com/hnlbs/amber/internal/model"
@@ -35,11 +34,10 @@ func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex
 		if entry.Host != "" {
 			idx.Add("host", entry.Host, entryID)
 		}
-		if !model.IsZeroTraceID(entry.TraceID) {
-			var traceHex [32]byte
-			hex.Encode(traceHex[:], entry.TraceID[:])
-			idx.Add("trace_id", string(traceHex[:]), entryID)
-		}
+		// trace_id intentionally excluded: high cardinality (~1 unique value per
+		// record) makes the bitmap per-value overhead dominate index size.
+		// Ribbon filter (.filt) handles segment-level trace_id pruning;
+		// executor falls back to scan for intra-segment matching.
 		return nil
 	})
 	if err != nil {
@@ -256,9 +254,8 @@ func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldInde
 		}
 		idx.Add("status", span.Status.String(), entryID)
 
-		var traceHex [32]byte
-		hex.Encode(traceHex[:], span.TraceID[:])
-		idx.Add("trace_id", string(traceHex[:]), entryID)
+		// trace_id excluded for same reason as log bitmap: high cardinality
+		// dominates index size. Ribbon filter handles segment pruning.
 
 		return nil
 	})
