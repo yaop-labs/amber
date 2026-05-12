@@ -124,7 +124,7 @@ func (sw *SegmentWriter) WriteRecord(data []byte, ts int64) error {
 	if sw.recordCount == 0 || ts < sw.minTS {
 		sw.minTS = ts
 	}
-	if ts > sw.maxTS {
+	if sw.recordCount == 0 || ts > sw.maxTS {
 		sw.maxTS = ts
 	}
 
