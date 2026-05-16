@@ -38,9 +38,28 @@ type (
 	SpanResult = query.SpanResult
 )
 
-// Options keeps the historical flat shape of the embedded API. Internally we
-// translate to runtime.Options. Callers who want richer knobs (cardinality
-// limits, etc.) can drop down to internal/runtime directly.
+// CardinalityLimits caps per-record attribute fan-out at ingest time.
+// Zero in any field disables that specific check; the zero value disables all.
+type CardinalityLimits struct {
+	MaxAttrsPerEntry      int
+	MaxAttrValueBytes     int
+	MaxAttrKeysPerService int
+}
+
+// S3Storage enables S3-compatible object storage for sealed segments and
+// their index sidecars. The active segment and WAL remain node-local.
+// Reads fall back to S3 on a local cache miss. Empty Bucket disables S3.
+// Endpoint overrides the AWS endpoint for MinIO, R2, DO Spaces, etc.
+type S3Storage struct {
+	Bucket   string
+	Prefix   string
+	Region   string
+	Endpoint string
+}
+
+// Options is the embedded API's configuration surface. It mirrors the
+// fields of internal/runtime.Options that matter for callers. Zero values
+// fall back to sensible defaults (see runtime/runtime.go).
 type Options struct {
 	SegmentMaxRecords uint64
 	SegmentMaxBytes   int64
@@ -49,6 +68,8 @@ type Options struct {
 	QueueSize         int
 	BreakerThreshold  int
 	IndexCacheSize    int
+	Cardinality       CardinalityLimits
+	S3                S3Storage
 	Logger            *slog.Logger
 }
 
@@ -75,12 +96,21 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 		Storage: runtime.StorageOptions{
 			SegmentMaxRecords: o.SegmentMaxRecords,
 			SegmentMaxBytes:   o.SegmentMaxBytes,
+			S3Bucket:          o.S3.Bucket,
+			S3Prefix:          o.S3.Prefix,
+			S3Region:          o.S3.Region,
+			S3Endpoint:        o.S3.Endpoint,
 		},
 		Ingest: runtime.IngestOptions{
 			BatchSize:        o.BatchSize,
 			BatchTimeout:     o.BatchTimeout,
 			QueueSize:        o.QueueSize,
 			BreakerThreshold: o.BreakerThreshold,
+		},
+		Cardinality: runtime.CardinalityOptions{
+			MaxAttrsPerEntry:      o.Cardinality.MaxAttrsPerEntry,
+			MaxAttrValueBytes:     o.Cardinality.MaxAttrValueBytes,
+			MaxAttrKeysPerService: o.Cardinality.MaxAttrKeysPerService,
 		},
 	})
 	if err != nil {
@@ -106,6 +136,12 @@ func (db *DB) QueryLogs(ctx context.Context, q *LogQuery) (*LogResult, error) {
 func (db *DB) QuerySpans(ctx context.Context, q *SpanQuery) (*SpanResult, error) {
 	return db.stack.Executor.ExecSpan(ctx, q)
 }
+
+// IsReady reports whether bootstrap has finished loading sealed indexes.
+// Until this returns true, queries may return partial results because some
+// segments still lack in-memory ribbon filters and bitmap caches.
+// Use as a readiness gate before serving traffic.
+func (db *DB) IsReady() bool { return db.stack.IsReady() }
 
 // shutdownTimeout caps how long Close waits for batcher drain + storage
 // flush. 30s matches the standalone binary default and is enough for any
