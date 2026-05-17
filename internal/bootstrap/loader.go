@@ -114,6 +114,7 @@ func loadLogSegments(
 				} else {
 					log.Warn("failed to build log fts ribbon on startup", "segment", seg.FileName, "err", err)
 				}
+
 			}
 		})
 	}
@@ -163,6 +164,7 @@ func loadSpanSegments(
 				} else {
 					log.Warn("failed to build span ribbon on startup", "segment", seg.FileName, "err", err)
 				}
+
 			}
 		})
 	}
@@ -223,6 +225,17 @@ func SetupSealCallbacks(
 		} else {
 			exec.RegisterLogFTSRibbon(meta.FileName, ftsRibbon)
 		}
+
+		// Posting list (.pidx) is built here so it exists on disk for on-demand
+		// loading, but is NOT registered in the executor's LRU. It will be
+		// loaded lazily the first time a trace_id query hits this segment.
+		if err := retryBuild(ctx, "log posting list", log, func() error {
+			_, err := index.BuildLogPostingList(segPath, log)
+			return err
+		}); err != nil {
+			metrics.SealIndexErrors.WithLabelValues("log", "posting").Inc()
+			log.Error("seal: build log posting list gave up", "segment", meta.FileName, "err", err)
+		}
 	})
 
 	spanManager.SetOnSeal(func(meta storage.SegmentMeta) {
@@ -246,6 +259,14 @@ func SetupSealCallbacks(
 			log.Error("seal: build span ribbon gave up", "segment", meta.FileName, "err", err)
 		} else {
 			exec.RegisterSpanRibbon(meta.FileName, spanRibbon)
+		}
+
+		if err := retryBuild(ctx, "span posting list", log, func() error {
+			_, err := index.BuildSpanPostingList(segPath, log)
+			return err
+		}); err != nil {
+			metrics.SealIndexErrors.WithLabelValues("span", "posting").Inc()
+			log.Error("seal: build span posting list gave up", "segment", meta.FileName, "err", err)
 		}
 	})
 }

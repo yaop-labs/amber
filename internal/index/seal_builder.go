@@ -228,6 +228,84 @@ func BuildLogFTSRibbon(segmentPath string, log *slog.Logger) (*RibbonFilter, err
 	return f, nil
 }
 
+// BuildLogPostingList builds a .pidx posting-list index for log segments.
+// It maps each unique trace_id to the sorted list of record IDs in the segment
+// that carry it, enabling exact intra-segment lookup and bitmap intersection.
+func BuildLogPostingList(segmentPath string, log *slog.Logger) (*PostingList, error) {
+	sr, err := storage.OpenSegmentReader(segmentPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sr.Close() }()
+
+	b := NewPostingListBuilder(16)
+	var skipped int
+
+	err = sr.Scan(func(data []byte) error {
+		var entry model.LogEntry
+		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
+			skipped++
+			return nil
+		}
+		if model.IsZeroTraceID(entry.TraceID) {
+			return nil
+		}
+		b.Add(entry.TraceID[:], model.EntryIDToUint64(entry.ID))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if skipped > 0 && log != nil {
+		log.Debug("seal_builder: posting list skipped undecodable records", "path", segmentPath, "count", skipped)
+	}
+
+	pl := b.Build()
+	if err := pl.Save(segmentPath + ".pidx"); err != nil {
+		return nil, err
+	}
+	return pl, nil
+}
+
+// BuildSpanPostingList builds a .pidx posting-list index for span segments.
+func BuildSpanPostingList(segmentPath string, log *slog.Logger) (*PostingList, error) {
+	sr, err := storage.OpenSegmentReader(segmentPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sr.Close() }()
+
+	b := NewPostingListBuilder(16)
+	var skipped int
+
+	err = sr.Scan(func(data []byte) error {
+		var span model.SpanEntry
+		if _, err := span.ReadFrom(bytes.NewReader(data)); err != nil {
+			skipped++
+			return nil
+		}
+		if model.IsZeroTraceID(span.TraceID) {
+			return nil
+		}
+		b.Add(span.TraceID[:], model.EntryIDToUint64(span.ID))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if skipped > 0 && log != nil {
+		log.Debug("seal_builder: span posting list skipped undecodable records", "path", segmentPath, "count", skipped)
+	}
+
+	pl := b.Build()
+	if err := pl.Save(segmentPath + ".pidx"); err != nil {
+		return nil, err
+	}
+	return pl, nil
+}
+
 func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {

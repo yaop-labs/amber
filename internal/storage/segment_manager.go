@@ -612,6 +612,27 @@ func appendSegmentWriter(path string) (*SegmentWriter, int64, error) {
 		fileOffset: fileSize,
 	}
 
+	// If the file is empty the header was never flushed before the crash
+	// (OpenSegmentWriter writes it into a bufio.Writer; if the process dies
+	// before bw.Flush the file stays 0 bytes). Write it now so WAL replay
+	// doesn't produce a headerless segment that OpenSegmentReader rejects.
+	if fileSize == 0 {
+		if err := sw.writeHeader(); err != nil {
+			_ = f.Close()
+			return nil, 0, fmt.Errorf("append segment: write header: %w", err)
+		}
+		if err := sw.bw.Flush(); err != nil {
+			_ = f.Close()
+			return nil, 0, fmt.Errorf("append segment: flush header: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, 0, fmt.Errorf("append segment: sync header: %w", err)
+		}
+		fileSize = segHeaderSize
+		sw.fileOffset = segHeaderSize
+	}
+
 	// Restore writer state from blocks already on disk. Without this, a rotate
 	// after a crash-and-replay would write a footer pointing only at the
 	// post-replay blocks, orphaning everything written before the crash.

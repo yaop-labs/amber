@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -90,9 +89,11 @@ type Executor struct {
 	logFTSRibbons map[string]*index.RibbonFilter
 	spanRibbons   map[string]*index.RibbonFilter
 
-	logBitmapCache  *indexLRU[*index.MultiFieldIndex]
-	spanBitmapCache *indexLRU[*index.MultiFieldIndex]
-	ftsCache        *indexLRU[*index.FTSIndex]
+	logBitmapCache   *indexLRU[*index.MultiFieldIndex]
+	spanBitmapCache  *indexLRU[*index.MultiFieldIndex]
+	ftsCache         *indexLRU[*index.FTSIndex]
+	logPostingCache  *indexLRU[*index.PostingList]
+	spanPostingCache *indexLRU[*index.PostingList]
 
 	logReaders  *readerCache
 	spanReaders *readerCache
@@ -341,23 +342,25 @@ func NewExecutorWithCache(
 		cacheSize = defaultIndexCacheSize
 	}
 	return &Executor{
-		logManager:      logManager,
-		spanManager:     spanManager,
-		logSparse:       logSparse,
-		spanSparse:      spanSparse,
-		planner:         NewPlanner(logSparse),
-		logDir:          logDir,
-		spanDir:         spanDir,
-		active:          indexer.New(logManager, spanManager),
-		logRibbons:      make(map[string]*index.RibbonFilter),
-		logFTSRibbons:   make(map[string]*index.RibbonFilter),
-		spanRibbons:     make(map[string]*index.RibbonFilter),
-		logBitmapCache:  newIndexLRU[*index.MultiFieldIndex](cacheSize),
-		spanBitmapCache: newIndexLRU[*index.MultiFieldIndex](cacheSize),
-		ftsCache:        newIndexLRU[*index.FTSIndex](cacheSize),
-		logReaders:      newReaderCache(cacheSize),
-		spanReaders:     newReaderCache(cacheSize),
-		resultCache:     newQueryCache(defaultResultCacheSize, defaultResultCacheTTL),
+		logManager:       logManager,
+		spanManager:      spanManager,
+		logSparse:        logSparse,
+		spanSparse:       spanSparse,
+		planner:          NewPlanner(logSparse),
+		logDir:           logDir,
+		spanDir:          spanDir,
+		active:           indexer.New(logManager, spanManager),
+		logRibbons:       make(map[string]*index.RibbonFilter),
+		logFTSRibbons:    make(map[string]*index.RibbonFilter),
+		spanRibbons:      make(map[string]*index.RibbonFilter),
+		logBitmapCache:   newIndexLRU[*index.MultiFieldIndex](cacheSize),
+		spanBitmapCache:  newIndexLRU[*index.MultiFieldIndex](cacheSize),
+		ftsCache:         newIndexLRU[*index.FTSIndex](cacheSize),
+		logPostingCache:  newIndexLRU[*index.PostingList](cacheSize),
+		spanPostingCache: newIndexLRU[*index.PostingList](cacheSize),
+		logReaders:       newReaderCache(cacheSize),
+		spanReaders:      newReaderCache(cacheSize),
+		resultCache:      newQueryCache(defaultResultCacheSize, defaultResultCacheTTL),
 	}
 }
 
@@ -435,6 +438,44 @@ func (e *Executor) RegisterSpanRibbon(segmentFile string, f *index.RibbonFilter)
 	e.sealedMu.Lock()
 	e.spanRibbons[segmentFile] = f
 	e.sealedMu.Unlock()
+}
+
+func (e *Executor) RegisterLogPostingList(segmentFile string, pl *index.PostingList) {
+	e.logPostingCache.put(segmentFile, pl)
+}
+
+func (e *Executor) RegisterSpanPostingList(segmentFile string, pl *index.PostingList) {
+	e.spanPostingCache.put(segmentFile, pl)
+}
+
+func (e *Executor) logPosting(name string) (*index.PostingList, bool) {
+	if pl, ok := e.logPostingCache.get(name); ok {
+		return pl, true
+	}
+	if e.logDir == "" {
+		return nil, false
+	}
+	pl, err := index.LoadPostingList(e.logDir + "/" + name + ".pidx")
+	if err != nil {
+		return nil, false
+	}
+	e.logPostingCache.put(name, pl)
+	return pl, true
+}
+
+func (e *Executor) spanPosting(name string) (*index.PostingList, bool) {
+	if pl, ok := e.spanPostingCache.get(name); ok {
+		return pl, true
+	}
+	if e.spanDir == "" {
+		return nil, false
+	}
+	pl, err := index.LoadPostingList(e.spanDir + "/" + name + ".pidx")
+	if err != nil {
+		return nil, false
+	}
+	e.spanPostingCache.put(name, pl)
+	return pl, true
 }
 
 func (e *Executor) logBitmap(name string) (*index.MultiFieldIndex, bool) {
@@ -753,23 +794,28 @@ func (e *Executor) execLogSegment(
 	}
 
 	if !model.IsZeroTraceID(q.TraceID) {
-
+		// Segment pruning: ribbon filter tells us fast if this segment
+		// definitely has no records with this trace_id.
 		if ribbon, ok := e.logRibbon(seg.FileName); ok {
 			if !ribbon.Contains(q.TraceID[:]) {
 				return 0, nil
 			}
 		}
-		if bm, ok := e.logBitmap(seg.FileName); ok && bm.HasField("trace_id") {
-			var traceHex [32]byte
-			hex.Encode(traceHex[:], q.TraceID[:])
-			traceIDs := bm.FilterAny("trace_id", []string{string(traceHex[:])})
-			if traceIDs.IsEmpty() {
+		// Exact lookup: posting list gives us the record IDs for this
+		// trace_id, enabling intersection with other bitmap constraints.
+		if pl, ok := e.logPosting(seg.FileName); ok {
+			ids := pl.Lookup(q.TraceID[:])
+			if len(ids) == 0 {
 				return 0, nil
 			}
+			traceBitmap := roaring64.New()
+			for _, id := range ids {
+				traceBitmap.Add(id)
+			}
 			if allowedIDs == nil {
-				allowedIDs = traceIDs
+				allowedIDs = traceBitmap
 			} else {
-				allowedIDs = roaring64.And(allowedIDs, traceIDs)
+				allowedIDs = roaring64.And(allowedIDs, traceBitmap)
 				allowedSlice = nil
 				if allowedIDs.IsEmpty() {
 					return 0, nil
@@ -977,12 +1023,14 @@ func (e *Executor) execSpanSegment(
 				return 0, nil
 			}
 		}
-		if bm, ok := e.spanBitmap(seg.FileName); ok {
-			var traceHex [32]byte
-			hex.Encode(traceHex[:], q.TraceID[:])
-			allowedIDs = bm.FilterAny("trace_id", []string{string(traceHex[:])})
-			if allowedIDs.IsEmpty() {
+		if pl, ok := e.spanPosting(seg.FileName); ok {
+			ids := pl.Lookup(q.TraceID[:])
+			if len(ids) == 0 {
 				return 0, nil
+			}
+			allowedIDs = roaring64.New()
+			for _, id := range ids {
+				allowedIDs.Add(id)
 			}
 		}
 	}
