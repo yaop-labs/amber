@@ -116,9 +116,6 @@ func BenchmarkSegmentReader_ScanFiltered_100k(b *testing.B) {
 
 	// Build a bitmap with every 25th ID to simulate 4% selectivity
 	// (service=svc-00 AND level=ERROR with 5 services × 5 levels).
-	type roaringLike interface {
-		Contains(uint64) bool
-	}
 	allowed := make(map[uint64]struct{}, 4000)
 	for i := uint64(15); i < 100_000; i += 25 {
 		allowed[i] = struct{}{}

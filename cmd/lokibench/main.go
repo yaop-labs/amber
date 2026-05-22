@@ -61,11 +61,11 @@ func main() {
 	for i, arg := range os.Args[1:] {
 		switch {
 		case arg == "-n" && i+1 < len(os.Args)-1:
-			fmt.Sscanf(os.Args[i+2], "%d", &flagN)
+			fmt.Sscanf(os.Args[i+2], "%d", &flagN) //nolint:errcheck
 		case arg == "-loki" && i+1 < len(os.Args)-1:
 			flagLoki = os.Args[i+2]
 		case arg == "-batch" && i+1 < len(os.Args)-1:
-			fmt.Sscanf(os.Args[i+2], "%d", &flagBatch)
+			fmt.Sscanf(os.Args[i+2], "%d", &flagBatch) //nolint:errcheck
 		}
 	}
 
@@ -354,7 +354,7 @@ func readRSS() uint64 {
 				return 0
 			}
 			var kb uint64
-			fmt.Sscanf(fields[1], "%d", &kb)
+			fmt.Sscanf(fields[1], "%d", &kb) //nolint:errcheck
 			return kb * 1024
 		}
 	}

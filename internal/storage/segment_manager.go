@@ -60,7 +60,7 @@ func (sm *SegmentManager) SetOnSeal(fn func(meta SegmentMeta)) {
 }
 
 func OpenSegmentManager(dir string, policy RotationPolicy) (*SegmentManager, error) {
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("segmgr: mkdir %s: %w", dir, err)
 	}
 
@@ -375,7 +375,7 @@ func (sm *SegmentManager) rotate() error {
 			sm.meta.Segments[i].MaxTS = maxTS
 
 			segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
-			if info, err := os.Stat(segPath); err == nil {
+			if info, err := os.Stat(segPath); err == nil { //nolint:gosec
 				sm.meta.Segments[i].SizeBytes = info.Size()
 			}
 			sealedMeta = sm.meta.Segments[i]
