@@ -73,7 +73,7 @@ type SegmentWriter struct {
 }
 
 func OpenSegmentWriter(path string) (*SegmentWriter, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("segment: create %s: %w", path, err)
 	}

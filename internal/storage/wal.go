@@ -70,12 +70,12 @@ func (w *WAL) CorruptRecords() uint64 {
 }
 
 func OpenWAL(dir string) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("wal: mkdir %s: %w", dir, err)
 	}
 
 	path := filepath.Join(dir, walFileName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}

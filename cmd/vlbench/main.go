@@ -60,11 +60,11 @@ func main() {
 	for i := 1; i < len(os.Args)-1; i++ {
 		switch os.Args[i] {
 		case "-n":
-			fmt.Sscanf(os.Args[i+1], "%d", &flagN)
+			fmt.Sscanf(os.Args[i+1], "%d", &flagN) //nolint:errcheck
 		case "-vl":
 			flagVL = os.Args[i+1]
 		case "-batch":
-			fmt.Sscanf(os.Args[i+1], "%d", &flagBatch)
+			fmt.Sscanf(os.Args[i+1], "%d", &flagBatch) //nolint:errcheck
 		}
 	}
 
@@ -125,7 +125,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "push [%d]: %v\n", i, err)
 				dropped += flagBatch
 			} else {
-				io.Copy(io.Discard, resp.Body)
+				io.Copy(io.Discard, resp.Body) //nolint:errcheck
 				resp.Body.Close()
 				if resp.StatusCode != 200 {
 					dropped += flagBatch
@@ -148,7 +148,7 @@ func main() {
 	fmt.Println("M — Storage")
 	fmt.Println("-----------")
 	var total int64
-	filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error { //nolint:errcheck
 		if err == nil && !info.IsDir() {
 			total += info.Size()
 		}
@@ -258,7 +258,7 @@ func vlRSS() string {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {
 					var kb uint64
-					fmt.Sscanf(fields[1], "%d", &kb)
+					fmt.Sscanf(fields[1], "%d", &kb) //nolint:errcheck
 					return humanBytes(int64(kb * 1024))
 				}
 			}

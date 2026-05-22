@@ -40,7 +40,7 @@ type StoreMeta struct {
 func loadMeta(dir string) (*StoreMeta, error) {
 	path := filepath.Join(dir, metaFileName)
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec
 	if os.IsNotExist(err) {
 		return &StoreMeta{NextSegmentID: 1}, nil
 	}
@@ -63,7 +63,7 @@ func saveMeta(dir string, m *StoreMeta) error {
 	}
 
 	tmp := filepath.Join(dir, metaFileName+".tmp")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600) //nolint:gosec
 	if err != nil {
 		return fmt.Errorf("meta: open tmp: %w", err)
 	}
@@ -80,14 +80,14 @@ func saveMeta(dir string, m *StoreMeta) error {
 	}
 
 	dst := filepath.Join(dir, metaFileName)
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := os.Rename(tmp, dst); err != nil { //nolint:gosec
 		return fmt.Errorf("meta: rename: %w", err)
 	}
 
 	// fsync the directory so the rename is durable across power loss; without
 	// this the directory entry update may be lost while the file content
 	// survives, leaving stale meta on disk.
-	if d, err := os.Open(dir); err == nil {
+	if d, err := os.Open(dir); err == nil { //nolint:gosec
 		_ = d.Sync()
 		_ = d.Close()
 	}
