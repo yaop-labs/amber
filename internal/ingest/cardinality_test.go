@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 func TestCardinalityGuard_AttrsPerEntry(t *testing.T) {

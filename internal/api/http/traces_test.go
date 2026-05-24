@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/query"
 )
 
 func TestCollectTraceSummariesAggregatesAcrossSpanPages(t *testing.T) {

@@ -6,11 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/ingest"
-	"github.com/hnlbs/amber/internal/query"
-	"github.com/hnlbs/amber/internal/storage"
-	"github.com/hnlbs/amber/internal/ui"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/ui"
 )
 
 type RoutesDeps struct {

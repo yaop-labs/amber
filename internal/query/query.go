@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 type LogQuery struct {

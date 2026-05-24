@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	ambergrpc "github.com/hnlbs/amber/internal/api/grpc"
-	amberhttp "github.com/hnlbs/amber/internal/api/http"
-	"github.com/hnlbs/amber/internal/config"
-	"github.com/hnlbs/amber/internal/metrics"
-	"github.com/hnlbs/amber/internal/retention"
-	"github.com/hnlbs/amber/internal/runtime"
+	ambergrpc "github.com/yaop-labs/amber/internal/api/grpc"
+	amberhttp "github.com/yaop-labs/amber/internal/api/http"
+	"github.com/yaop-labs/amber/internal/config"
+	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/retention"
+	"github.com/yaop-labs/amber/internal/runtime"
 )
 
 func main() {

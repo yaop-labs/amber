@@ -9,7 +9,7 @@ import (
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 func ExtractResource(attrs []*commonpb.KeyValue) (service, host string) {

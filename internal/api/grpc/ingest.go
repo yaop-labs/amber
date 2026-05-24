@@ -10,7 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/hnlbs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/ingest"
 )
 
 type logsServer struct {
