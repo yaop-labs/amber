@@ -5,8 +5,8 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex, error) {

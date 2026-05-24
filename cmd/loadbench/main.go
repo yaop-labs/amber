@@ -29,9 +29,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/query"
-	rt "github.com/hnlbs/amber/internal/runtime"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/query"
+	rt "github.com/yaop-labs/amber/internal/runtime"
 )
 
 var (

@@ -1,4 +1,4 @@
-module github.com/hnlbs/amber
+module github.com/yaop-labs/amber
 
 go 1.25.0
 

@@ -3,7 +3,7 @@ package ingest
 import (
 	"sync"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 // CardinalityGuard rejects entries that would blow up storage cardinality:

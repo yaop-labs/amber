@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/hnlbs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/query"
 )
 
 type ServicesHandler struct {

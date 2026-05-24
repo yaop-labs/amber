@@ -10,8 +10,8 @@ import (
 
 	json "github.com/goccy/go-json"
 
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/query"
 )
 
 type TraceHandler struct {

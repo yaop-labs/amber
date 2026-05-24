@@ -14,7 +14,7 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 type fakeSender struct {

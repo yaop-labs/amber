@@ -13,7 +13,7 @@ import (
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
-	"github.com/hnlbs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/ingest"
 )
 
 type OTLPHandler struct {

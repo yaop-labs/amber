@@ -15,11 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hnlbs/amber/internal/bootstrap"
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/ingest"
-	"github.com/hnlbs/amber/internal/query"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/bootstrap"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 type Options struct {

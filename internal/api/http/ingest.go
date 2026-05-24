@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/hnlbs/amber/internal/ingest"
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 type IngestHandler struct {

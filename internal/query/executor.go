@@ -16,10 +16,10 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/indexer"
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/indexer"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 type logMinHeap []model.LogEntry

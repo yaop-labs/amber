@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func setupTestCleaner(t *testing.T, policy Policy, numSegments int) (*Cleaner, *storage.SegmentManager, string) {

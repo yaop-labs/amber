@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hnlbs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/model"
 )
 
 func benchEntryBytes() []byte {

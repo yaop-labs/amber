@@ -1,17 +1,17 @@
 package amber_test
 
 // This file is the contract test for amber's embedded API: if it compiles
-// using only the github.com/hnlbs/amber import, the public surface is
+// using only the github.com/yaop-labs/amber import, the public surface is
 // sufficient to embed amber in another binary (e.g. forager).
 //
-// Do NOT add imports from github.com/hnlbs/amber/internal/... here.
+// Do NOT add imports from github.com/yaop-labs/amber/internal/... here.
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	"github.com/hnlbs/amber"
+	"github.com/yaop-labs/amber"
 )
 
 func TestEmbedded_RoundTrip(t *testing.T) {

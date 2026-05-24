@@ -22,10 +22,10 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/ingest"
-	"github.com/hnlbs/amber/internal/query"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 type apiHarness struct {

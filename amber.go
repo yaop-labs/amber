@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/query"
-	"github.com/hnlbs/amber/internal/runtime"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/runtime"
 )
 
 type (

@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/metrics"
-	"github.com/hnlbs/amber/internal/query"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 // retryBuild runs fn up to 3 times with exponential backoff (100ms, 500ms),

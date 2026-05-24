@@ -9,9 +9,9 @@ import (
 	"encoding/hex"
 	"sync"
 
-	"github.com/hnlbs/amber/internal/index"
-	"github.com/hnlbs/amber/internal/model"
-	"github.com/hnlbs/amber/internal/storage"
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 // kindSlot pairs an in-memory bitmap with the segment filename it indexes;

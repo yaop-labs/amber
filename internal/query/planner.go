@@ -1,7 +1,7 @@
 package query
 
 import (
-	"github.com/hnlbs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/index"
 )
 
 type ExecutionPlan struct {
