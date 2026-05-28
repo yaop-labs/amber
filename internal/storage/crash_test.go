@@ -44,7 +44,7 @@ func runCrashWriter(dir string) {
 
 	base := time.Now().UnixNano()
 	for i := 1; ; i++ {
-		data := []byte(fmt.Sprintf("crash-rec-%08d", i))
+		data := fmt.Appendf(nil, "crash-rec-%08d", i)
 		ts := base + int64(i)*int64(time.Microsecond)
 		if err := sm.Write(data, ts); err != nil {
 			// Write returns error only if WAL fsync failed — that record is
