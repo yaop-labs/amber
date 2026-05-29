@@ -22,6 +22,11 @@ var DefaultRotationPolicy = RotationPolicy{
 	MaxBytes:   128 << 20,
 }
 
+// SegmentSidecarExts lists every file extension that belongs to a sealed
+// segment, including the data file itself (""). Single source of truth for
+// upload, delete, and fetch paths — keep in sync with index/seal_builder.go.
+var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".pidx"}
+
 type SegmentManager struct {
 	mu             sync.RWMutex
 	dir            string
@@ -524,9 +529,8 @@ func (sm *SegmentManager) SegmentPath(meta SegmentMeta) string {
 // sidecars from the store. Missing files are silently ignored.
 // Call after RemoveSegment to clean up persistent state.
 func (sm *SegmentManager) DeleteSegmentFiles(meta SegmentMeta) error {
-	sidecars := []string{"", ".bidx", ".fidx", ".filt", ".fts.filt"}
 	var first error
-	for _, ext := range sidecars {
+	for _, ext := range SegmentSidecarExts {
 		if err := sm.store.Delete(meta.FileName + ext); err != nil && first == nil {
 			first = err
 		}

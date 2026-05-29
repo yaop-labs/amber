@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -356,4 +357,52 @@ func TestSegmentManager_SegmentPath(t *testing.T) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return !os.IsNotExist(err)
+}
+
+// recordingStore captures Delete calls without touching disk or the network.
+type recordingStore struct {
+	deleted []string
+}
+
+func (r *recordingStore) Put(_ string, _ io.Reader) error { return nil }
+func (r *recordingStore) Get(name string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("not implemented: %s", name)
+}
+func (r *recordingStore) Delete(name string) error {
+	r.deleted = append(r.deleted, name)
+	return nil
+}
+func (r *recordingStore) List() ([]string, error) { return nil, nil }
+
+func TestDeleteSegmentFiles_CoversAllSidecars(t *testing.T) {
+	sm, _ := newTestManager(t)
+	rec := &recordingStore{}
+	sm.SetStore(rec)
+
+	meta := SegmentMeta{FileName: "seg_00000001.alog"}
+	if err := sm.DeleteSegmentFiles(meta); err != nil {
+		t.Fatalf("DeleteSegmentFiles: %v", err)
+	}
+
+	if len(rec.deleted) != len(SegmentSidecarExts) {
+		t.Fatalf("delete call count: got %d, want %d (%v)", len(rec.deleted), len(SegmentSidecarExts), rec.deleted)
+	}
+
+	got := make(map[string]bool, len(rec.deleted))
+	for _, name := range rec.deleted {
+		got[name] = true
+	}
+	for _, ext := range SegmentSidecarExts {
+		want := meta.FileName + ext
+		if !got[want] {
+			t.Errorf("missing delete for %q", want)
+		}
+	}
+
+	// Regression guard: .pidx (posting index) was historically omitted, leaving
+	// orphaned files in S3 after retention. Assert it explicitly so a future
+	// refactor of SegmentSidecarExts can't silently drop it.
+	if !got[meta.FileName+".pidx"] {
+		t.Errorf(".pidx not deleted; SegmentSidecarExts regressed")
+	}
 }

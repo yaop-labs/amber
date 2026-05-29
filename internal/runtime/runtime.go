@@ -300,9 +300,8 @@ func (s *Stack) Close(ctx context.Context) error {
 // segment and all its index sidecars from dir to store. Called after index
 // builds finish, so all files are on disk when upload begins.
 func sealUploader(store storage.SegmentStore, dir string, log *slog.Logger) func(storage.SegmentMeta) {
-	sidecars := []string{"", ".bidx", ".fidx", ".filt", ".fts.filt"}
 	return func(meta storage.SegmentMeta) {
-		for _, ext := range sidecars {
+		for _, ext := range storage.SegmentSidecarExts {
 			name := meta.FileName + ext
 			path := filepath.Join(dir, name)
 			f, err := os.Open(path)
