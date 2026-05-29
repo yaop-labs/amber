@@ -117,7 +117,7 @@ func readSegmentFooter(path string, id uint32, fileName string) (storage.Segment
 	if err != nil {
 		return storage.SegmentMeta{}, fmt.Errorf("open reader: %w", err)
 	}
-	defer sr.Close()
+	defer func() { _ = sr.Close() }()
 
 	footer := sr.Footer()
 
