@@ -18,12 +18,13 @@ type Policy struct {
 }
 
 type Cleaner struct {
-	manager  *storage.SegmentManager
-	sparse   *index.SparseIndex
-	policy   Policy
-	dataDir  string
-	log      *slog.Logger
-	onDelete func(storage.SegmentMeta)
+	manager         *storage.SegmentManager
+	sparse          *index.SparseIndex
+	policy          Policy
+	dataDir         string
+	log             *slog.Logger
+	onDelete        func(storage.SegmentMeta)
+	requireUploaded bool
 }
 
 func NewCleaner(
@@ -46,10 +47,34 @@ func (c *Cleaner) SetOnDelete(fn func(storage.SegmentMeta)) {
 	c.onDelete = fn
 }
 
+// RequireUploaded gates retention on the segment having reached
+// UploadStateUploaded. Enable on nodes using a remote SegmentStore so a
+// transient S3 outage doesn't delete the only copy of a segment that
+// hasn't been uploaded yet. Default (off) preserves local-only behavior.
+func (c *Cleaner) RequireUploaded(v bool) {
+	c.requireUploaded = v
+}
+
 func (c *Cleaner) Run() (int, error) {
 	segments := c.manager.Segments()
 	if len(segments) == 0 {
 		return 0, nil
+	}
+
+	if c.requireUploaded {
+		// Filter out segments not yet durable in the remote store. Retention
+		// will revisit them on the next tick once the background uploader
+		// catches up.
+		eligible := segments[:0:0]
+		for _, s := range segments {
+			if s.UploadState == storage.UploadStateUploaded {
+				eligible = append(eligible, s)
+			}
+		}
+		segments = eligible
+		if len(segments) == 0 {
+			return 0, nil
+		}
 	}
 
 	toDelete := c.selectForDeletion(segments)
