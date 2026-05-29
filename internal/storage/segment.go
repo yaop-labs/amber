@@ -30,6 +30,23 @@ const (
 	DefaultBlockSize = 4 * 1024 * 1024
 )
 
+// Block buffer pools. Reused across scanBlock calls to keep the hot scan
+// path off the heap. The compressed pool sizes scale with on-disk block
+// width; the uncompressed pool sizes scale with DefaultBlockSize after
+// decompression. Both pools tolerate larger blocks: a buffer that's too
+// small is dropped on Put back so we don't poison the pool with mis-
+// sized slices, but a single oversized block still allocates fresh.
+var (
+	scanCompressedPool   = sync.Pool{New: func() any { b := make([]byte, 0, 64<<10); return &b }}
+	scanUncompressedPool = sync.Pool{New: func() any { b := make([]byte, 0, DefaultBlockSize); return &b }}
+)
+
+// blockPoolMaxSize caps what we return to scanUncompressedPool. Without a
+// cap, one outlier block (say a multi-MB outlier) would inflate every
+// future pooled buffer for the program's life. The threshold is generous —
+// 2× default block size — to keep typical workloads zero-alloc.
+const blockPoolMaxSize = 2 * DefaultBlockSize
+
 var (
 	ErrSegmentCorrupted = errors.New("segment: corrupted file")
 	ErrSegmentBadMagic  = errors.New("segment: bad magic bytes")
@@ -703,16 +720,50 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 	uncompressedSize := binary.LittleEndian.Uint32(blockHeader[4:8])
 	compressedSize := binary.LittleEndian.Uint32(blockHeader[8:12])
 
-	compressed := make([]byte, compressedSize)
+	compressedP := scanCompressedPool.Get().(*[]byte)
+	compressed := *compressedP
+	if cap(compressed) < int(compressedSize) {
+		compressed = make([]byte, compressedSize)
+	} else {
+		compressed = compressed[:compressedSize]
+	}
+	defer func() {
+		if cap(compressed) <= blockPoolMaxSize {
+			c := compressed[:0]
+			*compressedP = c
+			scanCompressedPool.Put(compressedP)
+		}
+	}()
+
 	if _, err := io.ReadFull(sr.file, compressed); err != nil {
 		return fmt.Errorf("segment: read block data at %d: %w", offset, err)
 	}
 
-	uncompressed := make([]byte, 0, uncompressedSize)
+	uncompressedP := scanUncompressedPool.Get().(*[]byte)
+	uncompressed := (*uncompressedP)[:0]
+	if cap(uncompressed) < int(uncompressedSize) {
+		// Drop the undersized pooled buffer (will be GC'd) and let DecodeAll
+		// allocate a fresh slice at the right size.
+		uncompressed = make([]byte, 0, uncompressedSize)
+	}
 	uncompressed, err := sr.decoder.DecodeAll(compressed, uncompressed)
 	if err != nil {
+		// Return the (possibly-grown) buffer to the pool if it still fits the
+		// cap. Otherwise drop it.
+		if cap(uncompressed) <= blockPoolMaxSize {
+			u := uncompressed[:0]
+			*uncompressedP = u
+			scanUncompressedPool.Put(uncompressedP)
+		}
 		return fmt.Errorf("segment: decompress block at %d: %w", offset, err)
 	}
+	defer func() {
+		if cap(uncompressed) <= blockPoolMaxSize {
+			u := uncompressed[:0]
+			*uncompressedP = u
+			scanUncompressedPool.Put(uncompressedP)
+		}
+	}()
 
 	// Walk the uncompressed buffer directly instead of bytes.NewReader +
 	// per-record make([]byte, length). Each fn call gets a zero-copy slice
