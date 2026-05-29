@@ -175,7 +175,8 @@ func (u *uploader) uploadOne(seg storage.SegmentMeta) error {
 
 // backoffDelay returns the delay before the next retry given the current
 // attempt count (1-based). Exponential with ±25% jitter, capped at
-// uploadBackoffMax.
+// uploadBackoffMax (cap applies AFTER jitter so the final value never
+// exceeds the documented bound).
 func backoffDelay(attempts uint32) time.Duration {
 	// Cap the exponent so the shift can't overflow: at attempts=30 the raw
 	// value already exceeds uploadBackoffMax by orders of magnitude.
@@ -187,7 +188,11 @@ func backoffDelay(attempts uint32) time.Duration {
 	if d <= 0 || d > uploadBackoffMax {
 		d = uploadBackoffMax
 	}
-	// Jitter ±25%.
+	// Jitter ±25% of d.
 	jitter := time.Duration(rand.Int64N(int64(d) / 2))
-	return d - d/4 + jitter
+	out := d - d/4 + jitter
+	if out > uploadBackoffMax {
+		out = uploadBackoffMax
+	}
+	return out
 }

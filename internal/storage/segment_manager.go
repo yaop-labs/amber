@@ -479,6 +479,59 @@ func (sm *SegmentManager) MarkUploaded(id uint32) error {
 	return fmt.Errorf("segmgr: mark uploaded: unknown segment id %d", id)
 }
 
+// AdoptUploadedSegment inserts a sealed, already-uploaded segment into the
+// manager's metadata. Used by the bootstrap S3 reconcile path to surface
+// segments that exist in remote storage but not in local meta.json (e.g.
+// after node migration). The caller must ensure the segment's data file
+// and required sidecars are present on local disk before calling — this
+// method only mutates meta.
+//
+// Conflict handling:
+//   - If an entry with the same ID is already Sealed, returns nil (reconcile
+//     is idempotent — we've seen this segment before).
+//   - If an entry with the same ID is Active (not Sealed) AND empty (no
+//     records), the active is discarded: its file is removed, NextSegmentID
+//     advances past the adopted ID, and a fresh active will be created on
+//     the next write. This resolves the bootstrap-creates-seg_00000001-then-
+//     S3-has-seg_00000001 collision on a fresh node.
+//   - If the active is non-empty, returns an error: we won't drop on-disk
+//     writes silently. The caller should flush and seal first.
+func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i, existing := range sm.meta.Segments {
+		if existing.ID != meta.ID {
+			continue
+		}
+		if existing.Sealed {
+			return nil
+		}
+		if sm.active != nil && sm.active.RecordCount() > 0 {
+			return fmt.Errorf("segmgr: adopt %d conflicts with non-empty active segment", meta.ID)
+		}
+		// Discard the empty active and let the adopt below replace it.
+		if sm.active != nil {
+			_ = sm.active.Close()
+			sm.active = nil
+			sm.activeSize = 0
+		}
+		_ = os.Remove(filepath.Join(sm.dir, existing.FileName))
+		sm.meta.Segments = append(sm.meta.Segments[:i], sm.meta.Segments[i+1:]...)
+		break
+	}
+
+	meta.Sealed = true
+	meta.UploadState = UploadStateUploaded
+	sm.meta.Segments = append(sm.meta.Segments, meta)
+
+	if meta.ID >= sm.meta.NextSegmentID {
+		sm.meta.NextSegmentID = meta.ID + 1
+	}
+
+	return saveMeta(sm.dir, sm.meta)
+}
+
 // RecordUploadFailure increments the failure counter and stores a truncated
 // error message. Persists meta so attempt counts survive restart, driving
 // backoff convergence even across crashes.

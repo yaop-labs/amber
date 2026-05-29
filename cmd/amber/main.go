@@ -51,8 +51,13 @@ func run() error {
 		Logger:         log,
 		IndexCacheSize: cfg.Storage.IndexCacheSize,
 		Storage: runtime.StorageOptions{
-			SegmentMaxRecords: cfg.Storage.SegmentMaxRecords,
-			SegmentMaxBytes:   cfg.Storage.SegmentMaxBytes,
+			SegmentMaxRecords:  cfg.Storage.SegmentMaxRecords,
+			SegmentMaxBytes:    cfg.Storage.SegmentMaxBytes,
+			S3Bucket:           cfg.Storage.S3.Bucket,
+			S3Prefix:           cfg.Storage.S3.Prefix,
+			S3Region:           cfg.Storage.S3.Region,
+			S3Endpoint:         cfg.Storage.S3.Endpoint,
+			S3ReconcileOnStart: cfg.Storage.S3.ReconcileOnStart,
 		},
 		Ingest: runtime.IngestOptions{
 			BatchSize:        cfg.Ingest.BatchSize,

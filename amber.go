@@ -55,6 +55,11 @@ type S3Storage struct {
 	Prefix   string
 	Region   string
 	Endpoint string
+
+	// ReconcileOnStart triggers a remote List at startup and adopts sealed
+	// segments not yet known locally. Default false: reconcile still runs
+	// implicitly when the local meta has no sealed segments.
+	ReconcileOnStart bool
 }
 
 // Options is the embedded API's configuration surface. It mirrors the
@@ -94,12 +99,13 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 		Logger:         o.Logger,
 		IndexCacheSize: o.IndexCacheSize,
 		Storage: runtime.StorageOptions{
-			SegmentMaxRecords: o.SegmentMaxRecords,
-			SegmentMaxBytes:   o.SegmentMaxBytes,
-			S3Bucket:          o.S3.Bucket,
-			S3Prefix:          o.S3.Prefix,
-			S3Region:          o.S3.Region,
-			S3Endpoint:        o.S3.Endpoint,
+			SegmentMaxRecords:  o.SegmentMaxRecords,
+			SegmentMaxBytes:    o.SegmentMaxBytes,
+			S3Bucket:           o.S3.Bucket,
+			S3Prefix:           o.S3.Prefix,
+			S3Region:           o.S3.Region,
+			S3Endpoint:         o.S3.Endpoint,
+			S3ReconcileOnStart: o.S3.ReconcileOnStart,
 		},
 		Ingest: runtime.IngestOptions{
 			BatchSize:        o.BatchSize,
