@@ -30,7 +30,6 @@ type Cursor struct {
 const cursorRawSize = 8 + 16
 
 var (
-	errCursorEmpty   = errors.New("cursor: empty")
 	errCursorDecode  = errors.New("cursor: decode")
 	errCursorLength  = errors.New("cursor: bad length")
 	errCursorPadding = errors.New("cursor: unexpected padding")
