@@ -40,6 +40,9 @@ type StorageOptions struct {
 	S3Prefix   string
 	S3Region   string
 	S3Endpoint string // empty = AWS, non-empty = MinIO/R2/etc.
+	// S3ReconcileOnStart forces a remote List at startup. Without it, reconcile
+	// still runs but only when the local meta has no sealed segments.
+	S3ReconcileOnStart bool
 }
 
 type IngestOptions struct {
@@ -213,6 +216,27 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		// PendingUploads on every wake, so missed signals are harmless.
 		logManager.SetOnSealComplete(func(storage.SegmentMeta) { logUp.Enqueue() })
 		spanManager.SetOnSealComplete(func(storage.SegmentMeta) { spanUp.Enqueue() })
+
+		// Reconcile: pull sealed segments that exist in S3 but not in local
+		// meta. Always runs when local meta is empty (typical fresh node);
+		// also runs on every start if the operator opts in. Runs before
+		// LoadSealedIndexes so the loader sees adopted segments.
+		runLogReconcile := cfg.Storage.S3ReconcileOnStart || len(logManager.Segments()) == 0
+		runSpanReconcile := cfg.Storage.S3ReconcileOnStart || len(spanManager.Segments()) == 0
+		if runLogReconcile {
+			if n, err := bootstrap.ReconcileFromRemote(ctx, logManager, logS3, logDir, cfg.Logger); err != nil {
+				cfg.Logger.Warn("log s3 reconcile failed", "err", err)
+			} else if n > 0 {
+				cfg.Logger.Info("log s3 reconcile adopted segments", "count", n)
+			}
+		}
+		if runSpanReconcile {
+			if n, err := bootstrap.ReconcileFromRemote(ctx, spanManager, spanS3, spanDir, cfg.Logger); err != nil {
+				cfg.Logger.Warn("span s3 reconcile failed", "err", err)
+			} else if n > 0 {
+				cfg.Logger.Info("span s3 reconcile adopted segments", "count", n)
+			}
+		}
 	}
 
 	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)

@@ -125,3 +125,16 @@ func saveMeta(dir string, m *StoreMeta) error {
 func segmentFileName(id uint32) string {
 	return fmt.Sprintf("seg_%08d.alog", id)
 }
+
+// ParseSegmentID extracts the numeric ID from a segment file name produced
+// by segmentFileName. Returns (0, false) if the name doesn't match the
+// expected pattern. Used by reconcile paths that learn about segments via
+// remote-store listings rather than the local meta.
+func ParseSegmentID(fileName string) (uint32, bool) {
+	var id uint32
+	n, err := fmt.Sscanf(fileName, "seg_%08d.alog", &id)
+	if err != nil || n != 1 {
+		return 0, false
+	}
+	return id, true
+}

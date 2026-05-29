@@ -35,6 +35,12 @@ type S3Config struct {
 	Prefix   string `yaml:"prefix"`
 	Region   string `yaml:"region"`
 	Endpoint string `yaml:"endpoint"` // custom endpoint for MinIO/R2/etc.
+
+	// ReconcileOnStart triggers a remote List at startup and adopts any sealed
+	// segments not present in local meta. Default false: reconcile runs only
+	// when local meta is empty (typical fresh-node case). Enable for paranoid
+	// fleets where local state can diverge from S3 (e.g. partial restores).
+	ReconcileOnStart bool `yaml:"reconcile_on_start"`
 }
 
 type StorageConfig struct {
