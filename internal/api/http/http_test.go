@@ -134,7 +134,7 @@ func TestSplitComma(t *testing.T) {
 
 func TestParseLogQuery(t *testing.T) {
 	req := httptest.NewRequest("GET",
-		"/api/v1/logs?service=api,worker&level=ERROR&host=node-01&q=timeout&limit=50&offset=10&attr.env=prod",
+		"/api/v1/logs?service=api,worker&level=ERROR&host=node-01&q=timeout&limit=50&cursor=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&attr.env=prod",
 		nil)
 
 	q, err := parseLogQuery(req)
@@ -157,8 +157,8 @@ func TestParseLogQuery(t *testing.T) {
 	if q.Limit != 50 {
 		t.Errorf("Limit: %d", q.Limit)
 	}
-	if q.Offset != 10 {
-		t.Errorf("Offset: %d", q.Offset)
+	if q.Cursor != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
+		t.Errorf("Cursor: %q", q.Cursor)
 	}
 	if q.Attrs["env"] != "prod" {
 		t.Errorf("Attrs: %v", q.Attrs)

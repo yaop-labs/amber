@@ -17,21 +17,25 @@ type LogQuery struct {
 	FullText string
 	TraceID  model.TraceID
 	Limit    int
-	Offset   int
+
+	// Cursor, if non-empty, resumes pagination after the (timestamp, entry_id)
+	// pair it encodes. Decoded via DecodeCursor. The empty cursor means "start
+	// from the newest matching record".
+	Cursor string
 }
 
 func (q *LogQuery) Validate() error {
 	if q.Limit < 0 {
 		return fmt.Errorf("query: limit cannot be negative")
 	}
-	if q.Offset < 0 {
-		return fmt.Errorf("query: offset cannot be negative")
-	}
 	if !q.From.IsZero() && !q.To.IsZero() && q.From.After(q.To) {
 		return fmt.Errorf("query: from cannot be after to")
 	}
 	if q.Limit == 0 {
 		q.Limit = 100
+	}
+	if _, err := DecodeCursor(q.Cursor); err != nil {
+		return fmt.Errorf("query: %w", err)
 	}
 	return nil
 }
@@ -67,6 +71,11 @@ type LogResult struct {
 	TotalHits int
 	Truncated bool
 
+	// NextCursor, if non-empty, is the opaque token to pass back as
+	// LogQuery.Cursor to fetch the next page. Empty when fewer results
+	// were available than Limit (last page).
+	NextCursor string `json:"next_cursor,omitempty"`
+
 	SegTotal   int  `json:"seg_total,omitempty"`
 	SegScanned int  `json:"seg_scanned,omitempty"`
 	CacheHit   bool `json:"cache_hit,omitempty"`
@@ -82,7 +91,10 @@ type SpanQuery struct {
 	MaxDuration time.Duration
 	Statuses    []model.SpanStatus
 	Limit       int
-	Offset      int
+
+	// Cursor, if non-empty, resumes pagination after the (start_time, entry_id)
+	// pair it encodes. See DecodeCursor.
+	Cursor string
 }
 
 func (q *SpanQuery) Validate() error {
@@ -95,6 +107,9 @@ func (q *SpanQuery) Validate() error {
 	if q.Limit == 0 {
 		q.Limit = 100
 	}
+	if _, err := DecodeCursor(q.Cursor); err != nil {
+		return fmt.Errorf("query: %w", err)
+	}
 	return nil
 }
 
@@ -102,4 +117,6 @@ type SpanResult struct {
 	Spans     []model.SpanEntry
 	TotalHits int
 	Truncated bool
+
+	NextCursor string `json:"next_cursor,omitempty"`
 }

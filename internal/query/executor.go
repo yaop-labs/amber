@@ -269,8 +269,8 @@ func hashLogQuery(q *LogQuery) [32]byte {
 	h.Write([]byte{'|'})
 	binary.BigEndian.PutUint64(buf[:], uint64(q.Limit))
 	h.Write(buf[:])
-	binary.BigEndian.PutUint64(buf[:], uint64(q.Offset))
-	h.Write(buf[:])
+	h.Write([]byte{'|'})
+	h.Write([]byte(q.Cursor))
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -307,8 +307,8 @@ func hashSpanQuery(q *SpanQuery) [32]byte {
 	h.Write([]byte{'|'})
 	binary.BigEndian.PutUint64(buf[:], uint64(q.Limit))
 	h.Write(buf[:])
-	binary.BigEndian.PutUint64(buf[:], uint64(q.Offset))
-	h.Write(buf[:])
+	h.Write([]byte{'|'})
+	h.Write([]byte(q.Cursor))
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -680,9 +680,11 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (*LogResult, error)
 	copy(segs, plan.Segments)
 	sort.Slice(segs, func(i, j int) bool { return segs[i].MaxTS > segs[j].MaxTS })
 
-	k := q.Limit + q.Offset
+	cursor, _ := DecodeCursor(q.Cursor) // pre-validated in q.Validate
+
+	k := q.Limit
 	if k <= 0 {
-		k = q.Limit
+		k = 100
 	}
 
 	var ftsTokens [][]byte
@@ -699,6 +701,12 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (*LogResult, error)
 	totalHits := 0
 	scanned := 0
 	for _, seg := range segs {
+		// Cursor segment skip: every record in this segment is strictly newer
+		// than the cursor TS, so the previous page already included them.
+		// Saves a full segment scan per page for the common newest-first walk.
+		if !cursor.IsZero() && seg.MinTS > cursor.Timestamp {
+			continue
+		}
 		if hp.Len() >= k {
 			thresholdTS := (*hp)[0].Timestamp.UnixNano()
 			if seg.MaxTS < thresholdTS {
@@ -706,7 +714,7 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (*LogResult, error)
 			}
 		}
 		scanned++
-		matched, err := e.execLogSegment(ctx, q, plan, seg, hp, k, ftsTokens)
+		matched, err := e.execLogSegment(ctx, q, plan, seg, cursor, hp, k, ftsTokens)
 		if err != nil {
 			return nil, fmt.Errorf("executor: segment %s: %w", seg.FileName, err)
 		}
@@ -718,22 +726,26 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (*LogResult, error)
 		entries[i] = heap.Pop(hp).(model.LogEntry)
 	}
 
-	truncated := totalHits > q.Limit+q.Offset
-
-	if q.Offset > len(entries) {
-		entries = nil
-	} else {
-		entries = entries[q.Offset:]
-		if len(entries) > q.Limit {
-			entries = entries[:q.Limit]
-			truncated = true
-		}
+	// entries are newest-first. NextCursor is set whenever we filled the heap
+	// to capacity — there MAY be more older records to page through. The
+	// alternative (totalHits > Limit) is wrong: totalHits only counts records
+	// that survived the thresholdID short-circuit, which kicks in after the
+	// heap fills, so it always undercounts.
+	truncated := len(entries) == q.Limit
+	var nextCursor string
+	if truncated {
+		last := entries[len(entries)-1]
+		nextCursor = EncodeCursor(Cursor{
+			Timestamp: last.Timestamp.UnixNano(),
+			EntryID:   last.ID,
+		})
 	}
 
 	result := &LogResult{
 		Entries:    entries,
 		TotalHits:  totalHits,
 		Truncated:  truncated,
+		NextCursor: nextCursor,
 		SegTotal:   len(segs),
 		SegScanned: scanned,
 	}
@@ -746,6 +758,7 @@ func (e *Executor) execLogSegment(
 	q *LogQuery,
 	plan *ExecutionPlan,
 	seg index.SegmentTimeRange,
+	cursor Cursor,
 	hp *logMinHeap,
 	k int,
 	ftsTokens [][]byte,
@@ -915,6 +928,12 @@ func (e *Executor) execLogSegment(
 			return nil
 		}
 
+		// Cursor pagination: skip records that are NOT strictly older than the
+		// cursor (we paginate newest-first). The cursor itself is excluded.
+		if !cursor.IsZero() && !cursor.After(entry.Timestamp.UnixNano(), entry.ID) {
+			return nil
+		}
+
 		matched++
 		if hp.Len() < k {
 			heap.Push(hp, entry)
@@ -972,22 +991,27 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (*SpanResult, err
 	copy(segs, plan.Segments)
 	sort.Slice(segs, func(i, j int) bool { return segs[i].MaxTS > segs[j].MaxTS })
 
-	k := q.Limit + q.Offset
+	cursor, _ := DecodeCursor(q.Cursor) // pre-validated in q.Validate
+
+	k := q.Limit
 	if k <= 0 {
-		k = q.Limit
+		k = 100
 	}
 
 	hp := &spanMinHeap{}
 	heap.Init(hp)
 	totalHits := 0
 	for _, seg := range segs {
+		if !cursor.IsZero() && seg.MinTS > cursor.Timestamp {
+			continue
+		}
 		if hp.Len() >= k {
 			thresholdTS := (*hp)[0].StartTime.UnixNano()
 			if seg.MaxTS < thresholdTS {
 				continue
 			}
 		}
-		matched, err := e.execSpanSegment(ctx, q, seg, hp, k)
+		matched, err := e.execSpanSegment(ctx, q, seg, cursor, hp, k)
 		if err != nil {
 			return nil, fmt.Errorf("executor: span segment %s: %w", seg.FileName, err)
 		}
@@ -999,22 +1023,21 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (*SpanResult, err
 		spans[i] = heap.Pop(hp).(model.SpanEntry)
 	}
 
-	truncated := totalHits > q.Limit+q.Offset
-
-	if q.Offset > len(spans) {
-		spans = nil
-	} else {
-		spans = spans[q.Offset:]
-		if len(spans) > q.Limit {
-			spans = spans[:q.Limit]
-			truncated = true
-		}
+	truncated := len(spans) == q.Limit
+	var nextCursor string
+	if truncated {
+		last := spans[len(spans)-1]
+		nextCursor = EncodeCursor(Cursor{
+			Timestamp: last.StartTime.UnixNano(),
+			EntryID:   last.ID,
+		})
 	}
 
 	result := &SpanResult{
-		Spans:     spans,
-		TotalHits: totalHits,
-		Truncated: truncated,
+		Spans:      spans,
+		TotalHits:  totalHits,
+		Truncated:  truncated,
+		NextCursor: nextCursor,
 	}
 	e.resultCache.putSpan(cacheKey, result)
 	return result, nil
@@ -1024,6 +1047,7 @@ func (e *Executor) execSpanSegment(
 	_ context.Context,
 	q *SpanQuery,
 	seg index.SegmentTimeRange,
+	cursor Cursor,
 	hp *spanMinHeap,
 	k int,
 ) (int, error) {
@@ -1115,6 +1139,10 @@ func (e *Executor) execSpanSegment(
 			return nil
 		}
 		if q.MaxDuration > 0 && span.Duration() > q.MaxDuration {
+			return nil
+		}
+
+		if !cursor.IsZero() && !cursor.After(span.StartTime.UnixNano(), span.ID) {
 			return nil
 		}
 
