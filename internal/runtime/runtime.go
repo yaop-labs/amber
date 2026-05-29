@@ -206,6 +206,12 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		logManager.SetStore(logS3)
 		spanManager.SetStore(spanS3)
 
+		// Wire remote fetch fallbacks on the reader caches: queries against
+		// segments that were evicted locally (or never on this node, see
+		// reconcile) will pull from S3 transparently. Singleflight inside the
+		// cache dedupes concurrent fetches of the same segment.
+		exec.SetSegmentStores(logS3, spanS3)
+
 		logUp = newUploader(logManager, logS3, logDir, cfg.Logger)
 		spanUp = newUploader(spanManager, spanS3, spanDir, cfg.Logger)
 		logUp.Start(ctx)

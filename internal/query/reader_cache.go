@@ -2,16 +2,39 @@ package query
 
 import (
 	"container/list"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/yaop-labs/amber/internal/storage"
 )
+
+// segmentFetcher pulls a segment data file and all its sidecars from a
+// remote SegmentStore into the local cache directory. fileName is the
+// data-file base name (e.g. "seg_00000001.alog"); sidecars are derived
+// from storage.SegmentSidecarExts. Returning nil means every required
+// file is now present at filepath.Join(localDir, fileName + ext) for
+// the data ext; missing optional sidecars are tolerated.
+type segmentFetcher func(fileName string) error
 
 type readerCache struct {
 	mu       sync.Mutex
 	capacity int
 	items    map[string]*list.Element
 	order    *list.List
+
+	// fetcher, if non-nil, is called when OpenSegmentReader fails with
+	// os.ErrNotExist. It pulls the segment from remote storage and the
+	// open is retried. Nil disables remote fetch (default for local-only
+	// deployments).
+	fetcher segmentFetcher
+	// flight deduplicates concurrent remote fetches of the same segment.
+	// Without it N concurrent queries against an evicted segment would
+	// each pay N S3 GETs.
+	flight singleflight.Group
 }
 
 type cachedReader struct {
@@ -36,6 +59,47 @@ func newReaderCache(capacity int) *readerCache {
 	}
 }
 
+// setFetcher wires a remote-fetch fallback. Pass nil to disable. The cache
+// itself stays unaware of S3 specifics; the fetcher closure encapsulates
+// store + local dir.
+func (c *readerCache) setFetcher(f segmentFetcher) {
+	c.fetcher = f
+}
+
+// makeStoreFetcher builds a segmentFetcher that pulls every sidecar for
+// fileName from store, materializing them under localDir. Missing remote
+// sidecars (except the data file itself) are tolerated — bootstrap or
+// on-demand build rebuilds them. Atomic write is delegated to store.Get,
+// which writes through a temp file and renames.
+func makeStoreFetcher(store storage.SegmentStore, localDir string) segmentFetcher {
+	return func(fileName string) error {
+		for _, ext := range storage.SegmentSidecarExts {
+			name := fileName + ext
+			// Skip if already present locally — store.Get does this check
+			// too, but avoiding the call saves a lock acquire in singleflight.
+			if _, err := os.Stat(filepath.Join(localDir, name)); err == nil {
+				continue
+			}
+			rc, err := store.Get(name)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if ext == "" {
+						return err
+					}
+					continue
+				}
+				if ext == "" {
+					return err
+				}
+				// Non-fatal sidecar fetch failure; carry on.
+				continue
+			}
+			_ = rc.Close()
+		}
+		return nil
+	}
+}
+
 func (c *readerCache) acquire(path string) (*cachedReader, error) {
 	c.mu.Lock()
 	if el, ok := c.items[path]; ok {
@@ -48,6 +112,19 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 	c.mu.Unlock()
 
 	sr, err := storage.OpenSegmentReader(path, nil)
+	if err != nil && c.fetcher != nil && errors.Is(err, os.ErrNotExist) {
+		// Local miss: pull from remote store under singleflight so concurrent
+		// queriers don't each pay the network cost. After fetch, retry the
+		// open — store.Get writes the data file atomically via temp+rename.
+		fileName := filepath.Base(path)
+		_, ferr, _ := c.flight.Do(path, func() (any, error) {
+			return nil, c.fetcher(fileName)
+		})
+		if ferr != nil {
+			return nil, ferr
+		}
+		sr, err = storage.OpenSegmentReader(path, nil)
+	}
 	if err != nil {
 		return nil, err
 	}

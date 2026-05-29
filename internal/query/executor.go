@@ -369,6 +369,19 @@ func NewExecutorWithCache(
 // internally via LookupLog/LookupSpan.
 func (e *Executor) ActiveIndex() *indexer.ActiveIndex { return e.active }
 
+// SetSegmentStores wires remote-fetch fallbacks on the reader caches. After
+// this call, a query whose target segment is missing locally will fetch it
+// from the matching store before opening. Wire-up code in runtime.New is
+// the only expected caller; pass nil to leave fallbacks disabled.
+func (e *Executor) SetSegmentStores(logStore, spanStore storage.SegmentStore) {
+	if logStore != nil && e.logReaders != nil {
+		e.logReaders.setFetcher(makeStoreFetcher(logStore, e.logDir))
+	}
+	if spanStore != nil && e.spanReaders != nil {
+		e.spanReaders.setFetcher(makeStoreFetcher(spanStore, e.spanDir))
+	}
+}
+
 func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 	if e.logReaders != nil {
 		e.logReaders.invalidate(e.logManager.SegmentPath(seg))
