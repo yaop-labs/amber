@@ -100,6 +100,13 @@ func run() error {
 		spanCleaner := retention.NewCleaner(stack.SpanManager, stack.SpanSparse, policy, stack.SpanDir, log)
 		logCleaner.SetOnDelete(stack.Executor.InvalidateLogSegment)
 		spanCleaner.SetOnDelete(stack.Executor.InvalidateSpanSegment)
+		if cfg.Storage.S3.Bucket != "" {
+			// With a remote backend, only delete segments that the background
+			// uploader has confirmed durable in S3. Without this guard a
+			// transient outage could destroy the only copy of a segment.
+			logCleaner.RequireUploaded(true)
+			spanCleaner.RequireUploaded(true)
+		}
 		go logCleaner.StartLoop(interval, ctx.Done())
 		go spanCleaner.StartLoop(interval, ctx.Done())
 		log.Info("retention enabled", "max_age", cfg.Retention.MaxAge, "max_bytes", cfg.Retention.MaxBytes, "interval", interval)

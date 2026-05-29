@@ -136,6 +136,37 @@ func TestSelectForDeletion_MaxTotalBytes(t *testing.T) {
 	}
 }
 
+func TestCleaner_RequireUploadedSkipsLocalOnly(t *testing.T) {
+	// MaxSegments=1 with 3 segments would normally evict 2. With
+	// RequireUploaded enabled and none marked Uploaded, nothing should be
+	// deleted — protecting segments still in flight to S3.
+	cleaner, manager, _ := setupTestCleaner(t, Policy{MaxSegments: 1}, 3)
+	defer manager.Close()
+	cleaner.RequireUploaded(true)
+
+	deleted, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("expected 0 deletions when no segments are Uploaded, got %d", deleted)
+	}
+
+	// Mark all three as Uploaded; retention should now evict the surplus.
+	for _, seg := range manager.Segments() {
+		if err := manager.MarkUploaded(seg.ID); err != nil {
+			t.Fatalf("MarkUploaded: %v", err)
+		}
+	}
+	deleted, err = cleaner.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("expected 2 deletions after marking Uploaded, got %d", deleted)
+	}
+}
+
 func TestFilterOut(t *testing.T) {
 	all := []storage.SegmentMeta{
 		{ID: 1, FileName: "seg_1"},
