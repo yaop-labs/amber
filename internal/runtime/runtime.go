@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -119,6 +118,9 @@ type Stack struct {
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
 
+	logUploader  *uploader
+	spanUploader *uploader
+
 	ready *atomic.Bool
 }
 
@@ -170,6 +172,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		logDir, spanDir, cfg.IndexCacheSize,
 	)
 
+	var logUp, spanUp *uploader
 	if cfg.Storage.S3Bucket != "" {
 		s3cfg := storage.S3StoreConfig{
 			Bucket:   cfg.Storage.S3Bucket,
@@ -199,8 +202,17 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		logManager.SetStore(logS3)
 		spanManager.SetStore(spanS3)
-		logManager.SetOnSealComplete(sealUploader(logS3, logDir, cfg.Logger))
-		spanManager.SetOnSealComplete(sealUploader(spanS3, spanDir, cfg.Logger))
+
+		logUp = newUploader(logManager, logS3, logDir, cfg.Logger)
+		spanUp = newUploader(spanManager, spanS3, spanDir, cfg.Logger)
+		logUp.Start(ctx)
+		spanUp.Start(ctx)
+
+		// Seal callback now just kicks the worker; upload happens off the seal
+		// goroutine so an S3 outage cannot stall rotation. The worker re-reads
+		// PendingUploads on every wake, so missed signals are harmless.
+		logManager.SetOnSealComplete(func(storage.SegmentMeta) { logUp.Enqueue() })
+		spanManager.SetOnSealComplete(func(storage.SegmentMeta) { spanUp.Enqueue() })
 	}
 
 	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
@@ -241,15 +253,17 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	batcher.Start(ctx)
 
 	return &Stack{
-		LogManager:  logManager,
-		SpanManager: spanManager,
-		LogSparse:   logSparse,
-		SpanSparse:  spanSparse,
-		LogDir:      logDir,
-		SpanDir:     spanDir,
-		Executor:    exec,
-		Batcher:     batcher,
-		ready:       ready,
+		LogManager:   logManager,
+		SpanManager:  spanManager,
+		LogSparse:    logSparse,
+		SpanSparse:   spanSparse,
+		LogDir:       logDir,
+		SpanDir:      spanDir,
+		Executor:     exec,
+		Batcher:      batcher,
+		logUploader:  logUp,
+		spanUploader: spanUp,
+		ready:        ready,
 	}, nil
 }
 
@@ -269,6 +283,17 @@ func (s *Stack) Close(ctx context.Context) error {
 	case <-waitDone:
 	case <-ctx.Done():
 		return fmt.Errorf("runtime: batcher drain: %w", ctx.Err())
+	}
+
+	// Stop uploaders before closing managers: the worker holds a reference to
+	// the manager and would race with Close otherwise. We do NOT block on
+	// pending uploads here — segments that haven't reached S3 remain in
+	// UploadStateLocal and will be retried on next start.
+	if s.logUploader != nil {
+		s.logUploader.Stop()
+	}
+	if s.spanUploader != nil {
+		s.spanUploader.Stop()
 	}
 
 	closeDone := make(chan error, 1)
@@ -293,28 +318,5 @@ func (s *Stack) Close(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		return fmt.Errorf("runtime: shutdown: %w", ctx.Err())
-	}
-}
-
-// sealUploader returns an onSealComplete callback that uploads the sealed
-// segment and all its index sidecars from dir to store. Called after index
-// builds finish, so all files are on disk when upload begins.
-func sealUploader(store storage.SegmentStore, dir string, log *slog.Logger) func(storage.SegmentMeta) {
-	return func(meta storage.SegmentMeta) {
-		for _, ext := range storage.SegmentSidecarExts {
-			name := meta.FileName + ext
-			path := filepath.Join(dir, name)
-			f, err := os.Open(path)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					log.Warn("s3 upload: open local file", "file", name, "err", err)
-				}
-				continue
-			}
-			if err := store.Put(name, f); err != nil {
-				log.Warn("s3 upload: put", "file", name, "err", err)
-			}
-			_ = f.Close()
-		}
 	}
 }
