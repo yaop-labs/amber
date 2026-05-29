@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/hex"
+	"strconv"
 	"testing"
 	"time"
 
@@ -22,16 +23,31 @@ func TestCollectTraceSummariesAggregatesAcrossSpanPages(t *testing.T) {
 		makeSpan(traceC, "svc-c", "op-c", start.Add(2*time.Minute)),
 	}
 
+	// The fetch mock uses cursor as an opaque "next index into all" so we
+	// can test the pagination-loop without exercising the real codec.
 	summaries, total, err := collectTraceSummaries(func(q *query.SpanQuery) (*query.SpanResult, error) {
-		end := q.Offset + q.Limit
+		start := 0
+		if q.Cursor != "" {
+			n, perr := strconv.Atoi(q.Cursor)
+			if perr != nil {
+				return nil, perr
+			}
+			start = n
+		}
+		end := start + q.Limit
 		if end > len(all) {
 			end = len(all)
 		}
-		page := all[q.Offset:end]
+		page := all[start:end]
+		next := ""
+		if end < len(all) {
+			next = strconv.Itoa(end)
+		}
 		return &query.SpanResult{
-			Spans:     page,
-			TotalHits: len(all),
-			Truncated: end < len(all),
+			Spans:      page,
+			TotalHits:  len(all),
+			Truncated:  end < len(all),
+			NextCursor: next,
 		}, nil
 	}, query.SpanQuery{})
 	if err != nil {

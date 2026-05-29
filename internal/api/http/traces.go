@@ -103,7 +103,7 @@ func collectTraceSummaries(
 ) ([]traceSummary, int, error) {
 	page := base
 	page.Limit = traceSummaryPageSize
-	page.Offset = 0
+	page.Cursor = ""
 
 	var allSpans []model.SpanEntry
 	for {
@@ -113,10 +113,10 @@ func collectTraceSummaries(
 		}
 		allSpans = append(allSpans, result.Spans...)
 
-		if !result.Truncated || len(result.Spans) == 0 {
+		if result.NextCursor == "" || len(result.Spans) == 0 {
 			break
 		}
-		page.Offset += len(result.Spans)
+		page.Cursor = result.NextCursor
 	}
 
 	summaries := buildTraceSummaries(allSpans)

@@ -21,6 +21,7 @@ type logQueryResponse struct {
 	Entries    []model.LogEntry `json:"entries"`
 	TotalHits  int              `json:"total_hits"`
 	Truncated  bool             `json:"truncated"`
+	NextCursor string           `json:"next_cursor,omitempty"`
 	TookMs     int64            `json:"took_ms"`
 	SegTotal   int              `json:"seg_total,omitempty"`
 	SegScanned int              `json:"seg_scanned,omitempty"`
@@ -154,6 +155,7 @@ func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Entries:    result.Entries,
 			TotalHits:  result.TotalHits,
 			Truncated:  result.Truncated,
+			NextCursor: result.NextCursor,
 			TookMs:     elapsed.Milliseconds(),
 			SegTotal:   result.SegTotal,
 			SegScanned: result.SegScanned,
@@ -241,12 +243,8 @@ func parseLogQuery(r *http.Request) (*query.LogQuery, error) {
 		}
 		lq.Limit = n
 	}
-	if v := q.Get("offset"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid 'offset': %w", err)
-		}
-		lq.Offset = n
+	if v := q.Get("cursor"); v != "" {
+		lq.Cursor = v
 	}
 
 	for key, vals := range q {
