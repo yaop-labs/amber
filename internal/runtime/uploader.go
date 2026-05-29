@@ -188,8 +188,9 @@ func backoffDelay(attempts uint32) time.Duration {
 	if d <= 0 || d > uploadBackoffMax {
 		d = uploadBackoffMax
 	}
-	// Jitter ±25% of d.
-	jitter := time.Duration(rand.Int64N(int64(d) / 2))
+	// Jitter ±25% of d. math/rand is fine here: this is retry-spread to
+	// avoid thundering herds across nodes, not security-sensitive entropy.
+	jitter := time.Duration(rand.Int64N(int64(d) / 2)) //nolint:gosec
 	out := d - d/4 + jitter
 	if out > uploadBackoffMax {
 		out = uploadBackoffMax
