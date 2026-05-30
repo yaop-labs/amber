@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -433,8 +434,6 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 	var offsets []int64
 	var stats []BlockStat
 	pos := int64(segHeaderSize)
-	var minTS, maxTS int64
-	var seenTS bool
 	var totalRecords uint64
 
 	for {
@@ -478,21 +477,11 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 				if _, err := io.ReadFull(r, recData); err != nil {
 					break
 				}
-				if len(recData) >= 8 {
-					ts := int64(binary.LittleEndian.Uint64(recData[:8]))
-					if !seenTS {
-						minTS = ts
-						maxTS = ts
-						seenTS = true
-					} else {
-						if ts < minTS {
-							minTS = ts
-						}
-						if ts > maxTS {
-							maxTS = ts
-						}
-					}
-				}
+				// Only the record ID (a ULID, always the first 16 bytes in both
+				// the log and span layouts) is recoverable here. The event
+				// timestamp is not: logs carry it at a fixed offset, spans after
+				// variable-length strings, and a footerless reader cannot tell
+				// the two apart. See the footer assignment below.
 				if len(recData) >= 10 {
 					id := binary.BigEndian.Uint64(recData[2:10])
 					if !blockHasRecs {
@@ -515,9 +504,14 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 		pos += int64(blockHeaderSize) + compressedSize
 	}
 
+	// The time range cannot be recovered from blocks alone (see the loop). Report
+	// the widest possible range so time-range pruning never wrongly skips this
+	// segment — correctness over a lost pruning opportunity. The crash-recovery
+	// path (appendSegmentWriter) seeds the true range from the meta watermark;
+	// any other footerless reader gets safe "scan everything" semantics.
 	sr.footer = SegmentFooter{
-		MinTS:        minTS,
-		MaxTS:        maxTS,
+		MinTS:        math.MinInt64,
+		MaxTS:        math.MaxInt64,
 		RecordCount:  totalRecords,
 		BlockCount:   uint32(len(offsets)),
 		BlockOffsets: offsets,

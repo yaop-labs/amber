@@ -146,14 +146,11 @@ func (sm *SegmentManager) replayWAL() error {
 		}
 	}
 
-	writer, fileSize, err := appendSegmentWriter(segPath)
+	writer, fileSize, err := appendSegmentWriter(segPath, activeMeta.MinTS, activeMeta.MaxTS)
 	if err != nil {
 		return fmt.Errorf("segmgr: replay: open segment for append: %w", err)
 	}
-	sm.activeSize = fileSize - segHeaderSize
-	if sm.activeSize < 0 {
-		sm.activeSize = 0
-	}
+	sm.activeSize = max(fileSize-segHeaderSize, 0)
 
 	syncedSeq := activeMeta.LastSyncedSeq
 	count, err := sm.wal.ReplayWithSeq(func(seq uint64, payload []byte) error {
@@ -190,15 +187,12 @@ func (sm *SegmentManager) openActiveSegment() error {
 	for i := range sm.meta.Segments {
 		if !sm.meta.Segments[i].Sealed {
 			segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
-			writer, fileSize, err := appendSegmentWriter(segPath)
+			writer, fileSize, err := appendSegmentWriter(segPath, sm.meta.Segments[i].MinTS, sm.meta.Segments[i].MaxTS)
 			if err != nil {
 				return fmt.Errorf("segmgr: open active: %w", err)
 			}
 			sm.active = writer
-			sm.activeSize = fileSize - segHeaderSize
-			if sm.activeSize < 0 {
-				sm.activeSize = 0
-			}
+			sm.activeSize = max(fileSize-segHeaderSize, 0)
 			return nil
 		}
 	}
@@ -313,37 +307,49 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 }
 
 // checkpoint syncs the active segment so that all blocks flushed up to and
-// including the record with seq=lastSyncedSeq are durably on disk, persists
-// the new sync watermark in meta, and truncates the WAL.
+// including the record with seq=lastSyncedSeq are durably on disk, and persists
+// the new sync watermark in meta.
 //
-// Order: file.Sync → saveMeta → wal.Truncate. A crash between saveMeta and
-// wal.Truncate leaves WAL records whose seq <= LastSyncedSeq; on next start
-// replayWAL skips them, which is what avoids duplication. A crash between
-// Sync and saveMeta leaves stale meta and a longer file; replay truncates
-// the file back to LastSyncedSize and re-applies WAL.
+// It deliberately does NOT truncate the WAL. The watermark covers only records
+// already in a flushed, fsync'd block; records written after lastSyncedSeq
+// (a partial block still buffered in memory) are durable solely in the WAL.
+// Truncating here would drop them — the data-loss window that bit WriteBatch,
+// whose trailing items land in blockBuf after the last mid-batch flush. The WAL
+// is instead truncated only at rotate/Close, where the active segment is sealed
+// and fsync'd in its entirety, so every record that fed it is durable.
+//
+// The WAL therefore retains every record written since the last rotate (bounded
+// by the segment rotation policy). On restart, replayWAL truncates the file
+// back to LastSyncedSize and re-applies WAL records with seq > LastSyncedSeq;
+// records with seq <= LastSyncedSeq are already in durable blocks and skipped,
+// so there is neither loss nor duplication.
 func (sm *SegmentManager) checkpoint(lastSyncedSeq uint64) error {
 	if sm.active == nil {
-		return sm.wal.Truncate()
+		return nil
 	}
 	syncedOffset, err := sm.active.Sync()
 	if err != nil {
 		return err
 	}
 
+	minTS, maxTS := sm.active.TimeRange()
 	for i := range sm.meta.Segments {
 		if !sm.meta.Segments[i].Sealed {
 			sm.meta.Segments[i].LastSyncedSize = syncedOffset
 			sm.meta.Segments[i].LastSyncedSeq = lastSyncedSeq
 			sm.meta.Segments[i].RecordCount = sm.active.RecordCount()
+			// Persist the time range so a crash-recovery reopen can seed it
+			// back: the per-record event timestamp is not recoverable from the
+			// segment blocks alone (it is not at a format-agnostic offset, and
+			// event time may differ arbitrarily from ingest time), so meta is
+			// the durable source of truth for an unsealed segment's range.
+			sm.meta.Segments[i].MinTS = minTS
+			sm.meta.Segments[i].MaxTS = maxTS
 			break
 		}
 	}
 
-	if err := saveMeta(sm.dir, sm.meta); err != nil {
-		return err
-	}
-
-	return sm.wal.Truncate()
+	return saveMeta(sm.dir, sm.meta)
 }
 
 type BatchItem struct {
@@ -704,7 +710,12 @@ func makeWALPayload(ts int64, data []byte) []byte {
 	return payload
 }
 
-func appendSegmentWriter(path string) (*SegmentWriter, int64, error) {
+// appendSegmentWriter reopens an existing (unsealed) segment for append after
+// a restart. seedMinTS/seedMaxTS carry the segment's durable time range from
+// meta; they override the range a footerless rebuild would otherwise produce,
+// which is intentionally unknown (see scanBlockOffsets). When the seed is zero
+// (legacy meta with no persisted range) the rebuilt range is kept as-is.
+func appendSegmentWriter(path string, seedMinTS, seedMaxTS int64) (*SegmentWriter, int64, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, 0, fmt.Errorf("append segment: open %s: %w", path, err)
@@ -764,11 +775,19 @@ func appendSegmentWriter(path string) (*SegmentWriter, int64, error) {
 		footer := sr.Footer()
 		_ = sr.Close()
 
-		sw.minTS = footer.MinTS
-		sw.maxTS = footer.MaxTS
 		sw.recordCount = footer.RecordCount
 		sw.blockOffsets = append([]int64(nil), footer.BlockOffsets...)
 		sw.blockStats = append([]BlockStat(nil), footer.BlockStats...)
+
+		// Block offsets, record count and per-block ID stats are rebuilt
+		// correctly from the file. The time range is not — seed it from meta.
+		if seedMinTS != 0 || seedMaxTS != 0 {
+			sw.minTS = seedMinTS
+			sw.maxTS = seedMaxTS
+		} else {
+			sw.minTS = footer.MinTS
+			sw.maxTS = footer.MaxTS
+		}
 	}
 
 	return sw, fileSize, nil
