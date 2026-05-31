@@ -143,6 +143,36 @@ func (db *DB) QuerySpans(ctx context.Context, q *SpanQuery) (*SpanResult, error)
 	return db.stack.Executor.ExecSpan(ctx, q)
 }
 
+// TraceResult is the combined output of QueryTrace: every log entry and
+// every span recorded for one trace id. No tree assembly, no ordering
+// guarantees beyond what the underlying queries provide — that lives in
+// the consumer (UI, TUI, collector-side gateway).
+type TraceResult struct {
+	Logs  []LogEntry
+	Spans []SpanEntry
+}
+
+// QueryTrace fetches both the logs and spans for a single trace id in one
+// call, saving the caller a round trip. limit is applied independently to
+// each side: at most `limit` logs and at most `limit` spans come back.
+// A limit of 0 or less is treated as unbounded by the underlying executor's
+// default (100 per side).
+//
+// This is intentionally a thin wrapper. Correlation (waterfall layout,
+// log-to-span association by SpanID, span-tree construction) belongs to
+// the UI layer; storage stays domain-agnostic.
+func (db *DB) QueryTrace(ctx context.Context, traceID TraceID, limit int) (*TraceResult, error) {
+	logs, err := db.stack.Executor.ExecLog(ctx, &LogQuery{TraceID: traceID, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	spans, err := db.stack.Executor.ExecSpan(ctx, &SpanQuery{TraceID: traceID, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	return &TraceResult{Logs: logs.Entries, Spans: spans.Spans}, nil
+}
+
 // IsReady reports whether bootstrap has finished loading sealed indexes.
 // Until this returns true, queries may return partial results because some
 // segments still lack in-memory ribbon filters and bitmap caches.

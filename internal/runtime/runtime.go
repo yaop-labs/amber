@@ -256,15 +256,13 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	ready := &atomic.Bool{}
 	s := &Stack{ready: ready}
-	s.bootstrapWG.Add(1)
-	go func() {
-		defer s.bootstrapWG.Done()
+	s.bootstrapWG.Go(func() {
 		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
 		if ctx.Err() == nil {
 			ready.Store(true)
 			cfg.Logger.Info("sealed indexes loaded")
 		}
-	}()
+	})
 
 	var guard *ingest.CardinalityGuard
 	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 {

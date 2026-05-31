@@ -277,3 +277,77 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 		t.Errorf("attrs not preserved: %v", got.Attrs)
 	}
 }
+
+// TestEmbedded_QueryTraceReturnsBothSides pins the wrapper contract: one
+// call gives back the logs AND the spans for a trace id, so the consumer
+// (UI/TUI/gateway) does not need two round trips. The wrapper does NOT
+// correlate, build trees, or order across sides — that stays upstream.
+func TestEmbedded_QueryTraceReturnsBothSides(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	db, err := amber.Open(dir, defaultOpts())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	var traceID amber.TraceID
+	copy(traceID[:], []byte("trace-correlate0"))
+	var spanID amber.SpanID
+	copy(spanID[:], []byte("span0001"))
+
+	// Write one log and one span, both tagged with the same trace id.
+	logEntry := amber.LogEntry{
+		Timestamp: time.Now(),
+		Level:     amber.LevelInfo,
+		Service:   "trace-svc",
+		Host:      "host-d",
+		Body:      "request handled",
+		TraceID:   traceID,
+		SpanID:    spanID,
+	}
+	if err := db.Log(ctx, logEntry); err != nil {
+		t.Fatalf("log: %v", err)
+	}
+
+	span, err := amber.NewSpanEntry(traceID, spanID, amber.SpanID{}, "trace-svc", "GET /widgets")
+	if err != nil {
+		t.Fatalf("NewSpanEntry: %v", err)
+	}
+	span.StartTime = time.Now()
+	span.EndTime = span.StartTime.Add(5 * time.Millisecond)
+	if err := db.Span(ctx, span); err != nil {
+		t.Fatalf("span: %v", err)
+	}
+
+	// Poll: both ingest paths are async, and the side that flushes later
+	// dictates when the result is complete. Empty results are not cached,
+	// so a tight loop won't lock in a partial answer.
+	var got *amber.TraceResult
+	if !eventually(t, 3*time.Second, 25*time.Millisecond, func() bool {
+		r, err := db.QueryTrace(ctx, traceID, 100)
+		if err != nil {
+			return false
+		}
+		got = r
+		return len(r.Logs) > 0 && len(r.Spans) > 0
+	}) {
+		var lc, sc int
+		if got != nil {
+			lc, sc = len(got.Logs), len(got.Spans)
+		}
+		t.Fatalf("QueryTrace never saw both sides: logs=%d spans=%d", lc, sc)
+	}
+
+	if got.Logs[0].TraceID != traceID {
+		t.Errorf("log trace_id: got %x, want %x", got.Logs[0].TraceID, traceID)
+	}
+	if got.Spans[0].TraceID != traceID {
+		t.Errorf("span trace_id: got %x, want %x", got.Spans[0].TraceID, traceID)
+	}
+}
