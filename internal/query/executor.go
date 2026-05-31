@@ -806,6 +806,12 @@ func (e *Executor) execLogSegment(
 		}
 	}
 
+	// needScanFTS triggers a per-record body match during the scan. It is set
+	// when a full-text query targets a segment that has no FTS index yet —
+	// notably the active, unsealed segment, whose index is only built at seal
+	// time. Without this fallback, `q` would be silently ignored for the most
+	// recent data.
+	needScanFTS := false
 	if plan.HasStep(StepFTSSearch) {
 
 		if len(ftsTokens) > 0 {
@@ -842,6 +848,8 @@ func (e *Executor) execLogSegment(
 			if allowedIDs.IsEmpty() {
 				return 0, nil
 			}
+		} else if len(ftsTokens) > 0 {
+			needScanFTS = true
 		}
 	}
 
@@ -897,6 +905,22 @@ func (e *Executor) execLogSegment(
 
 	matched := 0
 
+	// Scan-time full-text setup. The query tokens are converted to strings
+	// once per segment (not per record), and a per-scan memo collapses the
+	// repeated work of tokenizing identical bodies — log messages are highly
+	// templated, so the same body recurs thousands of times. The memo is
+	// capped so a pathologically high-cardinality segment can't blow memory;
+	// past the cap we simply recompute.
+	var ftsTokenStrs []string
+	var ftsMemo map[string]bool
+	if needScanFTS {
+		ftsTokenStrs = make([]string, len(ftsTokens))
+		for i, t := range ftsTokens {
+			ftsTokenStrs[i] = string(t)
+		}
+		ftsMemo = make(map[string]bool)
+	}
+
 	thresholdID := func() (uint64, bool) {
 		if hp.Len() < k {
 			return 0, false
@@ -948,6 +972,19 @@ func (e *Executor) execLogSegment(
 		}
 		if len(q.Hosts) > 0 && !containsStr(q.Hosts, entry.Host) {
 			return nil
+		}
+
+		if needScanFTS {
+			match, seen := ftsMemo[entry.Body]
+			if !seen {
+				match = bodyMatchesTokens(entry.Body, ftsTokenStrs)
+				if len(ftsMemo) < ftsMemoCap {
+					ftsMemo[entry.Body] = match
+				}
+			}
+			if !match {
+				return nil
+			}
 		}
 
 		if !model.IsZeroTraceID(q.TraceID) && entry.TraceID != q.TraceID {
@@ -1286,6 +1323,32 @@ func containsStr(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ftsMemoCap bounds the per-scan body-match memo so a high-cardinality segment
+// (mostly unique bodies) cannot grow it without limit; past the cap we recompute.
+const ftsMemoCap = 8192
+
+// bodyMatchesTokens reports whether body contains every query token, using the
+// same FTS tokenizer (lowercasing, stemming, stopword removal) as the sealed
+// index path so the active-segment fallback yields identical matches. queryToks
+// is the already-tokenized query. A linear scan over the (few) body tokens beats
+// building a set per call: query terms number one or two in practice.
+func bodyMatchesTokens(body string, queryToks []string) bool {
+	bodyToks := index.TokenizeFTS(body)
+	for _, q := range queryToks {
+		found := false
+		for _, bt := range bodyToks {
+			if bt == q {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func containsStatus(slice []model.SpanStatus, s model.SpanStatus) bool {

@@ -11,7 +11,6 @@ import (
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
-	"github.com/yaop-labs/amber/internal/ui"
 )
 
 type RoutesDeps struct {
@@ -62,6 +61,4 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Logger)
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))
 	mux.Handle("GET /api/v1/admin/segments", auth(http.HandlerFunc(adminH.Segments)))
-
-	mux.Handle("/", ui.Handler())
 }

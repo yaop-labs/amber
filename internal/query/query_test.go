@@ -1,11 +1,13 @@
 package query
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -272,6 +274,102 @@ func TestLogQuery_FromUnixNano_ZeroReturnsZero(t *testing.T) {
 	q := &LogQuery{}
 	if q.FromUnixNano() != 0 {
 		t.Errorf("expected 0 for zero From, got %d", q.FromUnixNano())
+	}
+}
+
+// buildBodyDataset writes logs with the given bodies into one segment and
+// returns a ready executor that registers NO FTS index. The scan-time
+// full-text fallback (needScanFTS) is gated on the absence of an FTS index,
+// not on whether the segment is active — so this exercises the same code path
+// the production active (unsealed) segment hits, while staying readable.
+func buildBodyDataset(t *testing.T, bodies []string) (*Executor, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	policy := storage.RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 1 << 30}
+	mgr, err := storage.OpenSegmentManager(dir+"/logs", policy)
+	if err != nil {
+		t.Fatalf("OpenSegmentManager logs: %v", err)
+	}
+	spanMgr, err := storage.OpenSegmentManager(dir+"/spans", policy)
+	if err != nil {
+		t.Fatalf("OpenSegmentManager spans: %v", err)
+	}
+
+	sparse := index.NewSparseIndex()
+	base := time.Now().Add(-time.Hour).UnixNano()
+	buf := &bytes.Buffer{}
+	batch := make([]storage.BatchItem, 0, len(bodies))
+	for i, body := range bodies {
+		ts := base + int64(i)*int64(time.Second)
+		entry := model.LogEntry{
+			ID:        makeMonotonicID(uint64(ts/int64(time.Millisecond)), uint64(i)),
+			Timestamp: time.Unix(0, ts),
+			Level:     model.LevelInfo,
+			Service:   "api",
+			Body:      body,
+		}
+		buf.Reset()
+		entry.WriteTo(buf)
+		data := make([]byte, buf.Len())
+		copy(data, buf.Bytes())
+		batch = append(batch, storage.BatchItem{Data: data, TS: entry.Timestamp.UnixNano()})
+	}
+	if err := mgr.WriteBatch(batch); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if active, ok := mgr.ActiveSegmentMeta(); ok {
+		sparse.TouchRange(active.ID, active.FileName, base, base+int64(len(bodies))*int64(time.Second))
+	}
+	if err := mgr.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	exec := NewExecutor(mgr, spanMgr, sparse, index.NewSparseIndex())
+	return exec, func() { mgr.Close(); spanMgr.Close() }
+}
+
+// TestExecutor_ExecLog_FullText_ActiveScanFallback pins the fix for full-text
+// search being silently ignored on the active (unsealed) segment, which has
+// no FTS index. Before the fix, `q` was a no-op for recent data and every
+// query returned the full set.
+func TestExecutor_ExecLog_FullText_ActiveScanFallback(t *testing.T) {
+	exec, cleanup := buildBodyDataset(t, []string{
+		"connection refused to postgres:5432",
+		"rate limit exceeded ip=10.0.0.1",
+		"request completed ok",
+		"connection refused to redis:6379",
+		"cache warmed successfully",
+	})
+	defer cleanup()
+
+	run := func(q string) []string {
+		t.Helper()
+		res, err := exec.ExecLog(context.Background(), &LogQuery{FullText: q, Limit: 100})
+		if err != nil {
+			t.Fatalf("ExecLog(%q): %v", q, err)
+		}
+		bodies := make([]string, len(res.Entries))
+		for i, e := range res.Entries {
+			bodies[i] = e.Body
+		}
+		return bodies
+	}
+
+	if got := run("refused"); len(got) != 2 {
+		t.Errorf("q=refused: got %d entries %v, want 2 (the refused bodies)", len(got), got)
+	}
+	if got := run("rate"); len(got) != 1 {
+		t.Errorf("q=rate: got %d entries %v, want 1", len(got), got)
+	}
+	if got := run("nonexistentxyz"); len(got) != 0 {
+		t.Errorf("q=nonexistentxyz: got %d entries, want 0", len(got))
+	}
+	// Multi-token queries are AND: every token must be present in the body.
+	if got := run("connection refused"); len(got) != 2 {
+		t.Errorf("q='connection refused': got %d, want 2", len(got))
+	}
+	if got := run("refused rate"); len(got) != 0 {
+		t.Errorf("q='refused rate': got %d, want 0 (no body has both tokens)", len(got))
 	}
 }
 

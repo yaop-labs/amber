@@ -31,7 +31,24 @@ import (
 //
 // Synthetic time placement: segment k covers [base + k*hour, base + (k+1)*hour)
 // so time-range pruning benchmarks can target specific windows.
+// templatedBodies are the handful of recurring log lines used by most
+// benchmarks — realistic in that production logs are highly templated.
+var templatedBodies = []string{
+	"connection refused to postgres:5432 error",
+	"timeout waiting for redis response",
+	"panic: nil pointer dereference in handler",
+	"GET /api/v1/users 200 success latency 45ms",
+	"failed to process payment transaction error 500",
+	"worker processed job successfully queue empty",
+}
+
+func defaultBody(idx int) string { return templatedBodies[idx%len(templatedBodies)] }
+
 func buildSealedDataset(b *testing.B, numSegments, recsPerSeg int) (*Executor, func()) {
+	return buildSealedDatasetBodied(b, numSegments, recsPerSeg, defaultBody)
+}
+
+func buildSealedDatasetBodied(b *testing.B, numSegments, recsPerSeg int, bodyFn func(idx int) string) (*Executor, func()) {
 	b.Helper()
 	dir := b.TempDir()
 	logDir := dir + "/logs"
@@ -55,14 +72,6 @@ func buildSealedDataset(b *testing.B, numSegments, recsPerSeg int) (*Executor, f
 
 	services := []string{"api-gateway", "auth-service", "payment", "worker", "scheduler"}
 	levels := []string{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
-	bodies := []string{
-		"connection refused to postgres:5432 error",
-		"timeout waiting for redis response",
-		"panic: nil pointer dereference in handler",
-		"GET /api/v1/users 200 success latency 45ms",
-		"failed to process payment transaction error 500",
-		"worker processed job successfully queue empty",
-	}
 
 	base := time.Now().Add(-time.Duration(numSegments) * time.Hour).UnixNano()
 	hourNs := int64(time.Hour)
@@ -84,7 +93,7 @@ func buildSealedDataset(b *testing.B, numSegments, recsPerSeg int) (*Executor, f
 				Level:     lvl,
 				Service:   services[idx%len(services)],
 				Host:      fmt.Sprintf("host-%03d", idx%10),
-				Body:      bodies[idx%len(bodies)],
+				Body:      bodyFn(idx),
 				Attrs:     []model.Attr{{Key: "env", Value: "prod"}},
 			}
 			buf.Reset()
@@ -160,6 +169,46 @@ func BenchmarkExecLog_Sealed_100seg_1k(b *testing.B) {
 	exec, cleanup := buildSealedDataset(b, 100, 1_000)
 	defer cleanup()
 	runExecLogBench(b, exec, &LogQuery{Limit: 100})
+}
+
+// BenchmarkExecLog_FullTextScanFallback_* measure the active-segment full-text
+// fallback: buildSealedDataset registers no FTS index, so a FullText query
+// takes the per-record TokenizeFTS body match (needScanFTS). Compare ns/op
+// against BenchmarkExecLog_Sealed_1seg_* (identical scan, no full text) to read
+// the tokenization overhead. This is the worst case — no bitmap pre-filter, so
+// every record in the segment is tokenized.
+func BenchmarkExecLog_FullTextScanFallback_1seg_10k(b *testing.B) {
+	exec, cleanup := buildSealedDataset(b, 1, 10_000)
+	defer cleanup()
+	runExecLogBench(b, exec, &LogQuery{FullText: "error", Limit: 100})
+}
+
+func BenchmarkExecLog_FullTextScanFallback_1seg_100k(b *testing.B) {
+	exec, cleanup := buildSealedDataset(b, 1, 100_000)
+	defer cleanup()
+	runExecLogBench(b, exec, &LogQuery{FullText: "error", Limit: 100})
+}
+
+// With a service filter the bitmap pre-filter shrinks the candidate set before
+// the body match, so far fewer records are tokenized.
+func BenchmarkExecLog_FullTextScanFallback_ServiceFilter_1seg_100k(b *testing.B) {
+	exec, cleanup := buildSealedDataset(b, 1, 100_000)
+	defer cleanup()
+	runExecLogBench(b, exec, &LogQuery{Services: []string{"api-gateway"}, FullText: "error", Limit: 100})
+}
+
+// uniqueBody keeps the templated prefix (so the "error" token recurs at the
+// same rate) but appends a unique id, mimicking real logs that embed request
+// IDs in the message. The per-scan body memo gets no hits here — this is the
+// worst case for the memo optimization.
+func uniqueBody(idx int) string {
+	return fmt.Sprintf("%s req=%d id=%08x", templatedBodies[idx%len(templatedBodies)], idx, idx*2654435761)
+}
+
+func BenchmarkExecLog_FullTextScanFallback_UniqueBodies_1seg_100k(b *testing.B) {
+	exec, cleanup := buildSealedDatasetBodied(b, 1, 100_000, uniqueBody)
+	defer cleanup()
+	runExecLogBench(b, exec, &LogQuery{FullText: "error", Limit: 100})
 }
 
 // BenchmarkExecLog_ServiceFilter_Bitmap_10seg_10k measures the bitmap

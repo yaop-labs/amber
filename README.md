@@ -5,8 +5,8 @@
 <h1 align="center">Amber</h1>
 
 <p align="center">
-  <a href="https://github.com/hnlbs/amber/actions/workflows/ci.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/hnlbs/amber/actions/workflows/lint.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/lint.yml/badge.svg" alt="Lint"></a>
+  <a href="https://github.com/hnlbs/amber/actions/workflows/ci.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/hnlbs/amber/actions/workflows/lint.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/lint.yaml/badge.svg" alt="Lint"></a>
   <a href="https://goreportcard.com/report/github.com/hnlbs/amber"><img src="https://goreportcard.com/badge/github.com/hnlbs/amber" alt="Go Report Card"></a>
   <a href="https://pkg.go.dev/github.com/hnlbs/amber"><img src="https://pkg.go.dev/badge/github.com/hnlbs/amber.svg" alt="Go Reference"></a>
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white" alt="Go 1.25+">
@@ -31,7 +31,7 @@ Think "SQLite for observability".
 - **Log-trace correlation** — trace viewer with span tree and linked logs
 - **Retention policies** — max age, max bytes, max segments
 - **Embedded mode** — use as a Go library without HTTP server
-- **Built-in Web UI** — Svelte-based log explorer and trace viewer
+- **amberctl** — command-line client and interactive terminal UI (logs, traces, span waterfall, live tail)
 
 ## Quick Start
 
@@ -74,6 +74,32 @@ result, err := db.QueryLogs(ctx, &amber.LogQuery{
     Limit:    100,
 })
 ```
+
+## amberctl (CLI & TUI)
+
+`amberctl` is the terminal client. It speaks amber's HTTP read API, so it works
+the same against a local dev server (default `http://localhost:8080`, no auth)
+or a remote one (`--addr` / `--api-key`, or `AMBER_ADDR` / `AMBER_API_KEY`).
+
+```bash
+make build                                  # builds ./amber and ./amberctl
+
+# one-shot, scriptable
+amberctl logs --service api --level ERROR --since 1h
+amberctl logs -q "connection refused" --json | jq .
+amberctl logs --service api -f              # live tail
+amberctl traces --service checkout --since 6h
+amberctl trace <trace_id>                   # span waterfall + linked logs
+amberctl services
+amberctl stats
+
+# interactive terminal UI
+amberctl tui
+```
+
+In the TUI: `↑/↓` move, `enter` or click opens a trace, `space` expands a row,
+`/` searches, `t` cycles the time range, `f` toggles live tail, `tab` switches
+logs/traces, `q` quits.
 
 ## API
 

@@ -5,6 +5,7 @@ BUILD_FLAGS := -ldflags="-s -w"
 
 build:
 	go build $(BUILD_FLAGS) -o $(BINARY) ./cmd/amber
+	go build $(BUILD_FLAGS) -o amberctl ./cmd/amberctl
 
 run: build
 	./$(BINARY) config.example.yaml
@@ -27,7 +28,7 @@ tidy:
 	go mod tidy
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) amberctl
 	go clean -testcache
 
 docker:
