@@ -117,9 +117,19 @@ func migrateLocalPresent(dir string, m *StoreMeta) {
 		if m.Segments[i].LocalPresent != nil {
 			continue
 		}
-		path := filepath.Join(dir, m.Segments[i].FileName)
+		// Validate that the recorded file name matches the segment-naming
+		// pattern before touching the filesystem. A meta.json with a crafted
+		// FileName (e.g. "../etc/passwd") would otherwise let Stat escape
+		// the data dir. ParseSegmentID accepts only seg_NNNNNNNN.alog.
+		fileName := m.Segments[i].FileName
+		if _, ok := ParseSegmentID(fileName); !ok {
+			absent := false
+			m.Segments[i].LocalPresent = &absent
+			continue
+		}
+		path := filepath.Join(dir, fileName)
 		present := true
-		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) { //nolint:gosec // path validated by ParseSegmentID above
 			present = false
 		}
 		m.Segments[i].LocalPresent = &present
