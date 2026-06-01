@@ -3,12 +3,15 @@ package query
 import (
 	"container/list"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/yaop-labs/amber/internal/metrics"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -71,8 +74,20 @@ func (c *readerCache) setFetcher(f segmentFetcher) {
 // sidecars (except the data file itself) are tolerated — bootstrap or
 // on-demand build rebuilds them. Atomic write is delegated to store.Get,
 // which writes through a temp file and renames.
-func makeStoreFetcher(store storage.SegmentStore, localDir string) segmentFetcher {
+//
+// kind is the storage stream tag ("logs"|"spans") used for cold-read metrics
+// and the single observability log emitted per fetch. log may be nil.
+func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *slog.Logger) segmentFetcher {
 	return func(fileName string) error {
+		// Treat the absence of the data file as the cold-read trigger:
+		// sidecar-only refetches (rare, only when bidx/fidx/etc. went missing
+		// but .alog stayed) shouldn't inflate the cold-fetch counter.
+		dataMissing := false
+		if _, err := os.Stat(filepath.Join(localDir, fileName)); err != nil && os.IsNotExist(err) {
+			dataMissing = true
+		}
+
+		start := time.Now()
 		for _, ext := range storage.SegmentSidecarExts {
 			name := fileName + ext
 			// Skip if already present locally — store.Get does this check
@@ -95,6 +110,21 @@ func makeStoreFetcher(store storage.SegmentStore, localDir string) segmentFetche
 				continue
 			}
 			_ = rc.Close()
+		}
+		if dataMissing {
+			elapsed := time.Since(start)
+			metrics.QueryColdSegmentReads.WithLabelValues(kind).Inc()
+			metrics.QueryColdSegmentFetchDur.WithLabelValues(kind).Observe(elapsed.Seconds())
+			// One log per cold fetch is bounded by segment size (sealed
+			// segments are tens of MB), so this stays quiet even when the
+			// query plan scans many segments.
+			if log != nil {
+				log.Info("cold segment fetch",
+					"kind", kind,
+					"segment", fileName,
+					"duration", elapsed,
+				)
+			}
 		}
 		return nil
 	}

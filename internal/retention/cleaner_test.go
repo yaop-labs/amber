@@ -3,6 +3,7 @@ package retention
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func setupTestCleaner(t *testing.T, policy Policy, numSegments int) (*Cleaner, *
 		}
 	}
 
-	cleaner := NewCleaner(manager, sparse, policy, dir, log)
+	cleaner := NewCleaner(manager, sparse, policy, dir, "logs", log)
 	return cleaner, manager, dir
 }
 
@@ -112,7 +113,7 @@ func TestCleaner_EmptyStorage(t *testing.T) {
 	defer manager.Close()
 
 	sparse := index.NewSparseIndex()
-	cleaner := NewCleaner(manager, sparse, Policy{MaxSegments: 5}, dir, log)
+	cleaner := NewCleaner(manager, sparse, Policy{MaxSegments: 5}, dir, "logs", log)
 
 	deleted, err := cleaner.Run()
 	if err != nil {
@@ -214,5 +215,101 @@ func TestFilterOut(t *testing.T) {
 	}
 	if result[0].ID != 1 || result[1].ID != 3 {
 		t.Errorf("wrong result: %v", result)
+	}
+}
+
+// TestCleaner_LocalEvictionRequiresUploaded confirms that local eviction
+// refuses to act on a segment that hasn't been marked Uploaded, even if its
+// age would otherwise trigger eviction. Without this guard, a misconfigured
+// local-only deploy with LocalMaxAge set could delete the only copy.
+func TestCleaner_LocalEvictionRequiresUploaded(t *testing.T) {
+	cleaner, manager, dir := setupTestCleaner(t, Policy{LocalMaxAge: time.Hour}, 3)
+
+	// No segment is marked Uploaded; local eviction must skip all.
+	n, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 evictions for non-uploaded segments, got %d", n)
+	}
+
+	for _, s := range manager.Segments() {
+		path := filepath.Join(dir, s.FileName)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("segment file %s should still exist: %v", s.FileName, err)
+		}
+	}
+}
+
+// TestCleaner_LocalEvictionByMaxAge marks segments Uploaded then runs local
+// eviction. Old segments should lose their local file but stay in the
+// manifest with LocalPresent=false; the global retention pass is disabled,
+// so they remain known to the manager.
+func TestCleaner_LocalEvictionByMaxAge(t *testing.T) {
+	cleaner, manager, dir := setupTestCleaner(t, Policy{LocalMaxAge: 36 * time.Hour}, 3)
+
+	for _, s := range manager.Segments() {
+		if err := manager.MarkUploaded(s.ID); err != nil {
+			t.Fatalf("MarkUploaded(%d): %v", s.ID, err)
+		}
+	}
+
+	n, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Of three segments at -72h, -48h, -24h (relative MaxTS), the first two
+	// are older than 36h and should be evicted; the third (24h old) stays.
+	if n != 2 {
+		t.Fatalf("expected 2 local evictions, got %d", n)
+	}
+
+	segs := manager.Segments()
+	if len(segs) != 3 {
+		t.Fatalf("expected manifest to retain all 3 segments, got %d", len(segs))
+	}
+
+	var presentCount, absentCount int
+	for _, s := range segs {
+		path := filepath.Join(dir, s.FileName)
+		_, statErr := os.Stat(path)
+		if s.HasLocalCopy() {
+			presentCount++
+			if statErr != nil {
+				t.Errorf("segment %s marked present but file missing: %v", s.FileName, statErr)
+			}
+		} else {
+			absentCount++
+			if !os.IsNotExist(statErr) {
+				t.Errorf("segment %s marked absent but file still on disk", s.FileName)
+			}
+		}
+	}
+	if presentCount != 1 || absentCount != 2 {
+		t.Errorf("expected 1 present + 2 absent, got %d present + %d absent", presentCount, absentCount)
+	}
+}
+
+// TestCleaner_LocalEvictionSkipsAlreadyEvicted confirms idempotency: running
+// twice doesn't double-count or error.
+func TestCleaner_LocalEvictionIdempotent(t *testing.T) {
+	cleaner, manager, _ := setupTestCleaner(t, Policy{LocalMaxAge: 36 * time.Hour}, 3)
+	for _, s := range manager.Segments() {
+		if err := manager.MarkUploaded(s.ID); err != nil {
+			t.Fatalf("MarkUploaded: %v", err)
+		}
+	}
+
+	first, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	second, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if first != 2 || second != 0 {
+		t.Errorf("first=%d second=%d; expected 2 then 0", first, second)
 	}
 }

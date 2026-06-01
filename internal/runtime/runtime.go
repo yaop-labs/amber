@@ -217,7 +217,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		// segments that were evicted locally (or never on this node, see
 		// reconcile) will pull from S3 transparently. Singleflight inside the
 		// cache dedupes concurrent fetches of the same segment.
-		exec.SetSegmentStores(logS3, spanS3)
+		exec.SetSegmentStores(logS3, spanS3, cfg.Logger)
 
 		logUp = newUploader(logManager, logS3, logDir, cfg.Logger)
 		spanUp = newUploader(spanManager, spanS3, spanDir, cfg.Logger)

@@ -145,7 +145,9 @@ func (s *S3Store) Get(name string) (io.ReadCloser, error) {
 	return os.Open(localPath)
 }
 
-// Delete removes the file from S3 and the local cache.
+// Delete removes the file from S3 and the local cache. Used for terminal
+// retention where the segment is gone for good. For local-only eviction
+// (keeping the S3 copy intact), use DeleteLocal.
 func (s *S3Store) Delete(name string) error {
 	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
@@ -154,6 +156,17 @@ func (s *S3Store) Delete(name string) error {
 	if err != nil {
 		return fmt.Errorf("s3store: delete %s: %w", name, err)
 	}
+	localPath := filepath.Join(s.localDir, name)
+	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("s3store: delete local cache %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteLocal removes the file from the local cache only, leaving the S3
+// object intact. A subsequent Get will re-fetch from S3 on demand. Used by
+// local-tier retention to free disk while keeping the durable copy.
+func (s *S3Store) DeleteLocal(name string) error {
 	localPath := filepath.Join(s.localDir, name)
 	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("s3store: delete local cache %s: %w", name, err)

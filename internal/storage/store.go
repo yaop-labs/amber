@@ -27,8 +27,15 @@ type SegmentStore interface {
 	// Returns os.ErrNotExist if the file is not present.
 	Get(name string) (io.ReadCloser, error)
 
-	// Delete removes the named file. Missing files are silently ignored.
+	// Delete removes the named file from both the remote store (if any) and
+	// the local cache. Missing files are silently ignored. Use for terminal
+	// retention where the segment is gone for good.
 	Delete(name string) error
+
+	// DeleteLocal removes the named file from the local cache only, leaving
+	// the remote copy intact. Used by local-tier eviction so the segment can
+	// be re-fetched on demand. For LocalStore this is equivalent to Delete.
+	DeleteLocal(name string) error
 
 	// List returns base names of all segment data files (*.alog) in the store.
 	List() ([]string, error)
@@ -64,6 +71,13 @@ func (s *LocalStore) Delete(name string) error {
 		return fmt.Errorf("localstore: delete %s: %w", name, err)
 	}
 	return nil
+}
+
+// DeleteLocal is identical to Delete on a local-only store: there is no
+// separate remote copy. Provided so SegmentStore consumers don't need to
+// type-switch on the concrete store.
+func (s *LocalStore) DeleteLocal(name string) error {
+	return s.Delete(name)
 }
 
 func (s *LocalStore) List() ([]string, error) {

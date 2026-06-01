@@ -21,7 +21,24 @@ log:
   format: text
 
 retention:
-  max_age: 0s       # максимальный возраст сегмента (например 168h = 7 дней), 0s = отключено
-  max_bytes: 0      # максимальный суммарный размер на диске в байтах, 0 = отключено
-  max_segments: 0   # максимальное количество сегментов, 0 = отключено
-  interval: 1h      # интервал проверки
+  interval: 1h           # интервал проверки (общий для logs и spans)
+
+  # Per-stream retention. Каждая секция имеет два tier'а:
+  #   local_*  — снимает файл с локального диска, объект в S3 остаётся.
+  #              Требует настроенного storage.s3. Запрос в эвиктнутый
+  #              сегмент прозрачно подтянет его обратно.
+  #   max_*    — удаляет сегмент глобально (и из S3). Compliance retention.
+  # Все значения 0 = соответствующий tier отключён.
+  logs:
+    local_max_age: 0s    # пример: 168h (7 дней) — после этого только в S3
+    local_max_bytes: 0
+    max_age: 0s          # пример: 8760h (год)
+    max_bytes: 0
+    max_segments: 0
+
+  spans:
+    local_max_age: 0s
+    local_max_bytes: 0
+    max_age: 0s          # обычно короче чем у logs
+    max_bytes: 0
+    max_segments: 0

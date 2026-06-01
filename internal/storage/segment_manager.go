@@ -213,11 +213,13 @@ func (sm *SegmentManager) createNewSegment() error {
 		return fmt.Errorf("segmgr: create segment %d: %w", id, err)
 	}
 
+	present := true
 	sm.meta.NextSegmentID++
 	sm.meta.Segments = append(sm.meta.Segments, SegmentMeta{
-		ID:       id,
-		FileName: fileName,
-		Sealed:   false,
+		ID:           id,
+		FileName:     fileName,
+		Sealed:       false,
+		LocalPresent: &present,
 	})
 
 	if err := saveMeta(sm.dir, sm.meta); err != nil {
@@ -502,6 +504,33 @@ func (sm *SegmentManager) MarkUploaded(id uint32) error {
 	return fmt.Errorf("segmgr: mark uploaded: unknown segment id %d", id)
 }
 
+// MarkLocalEvicted records that the segment's local file has been removed
+// while the remote copy remains. Rejects segments that aren't UploadStateUploaded
+// (evicting the only durable copy would lose data) and segments already marked
+// absent (idempotent no-op). Caller must remove the file from disk before
+// calling — this method only mutates meta.
+func (sm *SegmentManager) MarkLocalEvicted(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		seg := &sm.meta.Segments[i]
+		if seg.UploadState != UploadStateUploaded {
+			return fmt.Errorf("segmgr: mark local evicted: segment %d is not uploaded", id)
+		}
+		if seg.LocalPresent != nil && !*seg.LocalPresent {
+			return nil
+		}
+		absent := false
+		seg.LocalPresent = &absent
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return fmt.Errorf("segmgr: mark local evicted: unknown segment id %d", id)
+}
+
 // AdoptUploadedSegment inserts a sealed, already-uploaded segment into the
 // manager's metadata. Used by the bootstrap S3 reconcile path to surface
 // segments that exist in remote storage but not in local meta.json (e.g.
@@ -546,6 +575,11 @@ func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 
 	meta.Sealed = true
 	meta.UploadState = UploadStateUploaded
+	// Adopted segments come from the remote store; the local file is fetched
+	// lazily on first query. Mark explicitly absent so retention's local-tier
+	// pass doesn't try to evict a file that isn't there.
+	absent := false
+	meta.LocalPresent = &absent
 	sm.meta.Segments = append(sm.meta.Segments, meta)
 
 	if meta.ID >= sm.meta.NextSegmentID {
@@ -670,6 +704,20 @@ func (sm *SegmentManager) DeleteSegmentFiles(meta SegmentMeta) error {
 	var first error
 	for _, ext := range SegmentSidecarExts {
 		if err := sm.store.Delete(meta.FileName + ext); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// DeleteSegmentFilesLocal removes only the local copies of the segment data
+// file and sidecars; the remote (S3) copy, if any, is preserved. For
+// LocalStore this is equivalent to DeleteSegmentFiles. Used by the local
+// retention tier.
+func (sm *SegmentManager) DeleteSegmentFilesLocal(meta SegmentMeta) error {
+	var first error
+	for _, ext := range SegmentSidecarExts {
+		if err := sm.store.DeleteLocal(meta.FileName + ext); err != nil && first == nil {
 			first = err
 		}
 	}

@@ -57,6 +57,27 @@ type SegmentMeta struct {
 	// LastUploadErr is the most recent upload error message (truncated). Empty
 	// on success. Diagnostic only — never read for control flow.
 	LastUploadErr string `json:"last_upload_err,omitempty"`
+
+	// LocalPresent records whether the segment's data file currently exists on
+	// local disk. Decoupled from UploadState so the four combinations are
+	// expressible: fresh-sealed (Local+true), dual-resident (Uploaded+true),
+	// cold-evicted (Uploaded+false). Local+false is invalid and rejected by
+	// MarkLocalEvicted.
+	//
+	// Pointer so the zero JSON value (field absent) is distinguishable from an
+	// explicit false. Older meta.json predates the field; loadMeta calls
+	// migrateLocalPresent to set it based on file existence.
+	LocalPresent *bool `json:"local_present,omitempty"`
+}
+
+// HasLocalCopy reports whether the segment's data file is expected to be on
+// local disk. Treats a nil LocalPresent (legacy meta before migration) as
+// true so pre-tiering segments are not mistaken for evicted ones.
+func (s SegmentMeta) HasLocalCopy() bool {
+	if s.LocalPresent == nil {
+		return true
+	}
+	return *s.LocalPresent
 }
 
 type StoreMeta struct {
@@ -80,7 +101,29 @@ func loadMeta(dir string) (*StoreMeta, error) {
 		return nil, fmt.Errorf("meta: parse %s: %w", path, err)
 	}
 
+	migrateLocalPresent(dir, &m)
 	return &m, nil
+}
+
+// migrateLocalPresent fills in SegmentMeta.LocalPresent for entries that lack
+// the field (older meta.json). The decision is purely file-existence based:
+// if the .alog is on disk, mark present; otherwise mark absent. This is a
+// one-time, idempotent backfill — the caller (loadMeta) doesn't persist the
+// migrated state, so on every restart the same backfill runs cheaply.
+// Persisting only happens when a real mutation (MarkLocalEvicted, MarkUploaded,
+// etc.) writes meta back.
+func migrateLocalPresent(dir string, m *StoreMeta) {
+	for i := range m.Segments {
+		if m.Segments[i].LocalPresent != nil {
+			continue
+		}
+		path := filepath.Join(dir, m.Segments[i].FileName)
+		present := true
+		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+			present = false
+		}
+		m.Segments[i].LocalPresent = &present
+	}
 }
 
 func saveMeta(dir string, m *StoreMeta) error {

@@ -39,8 +39,9 @@ func (f *fakeStore) Get(name string) (io.ReadCloser, error) {
 	f.getCalls++
 	return nil, fmt.Errorf("not implemented")
 }
-func (f *fakeStore) Delete(_ string) error   { return nil }
-func (f *fakeStore) List() ([]string, error) { return nil, nil }
+func (f *fakeStore) Delete(_ string) error      { return nil }
+func (f *fakeStore) DeleteLocal(_ string) error { return nil }
+func (f *fakeStore) List() ([]string, error)    { return nil, nil }
 
 func (f *fakeStore) putsCount() int {
 	f.mu.Lock()

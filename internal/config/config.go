@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,11 +24,54 @@ type DebugConfig struct {
 	PprofAddr string `yaml:"pprof_addr"`
 }
 
+// RetentionConfig groups two independently-tunable policies (logs, spans) plus
+// a shared scheduler interval. Per-stream split lets traces age out faster
+// than logs without yaml gymnastics. BREAKING CHANGE from earlier flat shape
+// (MaxAge/MaxBytes/MaxSegments at top level) — no migration: rename keys in
+// existing config files.
 type RetentionConfig struct {
+	Logs     StreamRetentionConfig `yaml:"logs"`
+	Spans    StreamRetentionConfig `yaml:"spans"`
+	Interval time.Duration         `yaml:"interval"`
+}
+
+// StreamRetentionConfig governs one stream's retention. Two tiers:
+//
+//   - Local tier (LocalMaxAge / LocalMaxBytes): evict the data file from
+//     local disk while keeping the S3 object. Only applies when S3 is
+//     configured and the segment has been uploaded. Zero = disabled.
+//
+//   - Global tier (MaxAge / MaxBytes / MaxSegments): delete the segment
+//     everywhere, including S3. Zero = disabled. RequireUploaded (set by
+//     runtime when S3 is enabled) still gates against deleting the only
+//     durable copy if the uploader has fallen behind.
+//
+// Local thresholds should be < global thresholds; cleaner does not enforce
+// this — it just runs the local pass first, so a misconfig where local > global
+// effectively makes local a no-op.
+type StreamRetentionConfig struct {
+	LocalMaxAge   time.Duration `yaml:"local_max_age"`
+	LocalMaxBytes int64         `yaml:"local_max_bytes"`
+
 	MaxAge      time.Duration `yaml:"max_age"`
 	MaxBytes    int64         `yaml:"max_bytes"`
 	MaxSegments int           `yaml:"max_segments"`
-	Interval    time.Duration `yaml:"interval"`
+}
+
+// Enabled reports whether any retention threshold is set for this stream.
+func (s StreamRetentionConfig) Enabled() bool {
+	return s.LocalMaxAge > 0 || s.LocalMaxBytes > 0 ||
+		s.MaxAge > 0 || s.MaxBytes > 0 || s.MaxSegments > 0
+}
+
+// HasLocalTier reports whether local-tier eviction is configured.
+func (s StreamRetentionConfig) HasLocalTier() bool {
+	return s.LocalMaxAge > 0 || s.LocalMaxBytes > 0
+}
+
+// HasGlobalTier reports whether global retention is configured.
+func (s StreamRetentionConfig) HasGlobalTier() bool {
+	return s.MaxAge > 0 || s.MaxBytes > 0 || s.MaxSegments > 0
 }
 
 type S3Config struct {
@@ -189,11 +233,40 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
+	if err := detectLegacyRetention(data); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: invalid: %w", err)
 	}
 
 	return cfg, nil
+}
+
+// detectLegacyRetention surfaces a loud error when a config file still uses
+// the old flat retention shape (max_age/max_bytes/max_segments at the
+// retention top level). yaml.Unmarshal silently drops unknown keys; without
+// this check a stale config would parse to RetentionConfig.Enabled() == false
+// and retention would just stop running, which is worse than failing fast.
+func detectLegacyRetention(data []byte) error {
+	var probe struct {
+		Retention map[string]any `yaml:"retention"`
+	}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return nil
+	}
+	legacy := []string{"max_age", "max_bytes", "max_segments"}
+	var found []string
+	for _, k := range legacy {
+		if _, ok := probe.Retention[k]; ok {
+			found = append(found, k)
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("retention.{%s} moved under retention.logs / retention.spans (breaking change); please rename in your config", strings.Join(found, ","))
 }
 
 func (c *Config) Validate() error {

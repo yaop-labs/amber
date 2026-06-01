@@ -67,6 +67,12 @@ func (m *memStore) Delete(name string) error {
 	m.mu.Lock()
 	delete(m.objects, name)
 	m.mu.Unlock()
+	_ = os.Remove(filepath.Join(m.localDir, name))
+	return nil
+}
+
+func (m *memStore) DeleteLocal(name string) error {
+	_ = os.Remove(filepath.Join(m.localDir, name))
 	return nil
 }
 

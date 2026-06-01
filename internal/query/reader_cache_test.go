@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/metrics"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -83,6 +84,10 @@ func (m *queryMemStore) Delete(name string) error {
 	return nil
 }
 
+func (m *queryMemStore) DeleteLocal(_ string) error {
+	return nil
+}
+
 func (m *queryMemStore) List() ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -145,7 +150,7 @@ func TestReaderCache_FetchesFromStoreOnMiss(t *testing.T) {
 	uploadToQueryStore(t, srcDir, fileName, store)
 
 	cache := newReaderCache(4)
-	cache.setFetcher(makeStoreFetcher(store, dstDir))
+	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
 
 	path := filepath.Join(dstDir, fileName)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -170,7 +175,7 @@ func TestReaderCache_SingleflightDedupsConcurrentMisses(t *testing.T) {
 	uploadToQueryStore(t, srcDir, fileName, store)
 
 	cache := newReaderCache(4)
-	cache.setFetcher(makeStoreFetcher(store, dstDir))
+	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
 
 	const concurrency = 8
 	var wg sync.WaitGroup
@@ -210,12 +215,41 @@ func TestReaderCache_SingleflightDedupsConcurrentMisses(t *testing.T) {
 	}
 }
 
+// TestReaderCache_ColdFetchMetricsOnDataMiss confirms that a fetch triggered
+// by an absent .alog file (the eviction case) bumps the cold-read counter,
+// while a fetch that only refills sidecars (the data file is already local)
+// does not. This is what makes the metric a useful signal of "your local
+// retention horizon is too short for your query mix."
+func TestReaderCache_ColdFetchMetricsOnDataMiss(t *testing.T) {
+	srcDir, fileName := produceSealedSegment(t)
+	dstDir := t.TempDir()
+	store := newQueryMemStore(dstDir)
+	uploadToQueryStore(t, srcDir, fileName, store)
+
+	before := metrics.QueryColdSegmentReads.WithLabelValues("logs").Get()
+
+	cache := newReaderCache(4)
+	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
+
+	path := filepath.Join(dstDir, fileName)
+	cr, err := cache.acquire(path)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	cache.release(cr)
+
+	after := metrics.QueryColdSegmentReads.WithLabelValues("logs").Get()
+	if after != before+1 {
+		t.Errorf("cold read counter: before=%d after=%d, expected +1", before, after)
+	}
+}
+
 func TestReaderCache_PropagatesStoreErrorOnMissingRemote(t *testing.T) {
 	dstDir := t.TempDir()
 	// Store is empty: the data file simply doesn't exist anywhere.
 	store := newQueryMemStore(dstDir)
 	cache := newReaderCache(4)
-	cache.setFetcher(makeStoreFetcher(store, dstDir))
+	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
 
 	path := filepath.Join(dstDir, "seg_00000099.alog")
 	_, err := cache.acquire(path)

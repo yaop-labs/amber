@@ -60,8 +60,13 @@ log:
   level: debug
   format: json
 retention:
-  max_age: 168h
-  max_segments: 10
+  interval: 30m
+  logs:
+    local_max_age: 24h
+    max_age: 168h
+    max_segments: 10
+  spans:
+    max_age: 72h
 `
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
@@ -87,11 +92,46 @@ retention:
 	if cfg.API.GRPCAddr != ":4318" {
 		t.Errorf("GRPCAddr: got %q", cfg.API.GRPCAddr)
 	}
-	if cfg.Retention.MaxAge != 168*time.Hour {
-		t.Errorf("MaxAge: got %v", cfg.Retention.MaxAge)
+	if cfg.Retention.Interval != 30*time.Minute {
+		t.Errorf("Retention.Interval: got %v", cfg.Retention.Interval)
 	}
-	if cfg.Retention.MaxSegments != 10 {
-		t.Errorf("MaxSegments: got %d", cfg.Retention.MaxSegments)
+	if cfg.Retention.Logs.LocalMaxAge != 24*time.Hour {
+		t.Errorf("Logs.LocalMaxAge: got %v", cfg.Retention.Logs.LocalMaxAge)
+	}
+	if cfg.Retention.Logs.MaxAge != 168*time.Hour {
+		t.Errorf("Logs.MaxAge: got %v", cfg.Retention.Logs.MaxAge)
+	}
+	if cfg.Retention.Logs.MaxSegments != 10 {
+		t.Errorf("Logs.MaxSegments: got %d", cfg.Retention.Logs.MaxSegments)
+	}
+	if cfg.Retention.Spans.MaxAge != 72*time.Hour {
+		t.Errorf("Spans.MaxAge: got %v", cfg.Retention.Spans.MaxAge)
+	}
+}
+
+func TestLoad_LegacyRetentionRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	yaml := `
+storage:
+  data_dir: /tmp/amber-test
+ingest:
+  batch_size: 1
+  queue_size: 1
+api:
+  http_addr: ":9090"
+retention:
+  max_age: 168h
+  max_segments: 10
+`
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for legacy flat retention shape, got nil")
 	}
 }
 

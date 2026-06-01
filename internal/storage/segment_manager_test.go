@@ -23,8 +23,8 @@ func newTestManager(t *testing.T) (*SegmentManager, string) {
 func writeN(t *testing.T, sm *SegmentManager, n int) {
 	t.Helper()
 	base := time.Now().UnixNano()
-	for i := 0; i < n; i++ {
-		data := []byte(fmt.Sprintf("record-%d", i))
+	for i := range n {
+		data := fmt.Appendf(nil, "record-%d", i)
 		ts := base + int64(i)*int64(time.Millisecond)
 		if err := sm.Write(data, ts); err != nil {
 			t.Fatalf("Write[%d]: %v", i, err)
@@ -104,8 +104,8 @@ func TestSegmentManager_Rotation_ByBytes(t *testing.T) {
 	defer sm.Close()
 
 	base := time.Now().UnixNano()
-	for i := 0; i < 20; i++ {
-		data := []byte(fmt.Sprintf("record-with-some-content-%d-padding", i))
+	for i := range 20 {
+		data := fmt.Appendf(nil, "record-with-some-content-%d-padding", i)
 		sm.Write(data, base+int64(i))
 	}
 
@@ -359,9 +359,11 @@ func fileExists(path string) bool {
 	return !os.IsNotExist(err)
 }
 
-// recordingStore captures Delete calls without touching disk or the network.
+// recordingStore captures Delete and DeleteLocal calls without touching disk
+// or the network.
 type recordingStore struct {
-	deleted []string
+	deleted      []string
+	deletedLocal []string
 }
 
 func (r *recordingStore) Put(_ string, _ io.Reader) error { return nil }
@@ -370,6 +372,10 @@ func (r *recordingStore) Get(name string) (io.ReadCloser, error) {
 }
 func (r *recordingStore) Delete(name string) error {
 	r.deleted = append(r.deleted, name)
+	return nil
+}
+func (r *recordingStore) DeleteLocal(name string) error {
+	r.deletedLocal = append(r.deletedLocal, name)
 	return nil
 }
 func (r *recordingStore) List() ([]string, error) { return nil, nil }

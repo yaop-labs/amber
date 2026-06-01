@@ -241,6 +241,18 @@ var (
 
 	// Retention. reason="max_age"|"max_segments"|"max_total_bytes".
 	RetentionEvictions = NewCounterVec("amber_retention_evictions_total", "Sealed segments deleted by retention.", "reason")
+
+	// RetentionLocalEvictions counts segments whose local copy was removed by
+	// the local-tier pass, leaving the remote (S3) copy intact. Distinct from
+	// RetentionEvictions, which deletes the segment globally.
+	// kind="logs"|"spans", reason="local_max_age"|"local_max_bytes".
+	RetentionLocalEvictions = NewCounterVec("amber_retention_local_evictions_total", "Segments whose local copy was evicted, remote copy retained.", "kind", "reason")
+
+	// Cold-segment reads: a query against an evicted segment that had to
+	// fetch from the remote store before serving. Inflation here is the
+	// signal to raise local_max_age / local_max_bytes.
+	QueryColdSegmentReads    = NewCounterVec("amber_query_cold_segment_reads_total", "Queries that triggered a fetch from the remote segment store.", "kind")
+	QueryColdSegmentFetchDur = NewHistogramVec("amber_query_cold_segment_fetch_duration_seconds", "Time spent fetching an evicted segment from the remote store.", LongLatencyBuckets, "kind")
 )
 
 func init() {
@@ -251,9 +263,12 @@ func init() {
 	RegisterCounterVec(QueryErrors)
 	RegisterCounterVec(WALWrites)
 	RegisterCounterVec(RetentionEvictions)
+	RegisterCounterVec(RetentionLocalEvictions)
+	RegisterCounterVec(QueryColdSegmentReads)
 	RegisterHistogramVec(QueryDuration)
 	RegisterHistogramVec(WALWriteDuration)
 	RegisterHistogramVec(SealDuration)
+	RegisterHistogramVec(QueryColdSegmentFetchDur)
 }
 
 func Handler() http.Handler {

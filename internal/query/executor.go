@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -385,12 +386,16 @@ func (e *Executor) ActiveIndex() *indexer.ActiveIndex { return e.active }
 // this call, a query whose target segment is missing locally will fetch it
 // from the matching store before opening. Wire-up code in runtime.New is
 // the only expected caller; pass nil to leave fallbacks disabled.
-func (e *Executor) SetSegmentStores(logStore, spanStore storage.SegmentStore) {
+//
+// log is used by the fetcher to emit one cold-fetch line per evicted segment
+// pulled from the remote store. Pass nil to suppress those lines (metrics
+// are unaffected).
+func (e *Executor) SetSegmentStores(logStore, spanStore storage.SegmentStore, log *slog.Logger) {
 	if logStore != nil && e.logReaders != nil {
-		e.logReaders.setFetcher(makeStoreFetcher(logStore, e.logDir))
+		e.logReaders.setFetcher(makeStoreFetcher(logStore, e.logDir, "logs", log))
 	}
 	if spanStore != nil && e.spanReaders != nil {
-		e.spanReaders.setFetcher(makeStoreFetcher(spanStore, e.spanDir))
+		e.spanReaders.setFetcher(makeStoreFetcher(spanStore, e.spanDir, "spans", log))
 	}
 }
 

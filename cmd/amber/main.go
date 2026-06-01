@@ -14,9 +14,11 @@ import (
 	ambergrpc "github.com/yaop-labs/amber/internal/api/grpc"
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
+	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/metrics"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/runtime"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func main() {
@@ -91,30 +93,58 @@ func run() error {
 		return float64(stack.LogManager.WALCorruptRecords() + stack.SpanManager.WALCorruptRecords())
 	})
 
-	if cfg.Retention.MaxAge > 0 || cfg.Retention.MaxBytes > 0 || cfg.Retention.MaxSegments > 0 {
-		policy := retention.Policy{
-			MaxAge:        cfg.Retention.MaxAge,
-			MaxTotalBytes: cfg.Retention.MaxBytes,
-			MaxSegments:   cfg.Retention.MaxSegments,
-		}
+	if cfg.Retention.Logs.Enabled() || cfg.Retention.Spans.Enabled() {
 		interval := cfg.Retention.Interval
 		if interval == 0 {
 			interval = time.Hour
 		}
-		logCleaner := retention.NewCleaner(stack.LogManager, stack.LogSparse, policy, stack.LogDir, log)
-		spanCleaner := retention.NewCleaner(stack.SpanManager, stack.SpanSparse, policy, stack.SpanDir, log)
-		logCleaner.SetOnDelete(stack.Executor.InvalidateLogSegment)
-		spanCleaner.SetOnDelete(stack.Executor.InvalidateSpanSegment)
-		if cfg.Storage.S3.Bucket != "" {
-			// With a remote backend, only delete segments that the background
-			// uploader has confirmed durable in S3. Without this guard a
-			// transient outage could destroy the only copy of a segment.
-			logCleaner.RequireUploaded(true)
-			spanCleaner.RequireUploaded(true)
+		s3Enabled := cfg.Storage.S3.Bucket != ""
+
+		startCleaner := func(
+			stream string,
+			scfg config.StreamRetentionConfig,
+			mgr *storage.SegmentManager,
+			sparse *index.SparseIndex,
+			dir string,
+			onDelete func(storage.SegmentMeta),
+		) {
+			if !scfg.Enabled() {
+				return
+			}
+			if scfg.HasLocalTier() && !s3Enabled {
+				// Local-tier eviction without a remote copy would just delete
+				// data. Refuse loudly rather than silently turning the policy
+				// off.
+				log.Error("retention local_max_age / local_max_bytes set but storage.s3 is not configured",
+					"stream", stream)
+				return
+			}
+			policy := retention.Policy{
+				LocalMaxAge:   scfg.LocalMaxAge,
+				LocalMaxBytes: scfg.LocalMaxBytes,
+				MaxAge:        scfg.MaxAge,
+				MaxTotalBytes: scfg.MaxBytes,
+				MaxSegments:   scfg.MaxSegments,
+			}
+			cleaner := retention.NewCleaner(mgr, sparse, policy, dir, stream, log)
+			cleaner.SetOnDelete(onDelete)
+			if s3Enabled {
+				cleaner.RequireUploaded(true)
+			}
+			go cleaner.StartLoop(interval, ctx.Done())
+			log.Info("retention enabled",
+				"stream", stream,
+				"local_max_age", scfg.LocalMaxAge,
+				"local_max_bytes", scfg.LocalMaxBytes,
+				"max_age", scfg.MaxAge,
+				"max_bytes", scfg.MaxBytes,
+				"max_segments", scfg.MaxSegments,
+				"interval", interval,
+			)
 		}
-		go logCleaner.StartLoop(interval, ctx.Done())
-		go spanCleaner.StartLoop(interval, ctx.Done())
-		log.Info("retention enabled", "max_age", cfg.Retention.MaxAge, "max_bytes", cfg.Retention.MaxBytes, "interval", interval)
+
+		startCleaner("logs", cfg.Retention.Logs, stack.LogManager, stack.LogSparse, stack.LogDir, stack.Executor.InvalidateLogSegment)
+		startCleaner("spans", cfg.Retention.Spans, stack.SpanManager, stack.SpanSparse, stack.SpanDir, stack.Executor.InvalidateSpanSegment)
 	}
 
 	if cfg.API.GRPCAddr != "" {
