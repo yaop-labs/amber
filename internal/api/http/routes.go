@@ -63,6 +63,8 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("POST /v1/traces", authPost(otlpH))
 	mux.Handle("POST /v1/metrics", authPost(otlpH))
 
+	mux.Handle("GET /api/v1/metrics/rate", auth(NewMetricsQueryHandler(deps.MetricStore, deps.Logger)))
+
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Logger)
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))
 	mux.Handle("GET /api/v1/admin/segments", auth(http.HandlerFunc(adminH.Segments)))

@@ -168,6 +168,43 @@ func (c *Client) Trace(ctx context.Context, id string) (*Trace, error) {
 	return &resp, nil
 }
 
+// MetricRateQuery is the input to GET /api/v1/metrics/rate. Window is
+// mandatory; End defaults server-side to "now" when zero. Selector adds extra
+// label= matchers on top of the implicit `__name__=Metric` one. By empty
+// means "no grouping" — the server returns a single bucket keyed by "".
+type MetricRateQuery struct {
+	Metric   string
+	Window   time.Duration
+	End      time.Time
+	By       string
+	Selector map[string]string
+}
+
+func (q MetricRateQuery) values() url.Values {
+	v := url.Values{}
+	v.Set("metric", q.Metric)
+	v.Set("window", q.Window.String())
+	if !q.End.IsZero() {
+		v.Set("end", strconv.FormatInt(q.End.UnixMilli(), 10))
+	}
+	if q.By != "" {
+		v.Set("by", q.By)
+	}
+	for k, val := range q.Selector {
+		v.Add("selector", k+"="+val)
+	}
+	return v
+}
+
+// MetricRate runs a rate query against the embedded metrics store.
+func (c *Client) MetricRate(ctx context.Context, q MetricRateQuery) (*MetricRateResult, error) {
+	var resp MetricRateResult
+	if err := c.get(ctx, "/api/v1/metrics/rate", q.values(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Stats fetches admin storage/memory statistics.
 func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 	var resp Stats

@@ -90,6 +90,18 @@ type Trace struct {
 	TookMs    int64       `json:"took_ms"`
 }
 
+// MetricRateResult is the decoded GET /api/v1/metrics/rate response. Rates is
+// label-value → samples-per-second; the key is empty when the query had no
+// `by` grouping. EndMillis echoes the evaluation point the server applied so
+// the caller can render a deterministic timestamp.
+type MetricRateResult struct {
+	Metric    string             `json:"metric"`
+	WindowMS  int64              `json:"window_ms"`
+	EndMillis int64              `json:"end_ms"`
+	By        string             `json:"by,omitempty"`
+	Rates     map[string]float64 `json:"rates"`
+}
+
 // Stats mirrors GET /api/v1/admin/stats.
 type Stats struct {
 	Segments struct {

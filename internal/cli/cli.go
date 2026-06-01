@@ -23,12 +23,13 @@ usage:
   amberctl <command> [flags]
 
 commands:
-  logs        query log entries (supports -f/--follow live tail)
-  traces      list trace summaries
-  trace <id>  show one trace's span waterfall with attached logs
-  services    list known service names
-  stats       show storage and memory statistics
-  tui         launch the interactive terminal UI
+  logs                      query log entries (supports -f/--follow live tail)
+  traces                    list trace summaries
+  trace <id>                show one trace's span waterfall with attached logs
+  metrics rate <metric>     compute the per-second rate of a counter
+  services                  list known service names
+  stats                     show storage and memory statistics
+  tui                       launch the interactive terminal UI
 
 common flags (all commands):
   --addr      amber address (env AMBER_ADDR, default http://localhost:8080)
@@ -57,6 +58,8 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 		return cmdServices(ctx, rest, out)
 	case "stats":
 		return cmdStats(ctx, rest, out)
+	case "metrics":
+		return cmdMetrics(ctx, rest, out)
 	case "help", "-h", "--help":
 		writef(out, "%s", usageText)
 		return nil

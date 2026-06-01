@@ -111,3 +111,38 @@ func TestRunTraceMissingID(t *testing.T) {
 		t.Error("expected error when trace id missing")
 	}
 }
+
+func TestRunMetricsRatePlain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/metrics/rate" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("metric"); got != "http_requests_total" {
+			t.Errorf("metric param = %q", got)
+		}
+		if got := r.URL.Query().Get("window"); got != "5m0s" {
+			t.Errorf("window param = %q", got)
+		}
+		w.Write([]byte(`{"metric":"http_requests_total","window_ms":300000,"end_ms":0,"by":"job","rates":{"api":1.25,"worker":0.5}}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	err := Run(context.Background(), []string{"metrics", "rate", "--addr", srv.URL, "--by", "job", "http_requests_total"}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"http_requests_total", "api", "1.2500", "worker", "0.5000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunMetricsRateMissingMetric(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "rate"}, &buf); err == nil {
+		t.Error("expected error when metric name missing")
+	}
+}
