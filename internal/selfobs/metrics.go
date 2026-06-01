@@ -1,8 +1,8 @@
-// Package metrics is a hand-rolled Prometheus text-exposition exporter for
+// Package selfobs is a hand-rolled Prometheus text-exposition exporter for
 // Amber. It keeps the dependency surface to stdlib only — runtime/process
 // collectors are intentionally omitted; add them only when an operator
 // asks for them by name and we know what we're paying for.
-package metrics
+package selfobs
 
 import (
 	"fmt"

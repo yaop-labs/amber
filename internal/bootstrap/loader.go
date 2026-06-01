@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -190,7 +190,7 @@ func SetupSealCallbacks(
 			_, err := index.BuildLogBitmapIndex(segPath, log)
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("log", "bitmap").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("log", "bitmap").Inc()
 			log.Error("seal: build log bitmap gave up", "segment", meta.FileName, "err", err)
 		}
 
@@ -198,7 +198,7 @@ func SetupSealCallbacks(
 			_, err := index.BuildLogFTSIndex(segPath, log)
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("log", "fts").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("log", "fts").Inc()
 			log.Error("seal: build log fts gave up", "segment", meta.FileName, "err", err)
 		}
 
@@ -208,7 +208,7 @@ func SetupSealCallbacks(
 			logRibbon = r
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("log", "ribbon").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("log", "ribbon").Inc()
 			log.Error("seal: build log ribbon gave up", "segment", meta.FileName, "err", err)
 		} else {
 			exec.RegisterLogRibbon(meta.FileName, logRibbon)
@@ -220,7 +220,7 @@ func SetupSealCallbacks(
 			ftsRibbon = r
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("log", "fts_ribbon").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("log", "fts_ribbon").Inc()
 			log.Error("seal: build log fts ribbon gave up", "segment", meta.FileName, "err", err)
 		} else {
 			exec.RegisterLogFTSRibbon(meta.FileName, ftsRibbon)
@@ -233,7 +233,7 @@ func SetupSealCallbacks(
 			_, err := index.BuildLogPostingList(segPath, log)
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("log", "posting").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("log", "posting").Inc()
 			log.Error("seal: build log posting list gave up", "segment", meta.FileName, "err", err)
 		}
 	})
@@ -245,7 +245,7 @@ func SetupSealCallbacks(
 			_, err := index.BuildSpanBitmapIndex(segPath, log)
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("span", "bitmap").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("span", "bitmap").Inc()
 			log.Error("seal: build span bitmap gave up", "segment", meta.FileName, "err", err)
 		}
 
@@ -255,7 +255,7 @@ func SetupSealCallbacks(
 			spanRibbon = r
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("span", "ribbon").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("span", "ribbon").Inc()
 			log.Error("seal: build span ribbon gave up", "segment", meta.FileName, "err", err)
 		} else {
 			exec.RegisterSpanRibbon(meta.FileName, spanRibbon)
@@ -265,7 +265,7 @@ func SetupSealCallbacks(
 			_, err := index.BuildSpanPostingList(segPath, log)
 			return err
 		}); err != nil {
-			metrics.SealIndexErrors.WithLabelValues("span", "posting").Inc()
+			selfobs.SealIndexErrors.WithLabelValues("span", "posting").Inc()
 			log.Error("seal: build span posting list gave up", "segment", meta.FileName, "err", err)
 		}
 	})

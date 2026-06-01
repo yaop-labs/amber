@@ -12,7 +12,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 )
 
 type RotationPolicy struct {
@@ -240,8 +240,8 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 
 	walStart := time.Now()
 	seq, err := sm.wal.Write(payload)
-	metrics.WALWriteDuration.WithLabelValues("single").Observe(time.Since(walStart).Seconds())
-	metrics.WALWrites.WithLabelValues("single").Inc()
+	selfobs.WALWriteDuration.WithLabelValues("single").Observe(time.Since(walStart).Seconds())
+	selfobs.WALWrites.WithLabelValues("single").Inc()
 	if err != nil {
 		return fmt.Errorf("segmgr: wal write: %w", err)
 	}
@@ -280,8 +280,8 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 
 	walStart := time.Now()
 	firstSeq, err := sm.wal.WriteBatchTS(items)
-	metrics.WALWriteDuration.WithLabelValues("batch").Observe(time.Since(walStart).Seconds())
-	metrics.WALWrites.WithLabelValues("batch").Inc()
+	selfobs.WALWriteDuration.WithLabelValues("batch").Observe(time.Since(walStart).Seconds())
+	selfobs.WALWrites.WithLabelValues("batch").Inc()
 	if err != nil {
 		return fmt.Errorf("segmgr: wal batch: %w", err)
 	}
@@ -425,7 +425,7 @@ func (sm *SegmentManager) rotate() error {
 			if onSeal != nil {
 				onSeal(sealedMeta)
 			}
-			metrics.SealDuration.WithLabelValues(filepath.Base(sm.dir)).Observe(time.Since(sealStart).Seconds())
+			selfobs.SealDuration.WithLabelValues(filepath.Base(sm.dir)).Observe(time.Since(sealStart).Seconds())
 			if onSealComplete != nil {
 				onSealComplete(sealedMeta)
 			}

@@ -15,7 +15,7 @@ import (
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -77,19 +77,19 @@ func run() error {
 		return err
 	}
 
-	metrics.RegisterGaugeFunc("amber_ingest_queue_length", "Items currently buffered in the ingest queue.", func() float64 {
+	selfobs.RegisterGaugeFunc("amber_ingest_queue_length", "Items currently buffered in the ingest queue.", func() float64 {
 		return float64(stack.Batcher.QueueLen())
 	})
-	metrics.RegisterGaugeFunc("amber_ingest_breaker_open", "1 if the ingest circuit breaker is currently open.", func() float64 {
+	selfobs.RegisterGaugeFunc("amber_ingest_breaker_open", "1 if the ingest circuit breaker is currently open.", func() float64 {
 		if stack.Batcher.IsBreakerOpen() {
 			return 1
 		}
 		return 0
 	})
-	metrics.RegisterGaugeFunc("amber_segments_total", "Number of segments tracked by a manager.", func() float64 {
+	selfobs.RegisterGaugeFunc("amber_segments_total", "Number of segments tracked by a manager.", func() float64 {
 		return float64(stack.LogManager.SegmentCount() + stack.SpanManager.SegmentCount())
 	})
-	metrics.RegisterCounterFunc("amber_wal_corrupt_records_total", "Malformed WAL records observed during replay.", func() float64 {
+	selfobs.RegisterCounterFunc("amber_wal_corrupt_records_total", "Malformed WAL records observed during replay.", func() float64 {
 		return float64(stack.LogManager.WALCorruptRecords() + stack.SpanManager.WALCorruptRecords())
 	})
 
@@ -192,7 +192,7 @@ func run() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", metrics.Handler())
+	mux.Handle("GET /metrics", selfobs.Handler())
 	amberhttp.RegisterRoutes(mux, amberhttp.RoutesDeps{
 		Batcher:    stack.Batcher,
 		Executor:   stack.Executor,

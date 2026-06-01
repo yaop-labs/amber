@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -226,7 +226,7 @@ func TestReaderCache_ColdFetchMetricsOnDataMiss(t *testing.T) {
 	store := newQueryMemStore(dstDir)
 	uploadToQueryStore(t, srcDir, fileName, store)
 
-	before := metrics.QueryColdSegmentReads.WithLabelValues("logs").Get()
+	before := selfobs.QueryColdSegmentReads.WithLabelValues("logs").Get()
 
 	cache := newReaderCache(4)
 	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
@@ -238,7 +238,7 @@ func TestReaderCache_ColdFetchMetricsOnDataMiss(t *testing.T) {
 	}
 	cache.release(cr)
 
-	after := metrics.QueryColdSegmentReads.WithLabelValues("logs").Get()
+	after := selfobs.QueryColdSegmentReads.WithLabelValues("logs").Get()
 	if after != before+1 {
 		t.Errorf("cold read counter: before=%d after=%d, expected +1", before, after)
 	}

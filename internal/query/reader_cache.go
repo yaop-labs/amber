@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -113,8 +113,8 @@ func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *sl
 		}
 		if dataMissing {
 			elapsed := time.Since(start)
-			metrics.QueryColdSegmentReads.WithLabelValues(kind).Inc()
-			metrics.QueryColdSegmentFetchDur.WithLabelValues(kind).Observe(elapsed.Seconds())
+			selfobs.QueryColdSegmentReads.WithLabelValues(kind).Inc()
+			selfobs.QueryColdSegmentFetchDur.WithLabelValues(kind).Observe(elapsed.Seconds())
 			// One log per cold fetch is bounded by segment size (sealed
 			// segments are tens of MB), so this stays quiet even when the
 			// query plan scans many segments.
