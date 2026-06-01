@@ -34,3 +34,9 @@ go.work.sum
 # .vscode/
 
 graphify-out/
+
+# Local-only docs (specs, architecture, handoffs) — not for public repo
+docs/
+
+# Research artifacts — future publication, kept private
+research/
