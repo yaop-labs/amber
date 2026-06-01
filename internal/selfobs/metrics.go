@@ -253,6 +253,19 @@ var (
 	// signal to raise local_max_age / local_max_bytes.
 	QueryColdSegmentReads    = NewCounterVec("amber_query_cold_segment_reads_total", "Queries that triggered a fetch from the remote segment store.", "kind")
 	QueryColdSegmentFetchDur = NewHistogramVec("amber_query_cold_segment_fetch_duration_seconds", "Time spent fetching an evicted segment from the remote store.", LongLatencyBuckets, "kind")
+
+	// metricsengine ingest. kind="gauge"|"sum" mirrors the OTLP type
+	// (histogram/expHistogram fall into MetricsIngestUnsupported, not here,
+	// because metricsengine v0 has no query path for them).
+	MetricsIngestAccepted    = NewCounterVec("amber_metrics_ingest_accepted_total", "OTLP metric samples successfully written to the embedded metric store.", "kind")
+	MetricsIngestRejected    = NewCounterVec("amber_metrics_ingest_rejected_total", "OTLP metric samples rejected before reaching the store.", "reason")
+	MetricsIngestUnsupported = NewCounterVec("amber_metrics_ingest_unsupported_total", "OTLP metric points dropped because their kind has no v0 read path.", "kind")
+
+	// metricsengine query. op="rate" today; extra ops (aggregate, select) will
+	// land as new label values, not new metrics, so dashboards keep working.
+	MetricsQueryTotal    = NewCounterVec("amber_metrics_query_total", "Metric queries executed.", "op")
+	MetricsQueryErrors   = NewCounterVec("amber_metrics_query_errors_total", "Metric queries that returned an error to the caller.", "op")
+	MetricsQueryDuration = NewHistogramVec("amber_metrics_query_duration_seconds", "End-to-end metric query handling time.", ShortLatencyBuckets, "op")
 )
 
 func init() {
@@ -265,10 +278,16 @@ func init() {
 	RegisterCounterVec(RetentionEvictions)
 	RegisterCounterVec(RetentionLocalEvictions)
 	RegisterCounterVec(QueryColdSegmentReads)
+	RegisterCounterVec(MetricsIngestAccepted)
+	RegisterCounterVec(MetricsIngestRejected)
+	RegisterCounterVec(MetricsIngestUnsupported)
+	RegisterCounterVec(MetricsQueryTotal)
+	RegisterCounterVec(MetricsQueryErrors)
 	RegisterHistogramVec(QueryDuration)
 	RegisterHistogramVec(WALWriteDuration)
 	RegisterHistogramVec(SealDuration)
 	RegisterHistogramVec(QueryColdSegmentFetchDur)
+	RegisterHistogramVec(MetricsQueryDuration)
 }
 
 func Handler() http.Handler {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
@@ -36,6 +37,16 @@ func (h *MetricsQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
 		return
 	}
+	start := time.Now()
+	var ok bool
+	defer func() {
+		selfobs.MetricsQueryDuration.WithLabelValues("rate").Observe(time.Since(start).Seconds())
+		if !ok {
+			selfobs.MetricsQueryErrors.WithLabelValues("rate").Inc()
+			return
+		}
+		selfobs.MetricsQueryTotal.WithLabelValues("rate").Inc()
+	}()
 	q := r.URL.Query()
 	metric := strings.TrimSpace(q.Get("metric"))
 	if metric == "" {
@@ -103,6 +114,7 @@ func (h *MetricsQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		By:        by,
 		Rates:     rates,
 	})
+	ok = true
 }
 
 // parseEndParam accepts either RFC3339 ("2026-06-01T10:00:00Z") or raw unix

@@ -10,6 +10,7 @@ import (
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
@@ -49,6 +50,7 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				addPoints, kind := pointsForMetric(metric)
 				if !kind.supported {
 					unsupported += kind.skipCount
+					selfobs.MetricsIngestUnsupported.WithLabelValues(kind.label).Add(uint64(kind.skipCount))
 					continue
 				}
 				batch.Points = addPoints
@@ -58,17 +60,20 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				samples, err := metricsengine.OTLPSamples(batch)
 				if err != nil {
 					rejected += len(batch.Points)
+					selfobs.MetricsIngestRejected.WithLabelValues("conversion").Add(uint64(len(batch.Points)))
 					h.log.Warn("otlp metric sample conversion failed", "metric", metric.Name, "err", err)
 					continue
 				}
 				if _, err := h.metricStore.AppendBatch(samples); err != nil {
 					rejected += len(samples)
+					selfobs.MetricsIngestRejected.WithLabelValues("append").Add(uint64(len(samples)))
 					if !errors.Is(err, metricsengine.ErrNoSamples) {
 						h.log.Warn("otlp metric append failed", "metric", metric.Name, "err", err)
 					}
 					continue
 				}
 				accepted += len(samples)
+				selfobs.MetricsIngestAccepted.WithLabelValues(kind.label).Add(uint64(len(samples)))
 			}
 		}
 	}
@@ -83,6 +88,7 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 type metricKindStatus struct {
 	supported bool
 	skipCount int
+	label     string // selfobs label value: "gauge"|"sum"|"histogram"|"exphistogram"|"unknown"
 }
 
 // pointsForMetric flattens a single OTLP Metric into metricsengine OTLP points.
@@ -95,15 +101,15 @@ type metricKindStatus struct {
 func pointsForMetric(metric *metricspb.Metric) ([]metricsengine.OTLPPoint, metricKindStatus) {
 	switch data := metric.Data.(type) {
 	case *metricspb.Metric_Gauge:
-		return numberPoints(metric.Name, metricsengine.OTLPMetricGauge, data.Gauge.GetDataPoints()), metricKindStatus{supported: true}
+		return numberPoints(metric.Name, metricsengine.OTLPMetricGauge, data.Gauge.GetDataPoints()), metricKindStatus{supported: true, label: "gauge"}
 	case *metricspb.Metric_Sum:
-		return numberPoints(metric.Name, metricsengine.OTLPMetricSum, data.Sum.GetDataPoints()), metricKindStatus{supported: true}
+		return numberPoints(metric.Name, metricsengine.OTLPMetricSum, data.Sum.GetDataPoints()), metricKindStatus{supported: true, label: "sum"}
 	case *metricspb.Metric_Histogram:
-		return nil, metricKindStatus{supported: false, skipCount: len(data.Histogram.GetDataPoints())}
+		return nil, metricKindStatus{supported: false, skipCount: len(data.Histogram.GetDataPoints()), label: "histogram"}
 	case *metricspb.Metric_ExponentialHistogram:
-		return nil, metricKindStatus{supported: false, skipCount: len(data.ExponentialHistogram.GetDataPoints())}
+		return nil, metricKindStatus{supported: false, skipCount: len(data.ExponentialHistogram.GetDataPoints()), label: "exphistogram"}
 	default:
-		return nil, metricKindStatus{supported: false, skipCount: 1}
+		return nil, metricKindStatus{supported: false, skipCount: 1, label: "unknown"}
 	}
 }
 

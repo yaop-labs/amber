@@ -408,6 +408,22 @@ func (s *Store) Blocks() ([]string, error) {
 	return s.blocksForQueryLocked(index.Selector{}, query.Options{})
 }
 
+// BlockCount returns the number of sealed blocks currently tracked by the
+// manifest. Cheap (RLock + len); safe to call from a Prometheus scrape path.
+func (s *Store) BlockCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.manifest.Blocks)
+}
+
+// BufferedSeries returns the number of distinct series held in the in-memory
+// head, not yet flushed to a block. Cheap.
+func (s *Store) BufferedSeries() int { return s.engine.BufferedSeries() }
+
+// BufferedSamples returns the number of samples held in the in-memory head,
+// not yet flushed. Cheap.
+func (s *Store) BufferedSamples() int { return s.engine.BufferedSamples() }
+
 func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options) ([]string, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err

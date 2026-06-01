@@ -103,6 +103,21 @@ func run() error {
 		return float64(stack.LogManager.WALCorruptRecords() + stack.SpanManager.WALCorruptRecords())
 	})
 
+	if stack.MetricStore != nil {
+		// Cheap state gauges only — Stats() is per-scrape O(blocks) with stat
+		// syscalls and footer reads, which would hurt scrape latency. Series
+		// count, bytes on disk, and time range stay in amberctl stats.
+		selfobs.RegisterGaugeFunc("amber_metrics_store_blocks", "Sealed metric blocks tracked by the manifest.", func() float64 {
+			return float64(stack.MetricStore.BlockCount())
+		})
+		selfobs.RegisterGaugeFunc("amber_metrics_store_head_series", "Series held in the in-memory metrics head, not yet flushed.", func() float64 {
+			return float64(stack.MetricStore.BufferedSeries())
+		})
+		selfobs.RegisterGaugeFunc("amber_metrics_store_head_samples", "Samples held in the in-memory metrics head, not yet flushed.", func() float64 {
+			return float64(stack.MetricStore.BufferedSamples())
+		})
+	}
+
 	if cfg.Retention.Logs.Enabled() || cfg.Retention.Spans.Enabled() {
 		interval := cfg.Retention.Interval
 		if interval == 0 {
