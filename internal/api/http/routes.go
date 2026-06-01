@@ -11,6 +11,7 @@ import (
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 type RoutesDeps struct {
@@ -18,8 +19,11 @@ type RoutesDeps struct {
 	Executor   *query.Executor
 	LogManager *storage.SegmentManager
 	LogSparse  *index.SparseIndex
-	IsReady    func() bool
-	Logger     *slog.Logger
+	// MetricStore is the embedded metricsengine store. nil disables the
+	// /v1/metrics OTLP route (it returns 503).
+	MetricStore *metricsengine.Store
+	IsReady     func() bool
+	Logger      *slog.Logger
 }
 
 type RoutesConfig struct {
@@ -54,9 +58,10 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/traces", auth(NewTracesHandler(deps.Executor, deps.Logger)))
 	mux.Handle("GET /api/v1/services", auth(NewServicesHandler(deps.Executor, deps.Logger)))
 
-	otlpH := NewOTLPHandler(deps.Batcher, deps.Logger)
+	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger)
 	mux.Handle("POST /v1/logs", authPost(otlpH))
 	mux.Handle("POST /v1/traces", authPost(otlpH))
+	mux.Handle("POST /v1/metrics", authPost(otlpH))
 
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Logger)
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))

@@ -14,15 +14,17 @@ import (
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 type OTLPHandler struct {
-	batcher *ingest.Batcher
-	log     *slog.Logger
+	batcher     *ingest.Batcher
+	metricStore *metricsengine.Store // nil when metrics are disabled
+	log         *slog.Logger
 }
 
-func NewOTLPHandler(batcher *ingest.Batcher, log *slog.Logger) *OTLPHandler {
-	return &OTLPHandler{batcher: batcher, log: log}
+func NewOTLPHandler(batcher *ingest.Batcher, metricStore *metricsengine.Store, log *slog.Logger) *OTLPHandler {
+	return &OTLPHandler{batcher: batcher, metricStore: metricStore, log: log}
 }
 
 func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +41,8 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleLogs(w, r)
 	case "/v1/traces":
 		h.handleTraces(w, r)
+	case "/v1/metrics":
+		h.handleMetrics(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
