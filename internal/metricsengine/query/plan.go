@@ -191,7 +191,7 @@ func planCandidates(plan Plan, stats CandidateStats, baseCost PlanCost) ([]PlanC
 		return []PlanCandidate{newPlanCandidate(path, cost)}, nil
 	case OpRateByLabelRangeSteps, OpIncreaseByLabelRangeSteps:
 		cost := baseCost
-		path := PathSingleBlockStreaming
+		var path ExecutionPath
 		if stats.BlockCount == 1 && stats.HeadSeries == 0 {
 			path = PathSingleBlockStreaming
 		} else if rateRangeStepSummaryViable(plan, stats) {

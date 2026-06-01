@@ -910,7 +910,7 @@ func IncreaseByLabelInSeries(input []block.Series, selector index.Selector, opts
 		if !matchLabels(entry, selector) || !matchTimeRange(entry, opts) || !matchZoneMap(entry.ZoneMap, opts) {
 			continue
 		}
-		summary, ok, err := RateSummaryForSamples(uint64(series.ID), series.Timestamps, series.Values, opts)
+		summary, ok, err := RateSummaryForSamples(series.ID, series.Timestamps, series.Values, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -942,7 +942,7 @@ func RateSummariesInSeries(input []block.Series, selector index.Selector, opts O
 		if !matchLabels(entry, selector) || !matchTimeRange(entry, opts) || !matchZoneMap(entry.ZoneMap, opts) {
 			continue
 		}
-		summary, ok, err := RateSummaryForSamples(uint64(series.ID), series.Timestamps, series.Values, opts)
+		summary, ok, err := RateSummaryForSamples(series.ID, series.Timestamps, series.Values, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -1064,6 +1064,7 @@ func rateSummariesForSteps(seriesID uint64, timestamps []int64, values []int64, 
 	return out, nil
 }
 
+//nolint:unused // reserved for v1 histogram query execution
 func counterIncreasePrefix(values []int64) []int64 {
 	increasePrefix, _ := counterDeltaPrefixes(values)
 	return increasePrefix
@@ -1443,7 +1444,7 @@ func directoryEntryFromSeries(series block.Series) block.DirectoryEntry {
 		zoneMap.HasReset = false
 	}
 	return block.DirectoryEntry{
-		SeriesID: uint64(series.ID),
+		SeriesID: series.ID,
 		Type:     series.Type,
 		Labels:   series.Labels.Canonical(),
 		TimeMin:  minTimestamp(series.Timestamps),

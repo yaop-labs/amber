@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
