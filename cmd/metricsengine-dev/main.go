@@ -32,120 +32,123 @@ func main() {
 	selectorText := flag.String("selector", "{}", "debug label selector for -query-block")
 	flag.Parse()
 
-	if *rateStore != "" {
-		runRateQuery(*rateStore, *expr, *by, *endMillis)
-		return
+	if err := dispatch(*rateStore, *expr, *by, *endMillis, *serveStore, *listenAddr, *compactStore, *statsStore, *demoStore, *queryPath, *selectorText, *demoPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
+}
 
-	if *serveStore != "" {
-		runHTTPServer(*serveStore, *listenAddr)
-		return
+func dispatch(rateStore, expr, by string, endMillis int64, serveStore, listenAddr, compactStore, statsStore, demoStore, queryPath, selectorText, demoPath string) error {
+	switch {
+	case rateStore != "":
+		return runRateQuery(rateStore, expr, by, endMillis)
+	case serveStore != "":
+		return runHTTPServer(serveStore, listenAddr)
+	case compactStore != "":
+		return runCompact(compactStore)
+	case statsStore != "":
+		return runStats(statsStore)
+	case demoStore != "":
+		return runStoreDemo(demoStore)
+	case queryPath != "":
+		return runQueryBlock(queryPath, selectorText)
+	case demoPath != "":
+		return runBlockDemo(demoPath)
+	default:
+		printUsage()
+		return nil
 	}
+}
 
-	if *compactStore != "" {
-		st, err := store.Open(*compactStore)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer st.Close()
-		path, err := st.Compact()
-		if errors.Is(err, store.ErrNoSamples) {
-			fmt.Println("compaction skipped: need at least two blocks")
-			return
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		fmt.Printf("compacted into %s\n", path)
-		return
+func printUsage() {
+	fmt.Println("metrics-engine: library-first metrics storage engine")
+	fmt.Println("use -demo-block <path> to write and read a small block")
+	fmt.Println("use -demo-store <dir> to exercise WAL + manifest + query")
+	fmt.Println("use -compact-store <dir> to merge local blocks")
+	fmt.Println("use -serve-store <dir> -listen 127.0.0.1:9099 for HTTP stats/query")
+	fmt.Println(`use -query-block <path> -selector '{job="demo"}' to scan a block`)
+	fmt.Println(`use -rate-store <dir> -expr 'metric_name{job="api"}[5m]' -by job`)
+}
+
+func runCompact(dir string) error {
+	st, err := store.Open(dir)
+	if err != nil {
+		return err
 	}
-
-	if *statsStore != "" {
-		st, err := store.Open(*statsStore)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer st.Close()
-		stats, err := st.Stats()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		fmt.Printf("blocks=%d series=%d samples=%d bytes=%d\n", stats.Blocks, stats.Series, stats.Samples, stats.Bytes)
-		return
+	defer func() { _ = st.Close() }()
+	path, err := st.Compact()
+	if errors.Is(err, store.ErrNoSamples) {
+		fmt.Println("compaction skipped: need at least two blocks")
+		return nil
 	}
-
-	if *demoStore != "" {
-		runStoreDemo(*demoStore)
-		return
+	if err != nil {
+		return err
 	}
+	fmt.Printf("compacted into %s\n", path)
+	return nil
+}
 
-	if *queryPath != "" {
-		selector, err := parseDebugSelector(*selectorText)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		series, err := query.SelectBlock(*queryPath, selector, query.Options{})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		rates, err := query.Rate(series)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		fmt.Printf("matched %d series, computed %d rates\n", len(series), len(rates))
-		return
+func runStats(dir string) error {
+	st, err := store.Open(dir)
+	if err != nil {
+		return err
 	}
-
-	if *demoPath == "" {
-		fmt.Println("metrics-engine: library-first metrics storage engine")
-		fmt.Println("use -demo-block <path> to write and read a small block")
-		fmt.Println("use -demo-store <dir> to exercise WAL + manifest + query")
-		fmt.Println("use -compact-store <dir> to merge local blocks")
-		fmt.Println("use -serve-store <dir> -listen 127.0.0.1:9099 for HTTP stats/query")
-		fmt.Println(`use -query-block <path> -selector '{job="demo"}' to scan a block`)
-		fmt.Println(`use -rate-store <dir> -expr 'metric_name{job="api"}[5m]' -by job`)
-		return
+	defer func() { _ = st.Close() }()
+	stats, err := st.Stats()
+	if err != nil {
+		return err
 	}
+	fmt.Printf("blocks=%d series=%d samples=%d bytes=%d\n", stats.Blocks, stats.Series, stats.Samples, stats.Bytes)
+	return nil
+}
 
+func runQueryBlock(path, selectorText string) error {
+	selector, err := parseDebugSelector(selectorText)
+	if err != nil {
+		return err
+	}
+	series, err := query.SelectBlock(path, selector, query.Options{})
+	if err != nil {
+		return err
+	}
+	rates, err := query.Rate(series)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("matched %d series, computed %d rates\n", len(series), len(rates))
+	return nil
+}
+
+func runBlockDemo(path string) error {
 	e := engine.New()
 	labels := model.LabelSet{{Name: "__name__", Value: "demo_counter_total"}, {Name: "job", Value: "demo"}, {Name: "instance", Value: "local"}}
 	start := time.Now().UnixMilli() - 4000
 	for i := range int64(5) {
 		if _, err := e.Append(labels, model.MetricTypeCounter, start+i*1000, 100+i*i); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 	}
-	if err := e.FlushBlock(*demoPath); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if err := e.FlushBlock(path); err != nil {
+		return err
 	}
-	series, err := block.ReadFile(*demoPath)
+	series, err := block.ReadFile(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
-	fmt.Printf("wrote %s with %d series\n", *demoPath, len(series))
+	fmt.Printf("wrote %s with %d series\n", path, len(series))
+	return nil
 }
 
-func runStoreDemo(dir string) {
+func runStoreDemo(dir string) error {
 	st, err := store.Open(dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	labels := model.LabelSet{{Name: "__name__", Value: "demo_counter_total"}, {Name: "job", Value: "demo"}, {Name: "instance", Value: "local"}}
 	start := time.Now().UnixMilli() - 4000
-	var samples []model.Sample
+	samples := make([]model.Sample, 0, 5)
 	for i := range int64(5) {
 		samples = append(samples, model.Sample{
 			Labels:    labels,
@@ -155,68 +158,60 @@ func runStoreDemo(dir string) {
 		})
 	}
 	if _, err := st.AppendBatch(samples); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	path, err := st.Flush()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	selector, err := parseDebugSelector(`{job="demo"}`)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	series, err := st.Select(selector, query.Options{})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	rates, err := query.Rate(series)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	fmt.Printf("wrote %s; matched %d series, computed %d rates\n", path, len(series), len(rates))
+	return nil
 }
 
-func runRateQuery(dir string, expr string, by string, endMillis int64) {
+func runRateQuery(dir, expr, by string, endMillis int64) error {
 	if expr == "" {
-		fmt.Fprintln(os.Stderr, "-expr is required for -rate-store")
-		os.Exit(1)
+		return errors.New("-expr is required for -rate-store")
 	}
 	if endMillis == 0 {
 		endMillis = time.Now().UnixMilli()
 	}
 	st, err := store.Open(dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rs, err := parseDebugRangeSelector(expr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	rates, err := st.RateByLabelRange(rs, endMillis, by)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	for label, rate := range rates {
 		fmt.Printf("%s=%s rate=%f\n", by, label, rate)
 	}
+	return nil
 }
 
-func runHTTPServer(dir string, addr string) {
+func runHTTPServer(dir, addr string) error {
 	st, err := store.Open(dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -252,10 +247,12 @@ func runHTTPServer(dir string, addr string) {
 	})
 
 	fmt.Printf("serving %s on http://%s\n", dir, addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
+	return srv.ListenAndServe()
 }
 
 func writeJSON(w http.ResponseWriter, value any, err error) {

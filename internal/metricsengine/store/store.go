@@ -433,7 +433,9 @@ func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options
 	if err != nil {
 		return nil, err
 	}
-	paths := append(blockPaths, compactPaths...)
+	paths := make([]string, 0, len(blockPaths)+len(compactPaths))
+	paths = append(paths, blockPaths...)
+	paths = append(paths, compactPaths...)
 	sort.Strings(paths)
 	return paths, nil
 }
@@ -1231,7 +1233,7 @@ func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, 
 		}
 	}
 	for _, series := range head {
-		capacityHints[uint64(series.ID)] += len(series.Values)
+		capacityHints[series.ID] += len(series.Values)
 	}
 
 	collector := newExactSeriesCollector(len(capacityHints), capacityHints)

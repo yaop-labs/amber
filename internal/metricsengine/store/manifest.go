@@ -91,7 +91,9 @@ func rebuildManifest(dir string) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	paths := append(blockPaths, compactPaths...)
+	paths := make([]string, 0, len(blockPaths)+len(compactPaths))
+	paths = append(paths, blockPaths...)
+	paths = append(paths, compactPaths...)
 	sort.Strings(paths)
 	manifest := Manifest{Version: 1, Blocks: make([]BlockMeta, 0, len(paths))}
 	for _, path := range paths {

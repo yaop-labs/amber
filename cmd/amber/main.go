@@ -15,9 +15,9 @@ import (
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/runtime"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
