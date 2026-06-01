@@ -508,40 +508,6 @@ type timestampCacheKey struct {
 	strategy codec.TimestampStrategy
 }
 
-func decodeEntryTimestamps(payload []byte, entry DirectoryEntry, cache map[timestampCacheKey][]int64) ([]int64, error) {
-	key := timestampCacheKey{
-		off:      entry.TimestampOff,
-		n:        entry.TimestampLen,
-		count:    entry.TimestampN,
-		base:     entry.TimestampBase,
-		step:     entry.TimestampStep,
-		strategy: entry.TimestampKind,
-	}
-	if timestamps, ok := cache[key]; ok {
-		return append([]int64(nil), timestamps...), nil
-	}
-	tsPayload, err := checkedSlice(payload, entry.TimestampOff, entry.TimestampLen)
-	if err != nil {
-		return nil, err
-	}
-	timestamps, err := codec.DecodeTimestamps(codec.TimestampEncoding{
-		Strategy: entry.TimestampKind,
-		Count:    entry.TimestampN,
-		Base:     entry.TimestampBase,
-		Step:     entry.TimestampStep,
-		Payload:  tsPayload,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cache[key] = append([]int64(nil), timestamps...)
-	return timestamps, nil
-}
-
-func decodeEntryTimestampsFromFile(file *os.File, entry DirectoryEntry, cache map[timestampCacheKey][]int64) ([]int64, error) {
-	return decodeEntryTimestampsFromFileCopy(file, entry, cache, true)
-}
-
 func decodeEntryTimestampsFromFileCopy(file *os.File, entry DirectoryEntry, cache map[timestampCacheKey][]int64, copyResult bool) ([]int64, error) {
 	key := timestampCacheKey{
 		off:      entry.TimestampOff,
@@ -637,30 +603,6 @@ func BuildAggregateBuckets(timestamps []int64, values []int64, bucketSize int) [
 	return out
 }
 
-func readDirectory(payload []byte) (Directory, error) {
-	if len(payload) < len(fileMagic)+2+footerSize {
-		return Directory{}, io.ErrUnexpectedEOF
-	}
-	if string(payload[:len(fileMagic)]) != fileMagic {
-		return Directory{}, errors.New("block: invalid file magic")
-	}
-	footer := payload[len(payload)-footerSize:]
-	if string(footer[20:24]) != footerMagic {
-		return Directory{}, errors.New("block: invalid footer magic")
-	}
-	dirOff := int64(binary.LittleEndian.Uint64(footer[0:8]))
-	dirLen := int64(binary.LittleEndian.Uint64(footer[8:16]))
-	dirCRC := binary.LittleEndian.Uint32(footer[16:20])
-	if dirOff < 0 || dirLen < 0 || dirOff+dirLen > int64(len(payload)-footerSize) {
-		return Directory{}, errors.New("block: invalid directory offset")
-	}
-	dirPayload, err := checkedSlice(payload, dirOff, dirLen)
-	if err != nil {
-		return Directory{}, err
-	}
-	return decodeDirectoryPayload(dirPayload, dirCRC)
-}
-
 func decodeDirectoryPayload(dirPayload []byte, expectedCRC uint32) (Directory, error) {
 	if crc32.ChecksumIEEE(dirPayload) != expectedCRC {
 		return Directory{}, errors.New("block: directory checksum mismatch")
@@ -673,11 +615,4 @@ func decodeDirectoryPayload(dirPayload []byte, expectedCRC uint32) (Directory, e
 		return Directory{}, errors.New("block: unsupported version")
 	}
 	return dir, nil
-}
-
-func checkedSlice(payload []byte, off, n int64) ([]byte, error) {
-	if off < 0 || n < 0 || off+n < off || off+n > int64(len(payload)) {
-		return nil, errors.New("block: invalid section offset")
-	}
-	return payload[off : off+n], nil
 }

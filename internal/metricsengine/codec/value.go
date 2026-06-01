@@ -168,13 +168,6 @@ func encodeDeltaOfDelta(values []int64) ValueEncoding {
 	}
 }
 
-func restoreDelta(transformed []int64) []int64 {
-	out := make([]int64, len(transformed))
-	copy(out, transformed)
-	restoreDeltaInPlace(out)
-	return out
-}
-
 func restoreDeltaInPlace(out []int64) {
 	var current int64
 	for i, value := range out {
@@ -184,26 +177,6 @@ func restoreDeltaInPlace(out []int64) {
 			current += value
 		}
 		out[i] = current
-	}
-}
-
-func restoreDeltaOfDelta(transformed []int64) []int64 {
-	switch len(transformed) {
-	case 0:
-		return nil
-	case 1:
-		return []int64{transformed[0]}
-	default:
-		out := make([]int64, len(transformed))
-		out[0] = transformed[0]
-		prevDelta := transformed[1]
-		out[1] = out[0] + prevDelta
-		for i := 2; i < len(transformed); i++ {
-			delta := prevDelta + transformed[i]
-			out[i] = out[i-1] + delta
-			prevDelta = delta
-		}
-		return out
 	}
 }
 
