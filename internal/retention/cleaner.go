@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -128,7 +128,7 @@ func (c *Cleaner) Run() (int, error) {
 			continue
 		}
 		touched++
-		metrics.RetentionEvictions.WithLabelValues(item.reason).Inc()
+		selfobs.RetentionEvictions.WithLabelValues(item.reason).Inc()
 	}
 
 	return touched, nil
@@ -198,7 +198,7 @@ func (c *Cleaner) runLocalEviction(candidates []storage.SegmentMeta) int {
 			continue
 		}
 		evicted++
-		metrics.RetentionLocalEvictions.WithLabelValues(c.stream, p.reason).Inc()
+		selfobs.RetentionLocalEvictions.WithLabelValues(c.stream, p.reason).Inc()
 	}
 	return evicted
 }

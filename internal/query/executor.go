@@ -19,7 +19,7 @@ import (
 
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/indexer"
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -667,16 +667,16 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err error) {
 	start := time.Now()
 	defer func() {
-		metrics.QueryDuration.WithLabelValues("log").Observe(time.Since(start).Seconds())
+		selfobs.QueryDuration.WithLabelValues("log").Observe(time.Since(start).Seconds())
 		if err != nil {
-			metrics.QueryErrors.WithLabelValues("log").Inc()
+			selfobs.QueryErrors.WithLabelValues("log").Inc()
 			return
 		}
 		cache := "miss"
 		if r != nil && r.CacheHit {
 			cache = "hit"
 		}
-		metrics.QueryTotal.WithLabelValues("log", cache).Inc()
+		selfobs.QueryTotal.WithLabelValues("log", cache).Inc()
 	}()
 
 	if err := q.Validate(); err != nil {
@@ -1029,16 +1029,16 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	start := time.Now()
 	cacheHit := false
 	defer func() {
-		metrics.QueryDuration.WithLabelValues("span").Observe(time.Since(start).Seconds())
+		selfobs.QueryDuration.WithLabelValues("span").Observe(time.Since(start).Seconds())
 		if err != nil {
-			metrics.QueryErrors.WithLabelValues("span").Inc()
+			selfobs.QueryErrors.WithLabelValues("span").Inc()
 			return
 		}
 		cache := "miss"
 		if cacheHit {
 			cache = "hit"
 		}
-		metrics.QueryTotal.WithLabelValues("span", cache).Inc()
+		selfobs.QueryTotal.WithLabelValues("span", cache).Inc()
 	}()
 
 	if err := q.Validate(); err != nil {

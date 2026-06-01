@@ -1,4 +1,4 @@
-package metrics
+package selfobs
 
 import (
 	"net/http/httptest"

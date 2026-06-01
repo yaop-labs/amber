@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
-	"github.com/yaop-labs/amber/internal/metrics"
+	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -52,33 +52,33 @@ type Batcher struct {
 // success paths this fires on every accepted entry. Bind once at NewBatcher
 // time and store pointers.
 type kindMetrics struct {
-	accepted     *metrics.Counter
-	breakerOpen  *metrics.Counter
-	queueFull    *metrics.Counter
-	serializeErr *metrics.Counter
-	writeFailed  *metrics.Counter
-	cardAttrs    *metrics.Counter
-	cardValueLen *metrics.Counter
-	cardKeys     *metrics.Counter
+	accepted     *selfobs.Counter
+	breakerOpen  *selfobs.Counter
+	queueFull    *selfobs.Counter
+	serializeErr *selfobs.Counter
+	writeFailed  *selfobs.Counter
+	cardAttrs    *selfobs.Counter
+	cardValueLen *selfobs.Counter
+	cardKeys     *selfobs.Counter
 }
 
 func newKindMetrics(kind string) kindMetrics {
 	return kindMetrics{
-		accepted:     metrics.IngestAccepted.WithLabelValues(kind),
-		breakerOpen:  metrics.IngestDropped.WithLabelValues(kind, "breaker_open"),
-		queueFull:    metrics.IngestDropped.WithLabelValues(kind, "queue_full"),
-		serializeErr: metrics.IngestDropped.WithLabelValues(kind, "serialize_error"),
-		writeFailed:  metrics.IngestDropped.WithLabelValues(kind, "write_failed"),
-		cardAttrs:    metrics.IngestDropped.WithLabelValues(kind, "attrs_per_entry"),
-		cardValueLen: metrics.IngestDropped.WithLabelValues(kind, "attr_value_too_long"),
-		cardKeys:     metrics.IngestDropped.WithLabelValues(kind, "key_cardinality"),
+		accepted:     selfobs.IngestAccepted.WithLabelValues(kind),
+		breakerOpen:  selfobs.IngestDropped.WithLabelValues(kind, "breaker_open"),
+		queueFull:    selfobs.IngestDropped.WithLabelValues(kind, "queue_full"),
+		serializeErr: selfobs.IngestDropped.WithLabelValues(kind, "serialize_error"),
+		writeFailed:  selfobs.IngestDropped.WithLabelValues(kind, "write_failed"),
+		cardAttrs:    selfobs.IngestDropped.WithLabelValues(kind, "attrs_per_entry"),
+		cardValueLen: selfobs.IngestDropped.WithLabelValues(kind, "attr_value_too_long"),
+		cardKeys:     selfobs.IngestDropped.WithLabelValues(kind, "key_cardinality"),
 	}
 }
 
 // dropCardinality dispatches a guard.Check return string to the right
 // counter. Mirrors the reason strings defined in cardinality.go — keep in
 // sync. Returns nil for unknown reasons (defensive; caller checks).
-func (m *kindMetrics) dropCardinality(reason string) *metrics.Counter {
+func (m *kindMetrics) dropCardinality(reason string) *selfobs.Counter {
 	switch reason {
 	case "attrs_per_entry":
 		return m.cardAttrs
