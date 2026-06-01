@@ -72,6 +72,16 @@ func run() error {
 			MaxAttrValueBytes:     cfg.Ingest.MaxAttrValueBytes,
 			MaxAttrKeysPerService: cfg.Ingest.MaxAttrKeysPerService,
 		},
+		Metrics: runtime.MetricsOptions{
+			Disabled:            !cfg.Metrics.Enabled,
+			Dir:                 cfg.Metrics.Dir,
+			FlushInterval:       cfg.Metrics.FlushInterval,
+			MaxBufferedSamples:  cfg.Metrics.MaxBufferedSamples,
+			MaxActiveSeries:     cfg.Metrics.MaxActiveSeries,
+			MaxLabelsPerSeries:  cfg.Metrics.MaxLabelsPerSeries,
+			Retention:           cfg.Metrics.Retention,
+			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
+		},
 	})
 	if err != nil {
 		return err

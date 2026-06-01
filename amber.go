@@ -10,6 +10,7 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/runtime"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 type (
@@ -62,6 +63,21 @@ type S3Storage struct {
 	ReconcileOnStart bool
 }
 
+// Metrics controls the embedded metricsengine store. By default the store
+// is enabled and opens at <dataDir>/metrics. Set Disabled to opt out; set
+// Dir to relocate. Other fields map onto metricsengine/store.Options and
+// keep their zero-value defaults when unset.
+type Metrics struct {
+	Disabled            bool
+	Dir                 string
+	FlushInterval       time.Duration
+	MaxBufferedSamples  int
+	MaxActiveSeries     int
+	MaxLabelsPerSeries  int
+	Retention           time.Duration
+	CompactionMinBlocks int
+}
+
 // Options is the embedded API's configuration surface. It mirrors the
 // fields of internal/runtime.Options that matter for callers. Zero values
 // fall back to sensible defaults (see runtime/runtime.go).
@@ -75,6 +91,7 @@ type Options struct {
 	IndexCacheSize    int
 	Cardinality       CardinalityLimits
 	S3                S3Storage
+	Metrics           Metrics
 	Logger            *slog.Logger
 }
 
@@ -117,6 +134,16 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 			MaxAttrsPerEntry:      o.Cardinality.MaxAttrsPerEntry,
 			MaxAttrValueBytes:     o.Cardinality.MaxAttrValueBytes,
 			MaxAttrKeysPerService: o.Cardinality.MaxAttrKeysPerService,
+		},
+		Metrics: runtime.MetricsOptions{
+			Disabled:            o.Metrics.Disabled,
+			Dir:                 o.Metrics.Dir,
+			FlushInterval:       o.Metrics.FlushInterval,
+			MaxBufferedSamples:  o.Metrics.MaxBufferedSamples,
+			MaxActiveSeries:     o.Metrics.MaxActiveSeries,
+			MaxLabelsPerSeries:  o.Metrics.MaxLabelsPerSeries,
+			Retention:           o.Metrics.Retention,
+			CompactionMinBlocks: o.Metrics.CompactionMinBlocks,
 		},
 	})
 	if err != nil {
@@ -172,6 +199,12 @@ func (db *DB) QueryTrace(ctx context.Context, traceID TraceID, limit int) (*Trac
 	}
 	return &TraceResult{Logs: logs.Entries, Spans: spans.Spans}, nil
 }
+
+// MetricStore returns the embedded metricsengine store. nil when metrics
+// are disabled via Options.Metrics.Disabled. Callers get the live store
+// directly — Append, Select, Rate, Aggregate, etc. all live on it. amber
+// only owns its lifecycle (open at Open, flush+close at Close).
+func (db *DB) MetricStore() *metricsengine.Store { return db.stack.MetricStore }
 
 // IsReady reports whether bootstrap has finished loading sealed indexes.
 // Until this returns true, queries may return partial results because some

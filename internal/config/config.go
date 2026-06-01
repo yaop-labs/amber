@@ -16,7 +16,23 @@ type Config struct {
 	API       APIConfig       `yaml:"api"`
 	Log       LogConfig       `yaml:"log"`
 	Retention RetentionConfig `yaml:"retention"`
+	Metrics   MetricsConfig   `yaml:"metrics"`
 	Debug     DebugConfig     `yaml:"debug"`
+}
+
+// MetricsConfig governs the embedded metricsengine store. When Enabled the
+// store opens at <storage.data_dir>/metrics by default; override with Dir.
+// Limits and intervals map 1-to-1 onto metricsengine/store.Options; zero
+// in any field defers to metricsengine's own default.
+type MetricsConfig struct {
+	Enabled             bool          `yaml:"enabled"`
+	Dir                 string        `yaml:"dir"`
+	FlushInterval       time.Duration `yaml:"flush_interval"`
+	MaxBufferedSamples  int           `yaml:"max_buffered_samples"`
+	MaxActiveSeries     int           `yaml:"max_active_series"`
+	MaxLabelsPerSeries  int           `yaml:"max_labels_per_series"`
+	Retention           time.Duration `yaml:"retention"`
+	CompactionMinBlocks int           `yaml:"compaction_min_blocks"`
 }
 
 type DebugConfig struct {
@@ -214,6 +230,17 @@ func Default() *Config {
 		},
 		Retention: RetentionConfig{
 			Interval: time.Hour,
+		},
+		Metrics: MetricsConfig{
+			// Enabled by default: amber's promise is one binary that holds
+			// logs, traces, and metrics. Operators who don't want the metrics
+			// store can flip this off; nothing else changes.
+			Enabled: true,
+			// Empty Dir resolves to <storage.data_dir>/metrics at runtime.
+			// 24h retention covers the common rolling-window dashboard case
+			// without locking us into longer storage commitments before the
+			// cold tier lands.
+			Retention: 24 * time.Hour,
 		},
 	}
 }

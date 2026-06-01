@@ -18,6 +18,7 @@ import (
 	"github.com/yaop-labs/amber/internal/bootstrap"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -28,7 +29,24 @@ type Options struct {
 	Storage        StorageOptions
 	Ingest         IngestOptions
 	Cardinality    CardinalityOptions
+	Metrics        MetricsOptions
 	IndexCacheSize int
+}
+
+// MetricsOptions controls the embedded metricsengine store. Disabled is the
+// kill switch — when true the store is not opened and Stack.MetricStore stays
+// nil. Dir defaults to <DataDir>/metrics. The remaining fields map directly
+// onto metricsengine/store.Options; zero in any field defers to the engine's
+// own default.
+type MetricsOptions struct {
+	Disabled            bool
+	Dir                 string
+	FlushInterval       time.Duration
+	MaxBufferedSamples  int
+	MaxActiveSeries     int
+	MaxLabelsPerSeries  int
+	Retention           time.Duration
+	CompactionMinBlocks int
 }
 
 type StorageOptions struct {
@@ -121,6 +139,10 @@ type Stack struct {
 	SpanDir     string
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
+
+	// MetricStore is the embedded metricsengine store. Nil when metrics
+	// are disabled via MetricsOptions.Disabled.
+	MetricStore *mestore.Store
 
 	logUploader  *uploader
 	spanUploader *uploader
@@ -290,6 +312,35 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	batcher.Start(ctx)
 
+	var metricStore *mestore.Store
+	if !cfg.Metrics.Disabled {
+		metricsDir := cfg.Metrics.Dir
+		if metricsDir == "" {
+			metricsDir = filepath.Join(cfg.DataDir, "metrics")
+		}
+		ms, err := mestore.OpenWithOptions(metricsDir, mestore.Options{
+			FlushInterval:       cfg.Metrics.FlushInterval,
+			MaxBufferedSamples:  cfg.Metrics.MaxBufferedSamples,
+			MaxActiveSeries:     cfg.Metrics.MaxActiveSeries,
+			MaxLabelsPerSeries:  cfg.Metrics.MaxLabelsPerSeries,
+			Retention:           cfg.Metrics.Retention,
+			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
+		})
+		if err != nil {
+			batcher.Wait()
+			if logUp != nil {
+				logUp.Stop()
+			}
+			if spanUp != nil {
+				spanUp.Stop()
+			}
+			_ = logManager.Close()
+			_ = spanManager.Close()
+			return nil, fmt.Errorf("runtime: open metric store: %w", err)
+		}
+		metricStore = ms
+	}
+
 	s.LogManager = logManager
 	s.SpanManager = spanManager
 	s.LogSparse = logSparse
@@ -298,6 +349,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.SpanDir = spanDir
 	s.Executor = exec
 	s.Batcher = batcher
+	s.MetricStore = metricStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
 	return s, nil
@@ -353,6 +405,15 @@ func (s *Stack) Close(ctx context.Context) error {
 	closeDone := make(chan error, 1)
 	go func() {
 		var errs []error
+		// MetricStore.Close flushes the head into a final block and closes
+		// the WAL. It is independent of the log/span managers, but we close
+		// it here (not later) so a flush hang is bounded by ctx alongside
+		// the segment closes — the timeout budget is shared.
+		if s.MetricStore != nil {
+			if err := s.MetricStore.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("runtime: close metric store: %w", err))
+			}
+		}
 		if err := s.LogSparse.Save(s.LogDir); err != nil {
 			errs = append(errs, fmt.Errorf("runtime: save log sparse: %w", err))
 		}
