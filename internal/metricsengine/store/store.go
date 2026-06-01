@@ -298,7 +298,7 @@ func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 	defer s.mu.Unlock()
 
 	var kept []BlockMeta
-	var removePaths []string
+	removePaths := make([]string, 0, len(s.manifest.Blocks))
 	for _, meta := range s.manifest.Blocks {
 		if meta.MaxTime >= cutoffMillis {
 			kept = append(kept, meta)
