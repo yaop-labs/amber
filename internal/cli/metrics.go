@@ -56,19 +56,24 @@ func cmdMetricsList(ctx context.Context, args []string, out io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	names, err := cf.newClient().MetricNames(ctx)
+	cat, err := cf.newClient().MetricNames(ctx)
 	if err != nil {
 		return err
 	}
 	if cf.ndjson || cf.json {
-		return writeJSON(out, map[string]any{"metrics": names})
+		return writeJSON(out, cat)
 	}
-	if len(names) == 0 {
+	if len(cat.Metrics) == 0 && len(cat.Histograms) == 0 {
 		writef(out, "(no metrics)\n")
 		return nil
 	}
-	for _, n := range names {
-		writef(out, "%s\n", n)
+	// Scalar and histogram namespaces have distinct read paths (rate vs
+	// quantile). Tag each so users know which subcommand to reach for.
+	for _, n := range cat.Metrics {
+		writef(out, "%s\tscalar\n", n)
+	}
+	for _, n := range cat.Histograms {
+		writef(out, "%s\thistogram\n", n)
 	}
 	return nil
 }
@@ -92,22 +97,28 @@ func cmdMetricsStats(ctx context.Context, args []string, out io.Writer) error {
 
 func renderMetricStats(out io.Writer, s *client.MetricStoreStats) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintf(tw, "blocks\t%d\n", s.Blocks)
-	_, _ = fmt.Fprintf(tw, "series\t%d\n", s.Series)
-	_, _ = fmt.Fprintf(tw, "samples\t%d\n", s.Samples)
-	_, _ = fmt.Fprintf(tw, "bytes\t%d\n", s.Bytes)
-	_, _ = fmt.Fprintf(tw, "buffered_series\t%d\n", s.BufferedSeries)
-	_, _ = fmt.Fprintf(tw, "buffered_samples\t%d\n", s.BufferedSamples)
-	if s.MinTimeMS != nil && s.MaxTimeMS != nil {
-		minT := time.UnixMilli(*s.MinTimeMS).UTC().Format(time.RFC3339)
-		maxT := time.UnixMilli(*s.MaxTimeMS).UTC().Format(time.RFC3339)
-		_, _ = fmt.Fprintf(tw, "min_time\t%s\n", minT)
-		_, _ = fmt.Fprintf(tw, "max_time\t%s\n", maxT)
-	} else {
-		_, _ = fmt.Fprintf(tw, "min_time\t-\n")
-		_, _ = fmt.Fprintf(tw, "max_time\t-\n")
-	}
+	_, _ = fmt.Fprintf(tw, "scalar.blocks\t%d\n", s.Blocks)
+	_, _ = fmt.Fprintf(tw, "scalar.series\t%d\n", s.Series)
+	_, _ = fmt.Fprintf(tw, "scalar.samples\t%d\n", s.Samples)
+	_, _ = fmt.Fprintf(tw, "scalar.bytes\t%d\n", s.Bytes)
+	_, _ = fmt.Fprintf(tw, "scalar.buffered_series\t%d\n", s.BufferedSeries)
+	_, _ = fmt.Fprintf(tw, "scalar.buffered_samples\t%d\n", s.BufferedSamples)
+	writeStatsTimeRange(tw, "scalar", s.MinTimeMS, s.MaxTimeMS)
+	_, _ = fmt.Fprintf(tw, "histogram.blocks\t%d\n", s.Histogram.Blocks)
+	_, _ = fmt.Fprintf(tw, "histogram.series\t%d\n", s.Histogram.Series)
+	_, _ = fmt.Fprintf(tw, "histogram.bytes\t%d\n", s.Histogram.Bytes)
+	writeStatsTimeRange(tw, "histogram", s.Histogram.MinTimeMS, s.Histogram.MaxTimeMS)
 	_ = tw.Flush()
+}
+
+func writeStatsTimeRange(tw io.Writer, prefix string, minMS, maxMS *int64) {
+	if minMS != nil && maxMS != nil {
+		_, _ = fmt.Fprintf(tw, "%s.min_time\t%s\n", prefix, time.UnixMilli(*minMS).UTC().Format(time.RFC3339))
+		_, _ = fmt.Fprintf(tw, "%s.max_time\t%s\n", prefix, time.UnixMilli(*maxMS).UTC().Format(time.RFC3339))
+	} else {
+		_, _ = fmt.Fprintf(tw, "%s.min_time\t-\n", prefix)
+		_, _ = fmt.Fprintf(tw, "%s.max_time\t-\n", prefix)
+	}
 }
 
 func cmdMetricsRate(ctx context.Context, args []string, out io.Writer) error {

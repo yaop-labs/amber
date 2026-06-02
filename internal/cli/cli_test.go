@@ -161,7 +161,29 @@ func TestRunMetricsList(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, want := range []string{"alpha_total", "zeta_total"} {
+	// New format: each line carries a kind column ("scalar" or "histogram")
+	// so the user knows which subcommand (rate vs quantile) reads it.
+	for _, want := range []string{"alpha_total\tscalar", "zeta_total\tscalar"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRunMetricsListWithHistograms verifies the histogram namespace renders
+// distinctly from scalar, so the user can tell which subcommand to use.
+func TestRunMetricsListWithHistograms(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"metrics":["http_requests_total"],"histograms":["rpc_latency_seconds"]}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "list", "--addr", srv.URL}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"http_requests_total\tscalar", "rpc_latency_seconds\thistogram"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
@@ -170,7 +192,7 @@ func TestRunMetricsList(t *testing.T) {
 
 func TestRunMetricsList_Empty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"metrics":[]}`))
+		w.Write([]byte(`{"metrics":[],"histograms":[]}`))
 	}))
 	defer srv.Close()
 
@@ -188,7 +210,7 @@ func TestRunMetricsStats(t *testing.T) {
 		if r.URL.Path != "/api/v1/metrics/stats" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		w.Write([]byte(`{"blocks":2,"series":10,"samples":1000,"bytes":4096,"buffered_series":3,"buffered_samples":42,"min_time_ms":1700000000000,"max_time_ms":1700001000000}`))
+		w.Write([]byte(`{"blocks":2,"series":10,"samples":1000,"bytes":4096,"buffered_series":3,"buffered_samples":42,"min_time_ms":1700000000000,"max_time_ms":1700001000000,"histogram":{"blocks":5,"series":17,"bytes":2048,"min_time_ms":1700000500000,"max_time_ms":1700000900000}}`))
 	}))
 	defer srv.Close()
 
@@ -197,7 +219,15 @@ func TestRunMetricsStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, want := range []string{"blocks", "2", "series", "10", "samples", "1000", "buffered_samples", "42"} {
+	// Scalar half mirrors the old assertions but with the new prefix.
+	for _, want := range []string{"scalar.blocks", "scalar.series", "scalar.samples", "scalar.buffered_samples", "42"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	// Histogram half is the new surface; check both counters and time range
+	// rendered as RFC3339 (proves nullable pointers were honored).
+	for _, want := range []string{"histogram.blocks", "histogram.series", "17", "histogram.min_time"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
@@ -214,8 +244,26 @@ func TestRunMetricsStats_EmptyTimeRange(t *testing.T) {
 	if err := Run(context.Background(), []string{"metrics", "stats", "--addr", srv.URL}, &buf); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "min_time") || !strings.Contains(buf.String(), "-") {
-		t.Errorf("expected dash for missing time range, got:\n%s", buf.String())
+	out := buf.String()
+	// Both halves must render a dash when their respective store has no
+	// time range — the CLI relies on this to distinguish "empty" from
+	// "actual data at epoch 0". tabwriter pads with spaces, so we check
+	// each line carries the dash.
+	for _, line := range []string{"scalar.min_time", "histogram.min_time"} {
+		want := line
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing line %q:\n%s", want, out)
+			continue
+		}
+		idx := strings.Index(out, want)
+		// Walk forward to the end of this line and check it ends in "-".
+		end := strings.Index(out[idx:], "\n")
+		if end < 0 {
+			end = len(out) - idx
+		}
+		if !strings.HasSuffix(strings.TrimSpace(out[idx:idx+end]), "-") {
+			t.Errorf("expected dash on %q line, got %q", line, out[idx:idx+end])
+		}
 	}
 }
 
