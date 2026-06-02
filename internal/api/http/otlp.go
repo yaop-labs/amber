@@ -14,17 +14,19 @@ import (
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
 type OTLPHandler struct {
 	batcher     *ingest.Batcher
 	metricStore *metricsengine.Store // nil when metrics are disabled
+	histStore   *histogram.Store     // nil when metrics are disabled
 	log         *slog.Logger
 }
 
-func NewOTLPHandler(batcher *ingest.Batcher, metricStore *metricsengine.Store, log *slog.Logger) *OTLPHandler {
-	return &OTLPHandler{batcher: batcher, metricStore: metricStore, log: log}
+func NewOTLPHandler(batcher *ingest.Batcher, metricStore *metricsengine.Store, histStore *histogram.Store, log *slog.Logger) *OTLPHandler {
+	return &OTLPHandler{batcher: batcher, metricStore: metricStore, histStore: histStore, log: log}
 }
 
 func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

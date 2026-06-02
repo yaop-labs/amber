@@ -27,7 +27,7 @@ func TestMetricsSelfobs_IngestCountersIncrement(t *testing.T) {
 	h := setupMetricsHarness(t)
 
 	beforeAccepted := selfobs.MetricsIngestAccepted.WithLabelValues("sum").Get()
-	beforeUnsupported := selfobs.MetricsIngestUnsupported.WithLabelValues("histogram").Get()
+	beforeHist := selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Get()
 
 	req := &collectormetrics.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{{
@@ -69,8 +69,11 @@ func TestMetricsSelfobs_IngestCountersIncrement(t *testing.T) {
 	if got := selfobs.MetricsIngestAccepted.WithLabelValues("sum").Get() - beforeAccepted; got != 1 {
 		t.Errorf("accepted{sum} delta = %d, want 1", got)
 	}
-	if got := selfobs.MetricsIngestUnsupported.WithLabelValues("histogram").Get() - beforeUnsupported; got != 1 {
-		t.Errorf("unsupported{histogram} delta = %d, want 1", got)
+	// Histogram now flows through the histogram store rather than landing in
+	// unsupported — the OTLP point with Count=3 produces a single accepted
+	// series-point pair (1 series × 1 tick = 1 accepted point).
+	if got := selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Get() - beforeHist; got != 1 {
+		t.Errorf("accepted{histogram} delta = %d, want 1", got)
 	}
 }
 
