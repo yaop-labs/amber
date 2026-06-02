@@ -3,11 +3,13 @@ package http
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/metricsengine"
 )
@@ -205,4 +207,173 @@ func parseEndParam(raw string) (int64, error) {
 		return 0, err
 	}
 	return t.UnixMilli(), nil
+}
+
+// MetricsQuantileHandler serves GET /api/v1/metrics/quantile — answers a
+// single quantile (q, e.g. 0.95) over exponential histograms matching the
+// selector, optionally grouped by a label. Backed by histogram.Store, which
+// merges in the compressed (sketch) domain so accuracy is preserved even
+// when sketches come from different scales.
+type MetricsQuantileHandler struct {
+	store *histogram.Store
+	log   *slog.Logger
+}
+
+func NewMetricsQuantileHandler(store *histogram.Store, log *slog.Logger) *MetricsQuantileHandler {
+	return &MetricsQuantileHandler{store: store, log: log}
+}
+
+// quantileResponse mirrors rateResponse for the quantile op. WindowMS is the
+// effective window (0 when the request was unbounded). Quantiles is a
+// label-value → value map: a single entry under the empty key when no `by`
+// grouping was requested.
+type quantileResponse struct {
+	Metric    string             `json:"metric"`
+	Quantile  float64            `json:"quantile"`
+	WindowMS  int64              `json:"window_ms,omitempty"`
+	EndMillis int64              `json:"end_ms,omitempty"`
+	By        string             `json:"by,omitempty"`
+	Quantiles map[string]float64 `json:"quantiles"`
+}
+
+func (h *MetricsQuantileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "histogram store disabled")
+		return
+	}
+	start := time.Now()
+	var ok bool
+	defer func() {
+		selfobs.MetricsQueryDuration.WithLabelValues("quantile").Observe(time.Since(start).Seconds())
+		if !ok {
+			selfobs.MetricsQueryErrors.WithLabelValues("quantile").Inc()
+			return
+		}
+		selfobs.MetricsQueryTotal.WithLabelValues("quantile").Inc()
+	}()
+	q := r.URL.Query()
+	metric := strings.TrimSpace(q.Get("metric"))
+	if metric == "" {
+		writeError(w, http.StatusBadRequest, "metric is required")
+		return
+	}
+	qStr := strings.TrimSpace(q.Get("q"))
+	if qStr == "" {
+		writeError(w, http.StatusBadRequest, "q is required (e.g. q=0.95)")
+		return
+	}
+	quantile, err := strconv.ParseFloat(qStr, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "q: "+err.Error())
+		return
+	}
+	if quantile < 0 || quantile > 1 {
+		writeError(w, http.StatusBadRequest, "q must be in [0, 1]")
+		return
+	}
+
+	// Window resolution: if window is set, [end-window, end] where end
+	// defaults to now. If window is absent, the range is unbounded and
+	// covers every sealed block. The unbounded case is the "give me the
+	// quantile over everything" path used by ad-hoc CLI calls.
+	tr := histogram.TimeRange{Start: math.MinInt64, End: math.MaxInt64}
+	endMillis := int64(0)
+	windowMS := int64(0)
+	if windowStr := strings.TrimSpace(q.Get("window")); windowStr != "" {
+		window, err := time.ParseDuration(windowStr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "window: "+err.Error())
+			return
+		}
+		if window <= 0 {
+			writeError(w, http.StatusBadRequest, "window must be positive")
+			return
+		}
+		end := time.Now().UnixMilli()
+		if raw := strings.TrimSpace(q.Get("end")); raw != "" {
+			parsed, err := parseEndParam(raw)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "end: "+err.Error())
+				return
+			}
+			end = parsed
+		}
+		tr = histogram.TimeRange{Start: end - window.Milliseconds(), End: end}
+		endMillis = end
+		windowMS = window.Milliseconds()
+	}
+
+	by := strings.TrimSpace(q.Get("by"))
+	matchers := []metricsengine.Matcher{metricsengine.MetricName(metric)}
+	for _, raw := range q["selector"] {
+		k, v, found := strings.Cut(raw, "=")
+		if !found || k == "" {
+			writeError(w, http.StatusBadRequest, "selector "+strconv.Quote(raw)+": want key=value")
+			return
+		}
+		matchers = append(matchers, metricsengine.LabelEqual(k, v))
+	}
+	selector := metricsengine.NewSelector(matchers...)
+
+	result := make(map[string]float64)
+	if by == "" {
+		v, err := h.store.HistogramQuantile(selector, quantile, tr)
+		if err != nil {
+			h.log.Warn("histogram quantile failed", "metric", metric, "err", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !math.IsNaN(v) {
+			result[""] = v
+		}
+	} else {
+		// Single-label grouping only, mirroring /metrics/rate's contract.
+		// Multi-label-by is a deliberate future extension; supporting it
+		// today would force a different key format on the client.
+		if strings.Contains(by, ",") {
+			writeError(w, http.StatusBadRequest, "by must be a single label (multi-label grouping not supported yet)")
+			return
+		}
+		grouped, err := h.store.HistogramQuantileBy(selector, quantile, tr, []string{by})
+		if err != nil {
+			h.log.Warn("histogram quantile-by failed", "metric", metric, "err", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for k, v := range grouped {
+			if math.IsNaN(v) {
+				continue
+			}
+			// store returns keys like `"by"="value"` (canonical multi-label
+			// encoding); for the single-label case we only want the value.
+			result[unquoteSingleGroupKey(k, by)] = v
+		}
+	}
+
+	writeJSON(w, http.StatusOK, quantileResponse{
+		Metric:    metric,
+		Quantile:  quantile,
+		WindowMS:  windowMS,
+		EndMillis: endMillis,
+		By:        by,
+		Quantiles: result,
+	})
+	ok = true
+}
+
+// unquoteSingleGroupKey converts histogram.Store's canonical group key
+// (`"label"="value"`) into just the value, for the single-label /quantile
+// case. If the format doesn't match, the original key is returned untouched —
+// the handler still emits a stable mapping, just one that mirrors the store
+// encoding.
+func unquoteSingleGroupKey(key, label string) string {
+	prefix := strconv.Quote(label) + "="
+	if !strings.HasPrefix(key, prefix) {
+		return key
+	}
+	unq, err := strconv.Unquote(key[len(prefix):])
+	if err != nil {
+		return key
+	}
+	return unq
 }

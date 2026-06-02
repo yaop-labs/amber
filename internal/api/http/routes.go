@@ -71,6 +71,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/metrics", auth(NewMetricsListHandler(deps.MetricStore)))
 	mux.Handle("GET /api/v1/metrics/rate", auth(NewMetricsQueryHandler(deps.MetricStore, deps.Logger)))
 	mux.Handle("GET /api/v1/metrics/stats", auth(NewMetricsStatsHandler(deps.MetricStore, deps.Logger)))
+	mux.Handle("GET /api/v1/metrics/quantile", auth(NewMetricsQuantileHandler(deps.HistogramStore, deps.Logger)))
 
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Logger)
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))

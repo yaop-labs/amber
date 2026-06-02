@@ -8,6 +8,12 @@ import (
 	"testing"
 	"time"
 
+	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/yaop-labs/amber/internal/client"
 	"github.com/yaop-labs/amber/metricsengine"
 )
@@ -239,6 +245,180 @@ func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+// seedExpHistogram POSTs an exponential-histogram OTLP request into the
+// harness. We go through the public ingest path on purpose: it forces the
+// same OTLP → ExpSeries → histogram.Store.WriteBlock flow that real clients
+// take, so the quantile test catches regressions in the whole chain instead
+// of just the store-level math.
+func seedExpHistogram(t *testing.T, h *metricsHarness, name string, attrs map[string]string, scale int32, positiveOffset int32, counts []uint64, sum float64, count uint64) {
+	t.Helper()
+	kvs := make([]*commonpb.KeyValue, 0, len(attrs))
+	for k, v := range attrs {
+		kvs = append(kvs, &commonpb.KeyValue{Key: k, Value: stringValue(v)})
+	}
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			Resource: &resourcepb.Resource{},
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: name,
+					Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+						DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+							TimeUnixNano: uint64(time.Now().UnixNano()),
+							Scale:        scale,
+							Count:        count,
+							Sum:          proto.Float64(sum),
+							Positive: &metricspb.ExponentialHistogramDataPoint_Buckets{
+								Offset:       positiveOffset,
+								BucketCounts: counts,
+							},
+							Attributes: kvs,
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rec := h.post(t, "/v1/metrics", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed POST status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMetricsQuantile_RoundTrip seeds one exp-histogram and asks for q=0.5.
+// The exact value depends on the sketch geometry; we only assert it's positive
+// and falls within the bucket range the seed describes (offsets 0..3 at
+// scale=2 cover roughly 1.0..1.68). Tighter math is in histogram package
+// tests.
+func TestMetricsQuantile_RoundTrip(t *testing.T) {
+	h := setupMetricsHarness(t)
+	seedExpHistogram(t, h, "rpc_latency_seconds", map[string]string{"job": "api"},
+		2, 0, []uint64{2, 2, 2, 2}, 5.0, 8)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/quantile?metric=rpc_latency_seconds&q=0.5", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp quantileResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Metric != "rpc_latency_seconds" || resp.Quantile != 0.5 {
+		t.Fatalf("envelope wrong: %+v", resp)
+	}
+	v, ok := resp.Quantiles[""]
+	if !ok {
+		t.Fatalf("quantiles missing default key, got %v", resp.Quantiles)
+	}
+	if v <= 0 || v > 10 {
+		t.Fatalf("quantile value %v out of plausible range", v)
+	}
+}
+
+// TestMetricsQuantile_ByLabel seeds two series with different job labels and
+// asks for q=0.9 grouped by job. We expect two entries in the result map.
+func TestMetricsQuantile_ByLabel(t *testing.T) {
+	h := setupMetricsHarness(t)
+	seedExpHistogram(t, h, "rpc_latency_seconds", map[string]string{"job": "api"},
+		2, 0, []uint64{1, 1, 1, 1}, 2.0, 4)
+	seedExpHistogram(t, h, "rpc_latency_seconds", map[string]string{"job": "worker"},
+		2, 4, []uint64{1, 1, 1, 1}, 8.0, 4)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/quantile?metric=rpc_latency_seconds&q=0.9&by=job", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp quantileResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.By != "job" || len(resp.Quantiles) != 2 {
+		t.Fatalf("expected two groups, got %+v", resp)
+	}
+	api, okA := resp.Quantiles["api"]
+	worker, okW := resp.Quantiles["worker"]
+	if !okA || !okW {
+		t.Fatalf("missing group; got keys=%v", resp.Quantiles)
+	}
+	// worker series sits at higher offsets → its quantile should exceed api's.
+	if !(worker > api) {
+		t.Fatalf("expected worker quantile > api; got api=%v worker=%v", api, worker)
+	}
+}
+
+// TestMetricsQuantile_EmptyStore returns 200 with an empty map when nothing
+// matched; the CLI relies on this to render "(no series matched)".
+func TestMetricsQuantile_EmptyStore(t *testing.T) {
+	h := setupMetricsHarness(t)
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/quantile?metric=missing&q=0.5", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var resp quantileResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Quantiles) != 0 {
+		t.Fatalf("expected empty quantiles, got %v", resp.Quantiles)
+	}
+}
+
+// TestMetricsQuantile_BadParams covers the 400 paths the CLI relies on for
+// clear error messages.
+func TestMetricsQuantile_BadParams(t *testing.T) {
+	h := setupMetricsHarness(t)
+	cases := []struct {
+		name   string
+		path   string
+		status int
+	}{
+		{"missing metric", "/api/v1/metrics/quantile?q=0.5", http.StatusBadRequest},
+		{"missing q", "/api/v1/metrics/quantile?metric=x", http.StatusBadRequest},
+		{"q not numeric", "/api/v1/metrics/quantile?metric=x&q=abc", http.StatusBadRequest},
+		{"q out of range", "/api/v1/metrics/quantile?metric=x&q=1.5", http.StatusBadRequest},
+		{"bad selector", "/api/v1/metrics/quantile?metric=x&q=0.5&selector=novalue", http.StatusBadRequest},
+		{"bad window", "/api/v1/metrics/quantile?metric=x&q=0.5&window=oops", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer secret")
+			rec := httptest.NewRecorder()
+			h.mux.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMetricsQuantile_StoreDisabledReturns503(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/metrics/quantile", NewMetricsQuantileHandler(nil, nil))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/quantile?metric=x&q=0.5", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
