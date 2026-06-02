@@ -216,6 +216,15 @@ func (c *Client) MetricNames(ctx context.Context) ([]string, error) {
 	return resp.Metrics, nil
 }
 
+// MetricStats fetches storage counters for the embedded metrics store.
+func (c *Client) MetricStats(ctx context.Context) (*MetricStoreStats, error) {
+	var resp MetricStoreStats
+	if err := c.get(ctx, "/api/v1/metrics/stats", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Stats fetches admin storage/memory statistics.
 func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 	var resp Stats

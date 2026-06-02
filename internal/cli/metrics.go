@@ -17,10 +17,12 @@ const metricsUsage = `amberctl metrics — query metrics
 subcommands:
   list              list metric names available in the head index
   rate <metric>     compute the per-second rate of a counter
+  stats             show metric store size, block count, time range
 
 examples:
   amberctl metrics list
   amberctl metrics rate http_requests_total --window 5m --by job
+  amberctl metrics stats
 `
 
 func cmdMetrics(ctx context.Context, args []string, out io.Writer) error {
@@ -34,6 +36,8 @@ func cmdMetrics(ctx context.Context, args []string, out io.Writer) error {
 		return cmdMetricsList(ctx, rest, out)
 	case "rate":
 		return cmdMetricsRate(ctx, rest, out)
+	case "stats":
+		return cmdMetricsStats(ctx, rest, out)
 	case "help", "-h", "--help":
 		writef(out, "%s", metricsUsage)
 		return nil
@@ -63,6 +67,43 @@ func cmdMetricsList(ctx context.Context, args []string, out io.Writer) error {
 		writef(out, "%s\n", n)
 	}
 	return nil
+}
+
+func cmdMetricsStats(ctx context.Context, args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("metrics stats", flag.ContinueOnError)
+	cf := registerCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	stats, err := cf.newClient().MetricStats(ctx)
+	if err != nil {
+		return err
+	}
+	if cf.ndjson || cf.json {
+		return writeJSON(out, stats)
+	}
+	renderMetricStats(out, stats)
+	return nil
+}
+
+func renderMetricStats(out io.Writer, s *client.MetricStoreStats) {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintf(tw, "blocks\t%d\n", s.Blocks)
+	_, _ = fmt.Fprintf(tw, "series\t%d\n", s.Series)
+	_, _ = fmt.Fprintf(tw, "samples\t%d\n", s.Samples)
+	_, _ = fmt.Fprintf(tw, "bytes\t%d\n", s.Bytes)
+	_, _ = fmt.Fprintf(tw, "buffered_series\t%d\n", s.BufferedSeries)
+	_, _ = fmt.Fprintf(tw, "buffered_samples\t%d\n", s.BufferedSamples)
+	if s.MinTimeMS != nil && s.MaxTimeMS != nil {
+		minT := time.UnixMilli(*s.MinTimeMS).UTC().Format(time.RFC3339)
+		maxT := time.UnixMilli(*s.MaxTimeMS).UTC().Format(time.RFC3339)
+		_, _ = fmt.Fprintf(tw, "min_time\t%s\n", minT)
+		_, _ = fmt.Fprintf(tw, "max_time\t%s\n", maxT)
+	} else {
+		_, _ = fmt.Fprintf(tw, "min_time\t-\n")
+		_, _ = fmt.Fprintf(tw, "max_time\t-\n")
+	}
+	_ = tw.Flush()
 }
 
 func cmdMetricsRate(ctx context.Context, args []string, out io.Writer) error {

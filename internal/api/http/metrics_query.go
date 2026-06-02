@@ -43,6 +43,60 @@ func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"metrics": names})
 }
 
+// MetricsStatsHandler serves GET /api/v1/metrics/stats — returns storage
+// counters for the embedded metrics store. Stats() walks the manifest with a
+// stat syscall per block plus a footer read, so it is admin-grade (not scrape
+// path).
+type MetricsStatsHandler struct {
+	store *metricsengine.Store
+	log   *slog.Logger
+}
+
+func NewMetricsStatsHandler(store *metricsengine.Store, log *slog.Logger) *MetricsStatsHandler {
+	return &MetricsStatsHandler{store: store, log: log}
+}
+
+// metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats. We
+// emit MinTime/MaxTime as nullable millis so the client can distinguish
+// "no data yet" from "data starting at unix epoch 0".
+type metricsStatsResponse struct {
+	Blocks          int    `json:"blocks"`
+	Series          int    `json:"series"`
+	Samples         int    `json:"samples"`
+	Bytes           int64  `json:"bytes"`
+	MinTimeMS       *int64 `json:"min_time_ms,omitempty"`
+	MaxTimeMS       *int64 `json:"max_time_ms,omitempty"`
+	BufferedSeries  int    `json:"buffered_series"`
+	BufferedSamples int    `json:"buffered_samples"`
+}
+
+func (h *MetricsStatsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	if h.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
+		return
+	}
+	stats, err := h.store.Stats()
+	if err != nil {
+		h.log.Warn("metrics stats failed", "err", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := metricsStatsResponse{
+		Blocks:          stats.Blocks,
+		Series:          stats.Series,
+		Samples:         stats.Samples,
+		Bytes:           stats.Bytes,
+		BufferedSeries:  stats.BufferedSeries,
+		BufferedSamples: stats.BufferedSamples,
+	}
+	if stats.HasTime {
+		minT, maxT := stats.MinTime, stats.MaxTime
+		resp.MinTimeMS = &minT
+		resp.MaxTimeMS = &maxT
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // rateResponse is the JSON shape returned by GET /api/v1/metrics/rate.
 // EndMillis echoes the evaluation point the server actually used (useful when
 // the client passed no end= and wants to know how far ahead "now" was).

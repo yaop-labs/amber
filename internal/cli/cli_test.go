@@ -182,3 +182,39 @@ func TestRunMetricsList_Empty(t *testing.T) {
 		t.Errorf("expected '(no metrics)' for empty list, got:\n%s", buf.String())
 	}
 }
+
+func TestRunMetricsStats(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/metrics/stats" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"blocks":2,"series":10,"samples":1000,"bytes":4096,"buffered_series":3,"buffered_samples":42,"min_time_ms":1700000000000,"max_time_ms":1700001000000}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "stats", "--addr", srv.URL}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"blocks", "2", "series", "10", "samples", "1000", "buffered_samples", "42"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunMetricsStats_EmptyTimeRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"blocks":0,"series":0,"samples":0,"bytes":0,"buffered_series":0,"buffered_samples":0}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "stats", "--addr", srv.URL}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "min_time") || !strings.Contains(buf.String(), "-") {
+		t.Errorf("expected dash for missing time range, got:\n%s", buf.String())
+	}
+}
