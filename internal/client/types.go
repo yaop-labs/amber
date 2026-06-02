@@ -90,6 +90,20 @@ type Trace struct {
 	TookMs    int64       `json:"took_ms"`
 }
 
+// MetricQuantileResult is the decoded GET /api/v1/metrics/quantile response.
+// Quantiles is label-value → quantile-value. The key is "" when the query had
+// no `by` grouping. WindowMS/EndMillis are zero for an unbounded query (no
+// window= was passed). Quantile echoes the q the server actually applied so
+// the caller can render without re-parsing the request.
+type MetricQuantileResult struct {
+	Metric    string             `json:"metric"`
+	Quantile  float64            `json:"quantile"`
+	WindowMS  int64              `json:"window_ms,omitempty"`
+	EndMillis int64              `json:"end_ms,omitempty"`
+	By        string             `json:"by,omitempty"`
+	Quantiles map[string]float64 `json:"quantiles"`
+}
+
 // MetricRateResult is the decoded GET /api/v1/metrics/rate response. Rates is
 // label-value → samples-per-second; the key is empty when the query had no
 // `by` grouping. EndMillis echoes the evaluation point the server applied so
