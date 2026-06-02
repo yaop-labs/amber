@@ -218,3 +218,75 @@ func TestRunMetricsStats_EmptyTimeRange(t *testing.T) {
 		t.Errorf("expected dash for missing time range, got:\n%s", buf.String())
 	}
 }
+
+func TestRunMetricsQuantilePlain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/metrics/quantile" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		qp := r.URL.Query()
+		if got := qp.Get("metric"); got != "rpc_latency_seconds" {
+			t.Errorf("metric param = %q", got)
+		}
+		if got := qp.Get("q"); got != "0.95" {
+			t.Errorf("q param = %q", got)
+		}
+		if got := qp.Get("by"); got != "job" {
+			t.Errorf("by param = %q", got)
+		}
+		// Window flag was zero on the CLI side → must be absent so the
+		// server treats the query as unbounded.
+		if qp.Has("window") {
+			t.Errorf("window should be absent when --window is zero, got %q", qp.Get("window"))
+		}
+		w.Write([]byte(`{"metric":"rpc_latency_seconds","quantile":0.95,"by":"job","quantiles":{"api":12.5,"worker":7.25}}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"metrics", "quantile", "--addr", srv.URL, "--q", "0.95", "--by", "job", "rpc_latency_seconds"},
+		&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"rpc_latency_seconds", "q=0.95", "api", "12.5000", "worker", "7.2500"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunMetricsQuantileWithWindowEcho(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("window"); got != "5m0s" {
+			t.Errorf("window param = %q", got)
+		}
+		w.Write([]byte(`{"metric":"rpc_latency_seconds","quantile":0.5,"window_ms":300000,"end_ms":1700000000000,"quantiles":{"":1.42}}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"metrics", "quantile", "--addr", srv.URL, "--window", "5m", "rpc_latency_seconds"},
+		&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	// Bounded query: window must render as "300000ms", end as RFC3339, and
+	// the no-by group key "" must collapse to "(total)".
+	for _, want := range []string{"window=300000ms", "end=2023", "(total)", "1.4200"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunMetricsQuantileMissingMetric(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "quantile"}, &buf); err == nil {
+		t.Error("expected error when metric name missing")
+	}
+}
