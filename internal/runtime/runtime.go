@@ -18,6 +18,7 @@ import (
 	"github.com/yaop-labs/amber/internal/bootstrap"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -145,9 +146,16 @@ type Stack struct {
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
 
-	// MetricStore is the embedded metricsengine store. Nil when metrics
-	// are disabled via MetricsOptions.Disabled.
+	// MetricStore is the embedded metricsengine store for scalar metrics
+	// (counters, gauges). Nil when metrics are disabled via
+	// MetricsOptions.Disabled.
 	MetricStore *mestore.Store
+
+	// HistogramStore is the embedded metricsengine histogram store
+	// (exponential + explicit-bucket sketches). Opens/closes alongside
+	// MetricStore — the same Disabled kill switch covers both, so the
+	// metric subsystem is atomic from the operator's point of view.
+	HistogramStore *histogram.Store
 
 	// dogfoodStop, when non-nil, signals the self-scrape goroutine to exit.
 	// Close(dogfoodStop) then <-dogfoodDone is the shutdown handshake; both
@@ -324,6 +332,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	batcher.Start(ctx)
 
 	var metricStore *mestore.Store
+	var histStore *histogram.Store
 	if !cfg.Metrics.Disabled {
 		metricsDir := cfg.Metrics.Dir
 		if metricsDir == "" {
@@ -350,6 +359,22 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			return nil, fmt.Errorf("runtime: open metric store: %w", err)
 		}
 		metricStore = ms
+
+		hs, err := histogram.OpenStore(filepath.Join(metricsDir, "histograms"))
+		if err != nil {
+			batcher.Wait()
+			if logUp != nil {
+				logUp.Stop()
+			}
+			if spanUp != nil {
+				spanUp.Stop()
+			}
+			_ = metricStore.Close()
+			_ = logManager.Close()
+			_ = spanManager.Close()
+			return nil, fmt.Errorf("runtime: open histogram store: %w", err)
+		}
+		histStore = hs
 	}
 
 	s.LogManager = logManager
@@ -361,6 +386,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.Executor = exec
 	s.Batcher = batcher
 	s.MetricStore = metricStore
+	s.HistogramStore = histStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
 
