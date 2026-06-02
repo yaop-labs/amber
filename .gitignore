@@ -4,6 +4,7 @@
 # Binaries for programs and plugins
 /amber
 /amberctl
+/loadgen
 *.exe
 *.exe~
 *.dll
