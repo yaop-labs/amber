@@ -15,9 +15,11 @@ import (
 const metricsUsage = `amberctl metrics — query metrics
 
 subcommands:
+  list              list metric names available in the head index
   rate <metric>     compute the per-second rate of a counter
 
-example:
+examples:
+  amberctl metrics list
   amberctl metrics rate http_requests_total --window 5m --by job
 `
 
@@ -28,6 +30,8 @@ func cmdMetrics(ctx context.Context, args []string, out io.Writer) error {
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
+	case "list":
+		return cmdMetricsList(ctx, rest, out)
 	case "rate":
 		return cmdMetricsRate(ctx, rest, out)
 	case "help", "-h", "--help":
@@ -36,6 +40,29 @@ func cmdMetrics(ctx context.Context, args []string, out io.Writer) error {
 	default:
 		return fmt.Errorf("unknown subcommand %q for metrics (run \"amberctl metrics help\")", sub)
 	}
+}
+
+func cmdMetricsList(ctx context.Context, args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("metrics list", flag.ContinueOnError)
+	cf := registerCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	names, err := cf.newClient().MetricNames(ctx)
+	if err != nil {
+		return err
+	}
+	if cf.ndjson || cf.json {
+		return writeJSON(out, map[string]any{"metrics": names})
+	}
+	if len(names) == 0 {
+		writef(out, "(no metrics)\n")
+		return nil
+	}
+	for _, n := range names {
+		writef(out, "%s\n", n)
+	}
+	return nil
 }
 
 func cmdMetricsRate(ctx context.Context, args []string, out io.Writer) error {

@@ -21,6 +21,28 @@ func NewMetricsQueryHandler(store *metricsengine.Store, log *slog.Logger) *Metri
 	return &MetricsQueryHandler{store: store, log: log}
 }
 
+// MetricsListHandler serves GET /api/v1/metrics — returns all metric names
+// currently visible in the head index.
+type MetricsListHandler struct {
+	store *metricsengine.Store
+}
+
+func NewMetricsListHandler(store *metricsengine.Store) *MetricsListHandler {
+	return &MetricsListHandler{store: store}
+}
+
+func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	if h.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
+		return
+	}
+	names := h.store.MetricNames()
+	if names == nil {
+		names = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"metrics": names})
+}
+
 // rateResponse is the JSON shape returned by GET /api/v1/metrics/rate.
 // EndMillis echoes the evaluation point the server actually used (useful when
 // the client passed no end= and wants to know how far ahead "now" was).
