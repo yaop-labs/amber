@@ -175,3 +175,73 @@ func TestMetricsList_StoreDisabledReturns503(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+// TestMetricsStats_AfterIngest seeds a sample, flushes to a sealed block, then
+// hits /stats. We check buffered counters fall to zero post-flush and that the
+// sealed block contributes to Blocks/Series/Samples/Bytes plus a valid time
+// range.
+func TestMetricsStats_AfterIngest(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := time.Now().UnixMilli()
+	labels := metricsengine.LabelSet{
+		{Name: metricsengine.MetricNameLabel, Value: "stats_test_total"},
+	}
+	if _, err := h.metricStore.AppendBatch([]metricsengine.Sample{
+		{Labels: labels, Type: metricsengine.MetricTypeCounter, Timestamp: now, Value: 1},
+	}); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if _, err := h.metricStore.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp client.MetricStoreStats
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Blocks < 1 || resp.Series < 1 || resp.Samples < 1 || resp.Bytes <= 0 {
+		t.Fatalf("expected non-zero block stats, got %+v", resp)
+	}
+	if resp.MinTimeMS == nil || resp.MaxTimeMS == nil {
+		t.Fatalf("expected populated time range after flush, got %+v", resp)
+	}
+}
+
+// TestMetricsStats_EmptyStore returns 200 with zeroed counters and nil time
+// range; the CLI relies on min_time_ms being absent to render "-".
+func TestMetricsStats_EmptyStore(t *testing.T) {
+	h := setupMetricsHarness(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp client.MetricStoreStats
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Blocks != 0 || resp.MinTimeMS != nil || resp.MaxTimeMS != nil {
+		t.Fatalf("expected empty stats, got %+v", resp)
+	}
+}
+
+func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}

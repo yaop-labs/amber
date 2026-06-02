@@ -102,6 +102,20 @@ type MetricRateResult struct {
 	Rates     map[string]float64 `json:"rates"`
 }
 
+// MetricStoreStats is the decoded GET /api/v1/metrics/stats response.
+// MinTimeMS/MaxTimeMS are nil when the store is empty — that lets the CLI
+// distinguish "no data" from "data at epoch 0".
+type MetricStoreStats struct {
+	Blocks          int    `json:"blocks"`
+	Series          int    `json:"series"`
+	Samples         int    `json:"samples"`
+	Bytes           int64  `json:"bytes"`
+	MinTimeMS       *int64 `json:"min_time_ms,omitempty"`
+	MaxTimeMS       *int64 `json:"max_time_ms,omitempty"`
+	BufferedSeries  int    `json:"buffered_series"`
+	BufferedSamples int    `json:"buffered_samples"`
+}
+
 // Stats mirrors GET /api/v1/admin/stats.
 type Stats struct {
 	Segments struct {
