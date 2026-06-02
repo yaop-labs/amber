@@ -33,6 +33,11 @@ type MetricsConfig struct {
 	MaxLabelsPerSeries  int           `yaml:"max_labels_per_series"`
 	Retention           time.Duration `yaml:"retention"`
 	CompactionMinBlocks int           `yaml:"compaction_min_blocks"`
+	// DogfoodInterval, when >0, enables the in-process self-scrape: every
+	// interval the selfobs registry is snapshotted and appended to the
+	// embedded metric store. 30s is a reasonable starting point. Zero
+	// disables.
+	DogfoodInterval time.Duration `yaml:"dogfood_interval"`
 }
 
 type DebugConfig struct {
