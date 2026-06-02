@@ -26,6 +26,7 @@ var (
 	count     = flag.Int("n", 1000, "number of log entries to send")
 	traces    = flag.Int("traces", 50, "number of traces to generate")
 	batchSize = flag.Int("batch", 100, "entries per HTTP request")
+	metrics   = flag.Int("metrics", 200, "number of metric points to send (0 disables)")
 )
 
 var services = []string{
@@ -109,9 +110,10 @@ func main() {
 	flag.Parse()
 
 	fmt.Printf("→ amber loadgen\n")
-	fmt.Printf("  target: %s\n", *addr)
-	fmt.Printf("  logs:   %d\n", *count)
-	fmt.Printf("  traces: %d\n", *traces)
+	fmt.Printf("  target:  %s\n", *addr)
+	fmt.Printf("  logs:    %d\n", *count)
+	fmt.Printf("  traces:  %d\n", *traces)
+	fmt.Printf("  metrics: %d\n", *metrics)
 	fmt.Println()
 
 	if err := healthCheck(*addr); err != nil {
@@ -171,6 +173,15 @@ func main() {
 		sent += size
 		if sent%500 == 0 || sent == *count {
 			fmt.Printf("sent %d / %d\n", sent, *count)
+		}
+	}
+
+	if *metrics > 0 {
+		fmt.Printf("\n-> generating %d metric points...\n", *metrics)
+		if err := sendOTLPMetrics(client, *addr, rng, *metrics); err != nil {
+			fmt.Fprintf(os.Stderr, "  metrics error: %v\n", err)
+		} else {
+			fmt.Printf("[ok] metrics sent\n")
 		}
 	}
 
