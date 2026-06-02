@@ -22,6 +22,7 @@ import (
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 	"github.com/yaop-labs/amber/metricsengine"
@@ -33,6 +34,7 @@ import (
 type metricsHarness struct {
 	mux         *http.ServeMux
 	metricStore *metricsengine.Store
+	histStore   *histogram.Store
 }
 
 func setupMetricsHarness(t *testing.T) *metricsHarness {
@@ -67,6 +69,10 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 	if err != nil {
 		t.Fatalf("open metric store: %v", err)
 	}
+	histStore, err := histogram.OpenStore(filepath.Join(dir, "metrics", "histograms"))
+	if err != nil {
+		t.Fatalf("open histogram store: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	var ready atomic.Bool
@@ -74,8 +80,9 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 	RegisterRoutes(mux, RoutesDeps{
 		Batcher: batcher, Executor: exec,
 		LogManager: logManager, LogSparse: logSparse,
-		MetricStore: metricStore,
-		IsReady:     ready.Load, Logger: log,
+		MetricStore:    metricStore,
+		HistogramStore: histStore,
+		IsReady:        ready.Load, Logger: log,
 	}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
 
 	t.Cleanup(func() {
@@ -88,7 +95,7 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 		_ = spanManager.Close()
 	})
 
-	return &metricsHarness{mux: mux, metricStore: metricStore}
+	return &metricsHarness{mux: mux, metricStore: metricStore, histStore: histStore}
 }
 
 func (h *metricsHarness) post(t *testing.T, path string, body []byte) *httptest.ResponseRecorder {
@@ -175,11 +182,12 @@ func TestOTLPMetrics_CounterRoundTrip(t *testing.T) {
 	}
 }
 
-// TestOTLPMetrics_HistogramReportedUnsupported posts a Histogram metric and
-// expects the handler to record it as unsupported (skipped, not rejected).
-// metricsengine v0 has no query path for histograms; accepting them at ingest
-// would just write WAL bytes nothing can ever read.
-func TestOTLPMetrics_HistogramReportedUnsupported(t *testing.T) {
+// TestOTLPMetrics_ExplicitHistogramAccepted posts a Histogram metric through
+// the wired histogram path and expects it to be accepted (one block written).
+// We don't poke into block internals here — round-trip fidelity is covered by
+// histogram package tests; the HTTP layer just needs to forward without
+// dropping.
+func TestOTLPMetrics_ExplicitHistogramAccepted(t *testing.T) {
 	h := setupMetricsHarness(t)
 
 	req := &collectormetrics.ExportMetricsServiceRequest{
@@ -218,9 +226,145 @@ func TestOTLPMetrics_HistogramReportedUnsupported(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Accepted != 0 || resp.Unsupported != 1 {
-		t.Fatalf("accepted/unsupported = %d/%d, want 0/1", resp.Accepted, resp.Unsupported)
+	if resp.Accepted != 1 || resp.Unsupported != 0 || resp.Rejected != 0 {
+		t.Fatalf("accepted/rejected/unsupported = %d/%d/%d, want 1/0/0",
+			resp.Accepted, resp.Rejected, resp.Unsupported)
 	}
+}
+
+// TestOTLPMetrics_ExponentialHistogramAccepted is the exp-histogram analogue
+// of the explicit-bucket test. We supply a tiny positive-only sketch so the
+// adapter exercises every codec path (scale, offset, counts, sum/count).
+func TestOTLPMetrics_ExponentialHistogramAccepted(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			Resource: &resourcepb.Resource{},
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "rpc_latency_seconds",
+					Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+						DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+							TimeUnixNano: uint64(time.Now().UnixNano()),
+							Count:        4,
+							Sum:          proto.Float64(0.4),
+							Scale:        2,
+							Positive: &metricspb.ExponentialHistogramDataPoint_Buckets{
+								Offset:       0,
+								BucketCounts: []uint64{1, 1, 1, 1},
+							},
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec := h.post(t, "/v1/metrics", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Accepted    int `json:"accepted"`
+		Rejected    int `json:"rejected"`
+		Unsupported int `json:"unsupported"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Accepted != 1 || resp.Unsupported != 0 || resp.Rejected != 0 {
+		t.Fatalf("accepted/rejected/unsupported = %d/%d/%d, want 1/0/0",
+			resp.Accepted, resp.Rejected, resp.Unsupported)
+	}
+}
+
+// TestOTLPMetrics_HistogramUnsupportedWhenHistStoreNil keeps the old
+// "histogram is skipped" behavior alive for deployments where the histogram
+// store has not been opened. The handler still accepts the request (scalar
+// store is up) but reports the histogram point as unsupported.
+func TestOTLPMetrics_HistogramUnsupportedWhenHistStoreNil(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	metricStore, err := metricsengine.OpenStore(filepath.Join(dir, "metrics"))
+	if err != nil {
+		t.Fatalf("open metric store: %v", err)
+	}
+	t.Cleanup(func() { _ = metricStore.Close() })
+	mux := http.NewServeMux()
+	mux.Handle("POST /v1/metrics", NewOTLPHandler(noopBatcher(t), metricStore, nil, log))
+
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "h",
+					Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+						DataPoints: []*metricspb.HistogramDataPoint{{
+							TimeUnixNano:   uint64(time.Now().UnixNano()),
+							BucketCounts:   []uint64{1},
+							ExplicitBounds: []float64{},
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Accepted, Rejected, Unsupported int
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Unsupported != 1 {
+		t.Fatalf("unsupported = %d, want 1; full=%+v", resp.Unsupported, resp)
+	}
+}
+
+// noopBatcher returns a Batcher whose breaker is closed so the OTLP handler
+// admits the request. The actual logs/spans path is not exercised in the
+// nil-histStore test.
+func noopBatcher(t *testing.T) *ingest.Batcher {
+	t.Helper()
+	dir := t.TempDir()
+	logManager, err := storage.OpenSegmentManager(filepath.Join(dir, "logs"), storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open log manager: %v", err)
+	}
+	spanManager, err := storage.OpenSegmentManager(filepath.Join(dir, "spans"), storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open span manager: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	exec := query.NewExecutorWithCache(logManager, spanManager, index.NewSparseIndex(), index.NewSparseIndex(), filepath.Join(dir, "logs"), filepath.Join(dir, "spans"), 32)
+	b := ingest.NewBatcher(
+		ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Indexer: exec.ActiveIndex(), Logger: log},
+		ingest.Config{BatchSize: 16, BatchTimeout: 2 * time.Millisecond, QueueSize: 256},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		b.Wait()
+		_ = logManager.Close()
+		_ = spanManager.Close()
+	})
+	return b
 }
 
 // TestOTLPMetrics_NoStoreReturns503 verifies the route stays alive when

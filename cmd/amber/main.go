@@ -220,13 +220,14 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", selfobs.Handler())
 	amberhttp.RegisterRoutes(mux, amberhttp.RoutesDeps{
-		Batcher:     stack.Batcher,
-		Executor:    stack.Executor,
-		LogManager:  stack.LogManager,
-		LogSparse:   stack.LogSparse,
-		MetricStore: stack.MetricStore,
-		IsReady:     stack.IsReady,
-		Logger:      log,
+		Batcher:        stack.Batcher,
+		Executor:       stack.Executor,
+		LogManager:     stack.LogManager,
+		LogSparse:      stack.LogSparse,
+		MetricStore:    stack.MetricStore,
+		HistogramStore: stack.HistogramStore,
+		IsReady:        stack.IsReady,
+		Logger:         log,
 	}, amberhttp.RoutesConfig{
 		APIKeys:         cfg.API.ResolvedAPIKeys(),
 		MaxRequestBytes: cfg.API.MaxRequestBytes,
