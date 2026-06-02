@@ -159,21 +159,46 @@ func TestMetricsList_EmptyStore(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var resp struct {
-		Metrics []string `json:"metrics"`
-	}
+	var resp client.MetricCatalog
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if resp.Metrics == nil {
 		t.Fatalf("metrics is null, want empty array")
 	}
+	if resp.Histograms == nil {
+		t.Fatalf("histograms is null, want empty array")
+	}
+}
+
+// TestMetricsList_IncludesHistograms verifies the histogram namespace shows up
+// after an exp-histogram is ingested. Without this, "amberctl metrics list"
+// would hide histogram-only metrics from users.
+func TestMetricsList_IncludesHistograms(t *testing.T) {
+	h := setupMetricsHarness(t)
+	seedExpHistogram(t, h, "rpc_latency_seconds", nil,
+		2, 0, []uint64{1, 1, 1, 1}, 1.0, 4)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp client.MetricCatalog
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Histograms) != 1 || resp.Histograms[0] != "rpc_latency_seconds" {
+		t.Fatalf("histograms = %v, want [rpc_latency_seconds]", resp.Histograms)
+	}
 }
 
 // TestMetricsList_StoreDisabledReturns503 mirrors the rate handler guard.
 func TestMetricsList_StoreDisabledReturns503(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("GET /api/v1/metrics", NewMetricsListHandler(nil))
+	mux.Handle("GET /api/v1/metrics", NewMetricsListHandler(nil, nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -241,9 +266,37 @@ func TestMetricsStats_EmptyStore(t *testing.T) {
 	}
 }
 
+// TestMetricsStats_HistogramSection verifies the nested histogram counters
+// reflect a histogram ingest end-to-end. Histogram blocks are written
+// synchronously per request (no head), so we expect Blocks=1, Series=1,
+// Bytes>0, and a populated time range immediately.
+func TestMetricsStats_HistogramSection(t *testing.T) {
+	h := setupMetricsHarness(t)
+	seedExpHistogram(t, h, "rpc_latency_seconds", nil,
+		2, 0, []uint64{1, 1, 1, 1}, 1.0, 4)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp client.MetricStoreStats
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Histogram.Blocks != 1 || resp.Histogram.Series != 1 || resp.Histogram.Bytes <= 0 {
+		t.Fatalf("histogram counters = %+v, want blocks=1 series=1 bytes>0", resp.Histogram)
+	}
+	if resp.Histogram.MinTimeMS == nil || resp.Histogram.MaxTimeMS == nil {
+		t.Fatalf("histogram time range not populated: %+v", resp.Histogram)
+	}
+}
+
 func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil))
+	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

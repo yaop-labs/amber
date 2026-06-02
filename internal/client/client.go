@@ -248,15 +248,15 @@ func (c *Client) MetricQuantile(ctx context.Context, q MetricQuantileQuery) (*Me
 	return &resp, nil
 }
 
-// MetricNames lists all metric names currently visible in the head index.
-func (c *Client) MetricNames(ctx context.Context) ([]string, error) {
-	var resp struct {
-		Metrics []string `json:"metrics"`
-	}
+// MetricNames lists metric names currently visible in both the scalar head
+// index and the histogram store. Returned as a typed catalog so callers can
+// tell which read path serves each name (rate vs quantile).
+func (c *Client) MetricNames(ctx context.Context) (*MetricCatalog, error) {
+	var resp MetricCatalog
 	if err := c.get(ctx, "/api/v1/metrics", nil, &resp); err != nil {
 		return nil, err
 	}
-	return resp.Metrics, nil
+	return &resp, nil
 }
 
 // MetricStats fetches storage counters for the embedded metrics store.

@@ -72,6 +72,80 @@ func (s *Store) blockPaths() ([]string, error) {
 	return paths, nil
 }
 
+// MetricNames returns the sorted, deduplicated set of __name__ label values
+// across every histogram series in every block. Read-only: scans directories
+// without decoding payloads.
+func (s *Store) MetricNames() ([]string, error) {
+	paths, err := s.blockPaths()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		dir, err := ReadDirectory(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range dir.Series {
+			if v, ok := e.Labels.Get(model.MetricNameLabel); ok {
+				seen[v] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// Stats summarizes histogram-store contents: block count, total series across
+// blocks (NOT unique-by-labels — that would be a fingerprint join), total
+// bytes on disk, and the [min,max] timestamp envelope.
+type Stats struct {
+	Blocks  int
+	Series  int
+	Bytes   int64
+	MinTime int64
+	MaxTime int64
+	HasTime bool
+}
+
+func (s *Store) Stats() (Stats, error) {
+	paths, err := s.blockPaths()
+	if err != nil {
+		return Stats{}, err
+	}
+	st := Stats{Blocks: len(paths)}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return Stats{}, err
+		}
+		st.Bytes += info.Size()
+		dir, err := ReadDirectory(path)
+		if err != nil {
+			return Stats{}, err
+		}
+		st.Series += len(dir.Series)
+		if mn, mx, ok := dir.TimeRange(); ok {
+			if !st.HasTime {
+				st.MinTime, st.MaxTime = mn, mx
+				st.HasTime = true
+			} else {
+				if mn < st.MinTime {
+					st.MinTime = mn
+				}
+				if mx > st.MaxTime {
+					st.MaxTime = mx
+				}
+			}
+		}
+	}
+	return st, nil
+}
+
 // matchedExp collects, per series ID, all exp sketches across blocks whose ticks
 // fall within tr and whose labels match the selector. Labels are carried for
 // grouping.

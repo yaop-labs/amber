@@ -116,18 +116,40 @@ type MetricRateResult struct {
 	Rates     map[string]float64 `json:"rates"`
 }
 
-// MetricStoreStats is the decoded GET /api/v1/metrics/stats response.
-// MinTimeMS/MaxTimeMS are nil when the store is empty — that lets the CLI
-// distinguish "no data" from "data at epoch 0".
+// MetricCatalog is the decoded GET /api/v1/metrics response. Metrics is the
+// scalar (counter/gauge) set; Histograms is the histogram-store set. Both
+// are sorted server-side.
+type MetricCatalog struct {
+	Metrics    []string `json:"metrics"`
+	Histograms []string `json:"histograms"`
+}
+
+// MetricStoreStats is the decoded GET /api/v1/metrics/stats response. Top
+// level reports scalar-store counters; Histogram is the nested counterpart
+// for the histogram store. MinTimeMS/MaxTimeMS are nil when the
+// corresponding store is empty — that lets the CLI distinguish "no data"
+// from "data at epoch 0".
 type MetricStoreStats struct {
-	Blocks          int    `json:"blocks"`
-	Series          int    `json:"series"`
-	Samples         int    `json:"samples"`
-	Bytes           int64  `json:"bytes"`
-	MinTimeMS       *int64 `json:"min_time_ms,omitempty"`
-	MaxTimeMS       *int64 `json:"max_time_ms,omitempty"`
-	BufferedSeries  int    `json:"buffered_series"`
-	BufferedSamples int    `json:"buffered_samples"`
+	Blocks          int                 `json:"blocks"`
+	Series          int                 `json:"series"`
+	Samples         int                 `json:"samples"`
+	Bytes           int64               `json:"bytes"`
+	MinTimeMS       *int64              `json:"min_time_ms,omitempty"`
+	MaxTimeMS       *int64              `json:"max_time_ms,omitempty"`
+	BufferedSeries  int                 `json:"buffered_series"`
+	BufferedSamples int                 `json:"buffered_samples"`
+	Histogram       HistogramStoreStats `json:"histogram"`
+}
+
+// HistogramStoreStats mirrors the nested "histogram" object inside
+// MetricStoreStats. No Samples/Buffered fields: histogram-store writes are
+// per-block atomic, there is no head buffer.
+type HistogramStoreStats struct {
+	Blocks    int    `json:"blocks"`
+	Series    int    `json:"series"`
+	Bytes     int64  `json:"bytes"`
+	MinTimeMS *int64 `json:"min_time_ms,omitempty"`
+	MaxTimeMS *int64 `json:"max_time_ms,omitempty"`
 }
 
 // Stats mirrors GET /api/v1/admin/stats.

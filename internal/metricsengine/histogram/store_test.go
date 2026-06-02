@@ -251,3 +251,80 @@ func TestStoreTimeRangeFilter(t *testing.T) {
 		t.Fatalf("expected only early tick (count 3), got %d", merged.Count)
 	}
 }
+
+// TestStoreMetricNames seeds two series with distinct __name__ values across
+// two blocks and asserts MetricNames deduplicates and sorts.
+func TestStoreMetricNames(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sk := FromValues(4, []float64{1, 2, 3})
+	if _, err := s.WriteBlock([]ExpSeries{{
+		ID: 1, Labels: lbls("__name__", "zeta"), Timestamps: []int64{100}, Sketches: []*ExponentialHistogram{sk},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteBlock([]ExpSeries{
+		{ID: 1, Labels: lbls("__name__", "alpha"), Timestamps: []int64{200}, Sketches: []*ExponentialHistogram{sk}},
+		// Duplicate "alpha" in a different label set must collapse to one entry.
+		{ID: 2, Labels: lbls("__name__", "alpha", "host", "h1"), Timestamps: []int64{200}, Sketches: []*ExponentialHistogram{sk}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	names, err := s.MetricNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 || names[0] != "alpha" || names[1] != "zeta" {
+		t.Fatalf("MetricNames = %v, want [alpha zeta]", names)
+	}
+}
+
+// TestStoreStats checks block-count, series-count, and time-range accumulation
+// across two blocks. Bytes is asserted as >0 rather than exact to stay
+// resilient to codec changes.
+func TestStoreStats(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sk := FromValues(4, []float64{1, 2, 3})
+	if _, err := s.WriteBlock([]ExpSeries{{
+		ID: 1, Labels: lbls("__name__", "m"), Timestamps: []int64{50}, Sketches: []*ExponentialHistogram{sk},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteBlock([]ExpSeries{
+		{ID: 1, Labels: lbls("__name__", "m", "host", "a"), Timestamps: []int64{100}, Sketches: []*ExponentialHistogram{sk}},
+		{ID: 2, Labels: lbls("__name__", "m", "host", "b"), Timestamps: []int64{200}, Sketches: []*ExponentialHistogram{sk}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Blocks != 2 || st.Series != 3 || st.Bytes <= 0 {
+		t.Fatalf("stats = %+v, want blocks=2 series=3 bytes>0", st)
+	}
+	if !st.HasTime || st.MinTime != 50 || st.MaxTime != 200 {
+		t.Fatalf("time range = %v..%v, want 50..200", st.MinTime, st.MaxTime)
+	}
+}
+
+// TestStoreStatsEmpty confirms zero-state behavior — used by the HTTP stats
+// endpoint to render "-" for time range when nothing has been written.
+func TestStoreStatsEmpty(t *testing.T) {
+	s, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Blocks != 0 || st.Series != 0 || st.Bytes != 0 || st.HasTime {
+		t.Fatalf("empty stats = %+v", st)
+	}
+}

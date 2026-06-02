@@ -23,61 +23,98 @@ func NewMetricsQueryHandler(store *metricsengine.Store, log *slog.Logger) *Metri
 	return &MetricsQueryHandler{store: store, log: log}
 }
 
-// MetricsListHandler serves GET /api/v1/metrics — returns all metric names
-// currently visible in the head index.
+// MetricsListHandler serves GET /api/v1/metrics — returns metric names
+// currently visible in both the scalar head index and the histogram store.
+// Histograms live in a separate store with a different on-disk format, so
+// they get their own array in the response — clients (and the CLI) need to
+// know which read path serves each name (rate vs quantile).
 type MetricsListHandler struct {
-	store *metricsengine.Store
+	scalar *metricsengine.Store
+	hist   *histogram.Store
+	log    *slog.Logger
 }
 
-func NewMetricsListHandler(store *metricsengine.Store) *MetricsListHandler {
-	return &MetricsListHandler{store: store}
+func NewMetricsListHandler(scalar *metricsengine.Store, hist *histogram.Store, log *slog.Logger) *MetricsListHandler {
+	return &MetricsListHandler{scalar: scalar, hist: hist, log: log}
+}
+
+type metricsListResponse struct {
+	// Metrics is the scalar (counter/gauge) set; backwards-compatible with the
+	// initial version of this endpoint.
+	Metrics []string `json:"metrics"`
+	// Histograms is the histogram-store set. Empty (not omitted) when the
+	// histogram store is disabled or empty, so the field is always present.
+	Histograms []string `json:"histograms"`
 }
 
 func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	if h.store == nil {
+	if h.scalar == nil {
 		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
 		return
 	}
-	names := h.store.MetricNames()
-	if names == nil {
-		names = []string{}
+	scalar := h.scalar.MetricNames()
+	if scalar == nil {
+		scalar = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"metrics": names})
+	hists := []string{}
+	if h.hist != nil {
+		names, err := h.hist.MetricNames()
+		if err != nil {
+			h.log.Warn("histogram metric-names failed", "err", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if names != nil {
+			hists = names
+		}
+	}
+	writeJSON(w, http.StatusOK, metricsListResponse{Metrics: scalar, Histograms: hists})
 }
 
 // MetricsStatsHandler serves GET /api/v1/metrics/stats — returns storage
-// counters for the embedded metrics store. Stats() walks the manifest with a
-// stat syscall per block plus a footer read, so it is admin-grade (not scrape
-// path).
+// counters for both the embedded scalar and histogram stores. Stats() walks
+// the manifest with a stat syscall per block plus a footer read, so it is
+// admin-grade (not scrape path).
 type MetricsStatsHandler struct {
-	store *metricsengine.Store
-	log   *slog.Logger
+	scalar *metricsengine.Store
+	hist   *histogram.Store
+	log    *slog.Logger
 }
 
-func NewMetricsStatsHandler(store *metricsengine.Store, log *slog.Logger) *MetricsStatsHandler {
-	return &MetricsStatsHandler{store: store, log: log}
+func NewMetricsStatsHandler(scalar *metricsengine.Store, hist *histogram.Store, log *slog.Logger) *MetricsStatsHandler {
+	return &MetricsStatsHandler{scalar: scalar, hist: hist, log: log}
 }
 
-// metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats. We
-// emit MinTime/MaxTime as nullable millis so the client can distinguish
-// "no data yet" from "data starting at unix epoch 0".
+// metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats. Top
+// level mirrors the original scalar-only response (additive change, existing
+// clients keep working). Histogram counters live under a nested object,
+// always present (zero values when the histogram store is disabled).
 type metricsStatsResponse struct {
-	Blocks          int    `json:"blocks"`
-	Series          int    `json:"series"`
-	Samples         int    `json:"samples"`
-	Bytes           int64  `json:"bytes"`
-	MinTimeMS       *int64 `json:"min_time_ms,omitempty"`
-	MaxTimeMS       *int64 `json:"max_time_ms,omitempty"`
-	BufferedSeries  int    `json:"buffered_series"`
-	BufferedSamples int    `json:"buffered_samples"`
+	Blocks          int                       `json:"blocks"`
+	Series          int                       `json:"series"`
+	Samples         int                       `json:"samples"`
+	Bytes           int64                     `json:"bytes"`
+	MinTimeMS       *int64                    `json:"min_time_ms,omitempty"`
+	MaxTimeMS       *int64                    `json:"max_time_ms,omitempty"`
+	BufferedSeries  int                       `json:"buffered_series"`
+	BufferedSamples int                       `json:"buffered_samples"`
+	Histogram       histogramStatsSubResponse `json:"histogram"`
+}
+
+type histogramStatsSubResponse struct {
+	Blocks    int    `json:"blocks"`
+	Series    int    `json:"series"`
+	Bytes     int64  `json:"bytes"`
+	MinTimeMS *int64 `json:"min_time_ms,omitempty"`
+	MaxTimeMS *int64 `json:"max_time_ms,omitempty"`
 }
 
 func (h *MetricsStatsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
-	if h.store == nil {
+	if h.scalar == nil {
 		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
 		return
 	}
-	stats, err := h.store.Stats()
+	stats, err := h.scalar.Stats()
 	if err != nil {
 		h.log.Warn("metrics stats failed", "err", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -95,6 +132,24 @@ func (h *MetricsStatsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) 
 		minT, maxT := stats.MinTime, stats.MaxTime
 		resp.MinTimeMS = &minT
 		resp.MaxTimeMS = &maxT
+	}
+	if h.hist != nil {
+		hs, err := h.hist.Stats()
+		if err != nil {
+			h.log.Warn("histogram stats failed", "err", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		resp.Histogram = histogramStatsSubResponse{
+			Blocks: hs.Blocks,
+			Series: hs.Series,
+			Bytes:  hs.Bytes,
+		}
+		if hs.HasTime {
+			minT, maxT := hs.MinTime, hs.MaxTime
+			resp.Histogram.MinTimeMS = &minT
+			resp.Histogram.MaxTimeMS = &maxT
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
