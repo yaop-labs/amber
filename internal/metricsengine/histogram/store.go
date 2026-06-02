@@ -112,10 +112,16 @@ func (s *Store) collectExp(selector index.Selector, tr TimeRange) (map[uint64]*m
 			if err != nil {
 				return nil, err
 			}
-			m := out[e.SeriesID]
+			// Key by label fingerprint, not SeriesID: each block assigns its
+			// own local IDs (1..N), so identical series across blocks would
+			// collide and silently merge into one group otherwise. Two POSTs
+			// of the same labels become two blocks with SeriesID=1 each,
+			// which the read path must reunify.
+			fp := e.Labels.Fingerprint()
+			m := out[fp]
 			if m == nil {
 				m = &matchedExp{labels: e.Labels}
-				out[e.SeriesID] = m
+				out[fp] = m
 			}
 			for i, ts := range dec.Timestamps {
 				if tr.contains(ts) {
