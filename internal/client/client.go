@@ -205,6 +205,49 @@ func (c *Client) MetricRate(ctx context.Context, q MetricRateQuery) (*MetricRate
 	return &resp, nil
 }
 
+// MetricQuantileQuery is the input to GET /api/v1/metrics/quantile. Quantile
+// is mandatory and must be in [0, 1]. Window is optional — zero means
+// unbounded (the server quantiles over everything). End is honored only when
+// Window is non-zero. By selects a single grouping label, empty means "no
+// grouping" (a single bucket keyed by "").
+type MetricQuantileQuery struct {
+	Metric   string
+	Quantile float64
+	Window   time.Duration
+	End      time.Time
+	By       string
+	Selector map[string]string
+}
+
+func (q MetricQuantileQuery) values() url.Values {
+	v := url.Values{}
+	v.Set("metric", q.Metric)
+	v.Set("q", strconv.FormatFloat(q.Quantile, 'g', -1, 64))
+	if q.Window > 0 {
+		v.Set("window", q.Window.String())
+		if !q.End.IsZero() {
+			v.Set("end", strconv.FormatInt(q.End.UnixMilli(), 10))
+		}
+	}
+	if q.By != "" {
+		v.Set("by", q.By)
+	}
+	for k, val := range q.Selector {
+		v.Add("selector", k+"="+val)
+	}
+	return v
+}
+
+// MetricQuantile runs a histogram quantile query against the embedded
+// histogram store.
+func (c *Client) MetricQuantile(ctx context.Context, q MetricQuantileQuery) (*MetricQuantileResult, error) {
+	var resp MetricQuantileResult
+	if err := c.get(ctx, "/api/v1/metrics/quantile", q.values(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // MetricNames lists all metric names currently visible in the head index.
 func (c *Client) MetricNames(ctx context.Context) ([]string, error) {
 	var resp struct {
