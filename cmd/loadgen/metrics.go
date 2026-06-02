@@ -9,9 +9,10 @@ import (
 	"time"
 )
 
-// OTLP JSON metric shapes. Only the subset amber actually consumes: Sum and
-// Gauge with Number data points. Histogram support is server-side TBD, so we
-// don't emit it.
+// OTLP JSON metric shapes. The subset amber actually consumes: Sum and Gauge
+// (number data points) and ExponentialHistogram (sketch). Explicit-bucket
+// Histogram is also supported server-side but the exp variant exercises the
+// more interesting sketch codec, so that's what loadgen emits.
 
 type otlpMetricVal struct {
 	StringValue string   `json:"stringValue,omitempty"`
@@ -42,9 +43,30 @@ type otlpGauge struct {
 }
 
 type otlpMetric struct {
-	Name  string     `json:"name"`
-	Sum   *otlpSum   `json:"sum,omitempty"`
-	Gauge *otlpGauge `json:"gauge,omitempty"`
+	Name                 string            `json:"name"`
+	Sum                  *otlpSum          `json:"sum,omitempty"`
+	Gauge                *otlpGauge        `json:"gauge,omitempty"`
+	ExponentialHistogram *otlpExpHistogram `json:"exponentialHistogram,omitempty"`
+}
+
+type otlpExpBuckets struct {
+	Offset       int32    `json:"offset"`
+	BucketCounts []uint64 `json:"bucketCounts"`
+}
+
+type otlpExpHistogramPoint struct {
+	Attributes   []otlpMetricAttr `json:"attributes,omitempty"`
+	TimeUnixNano string           `json:"timeUnixNano"`
+	Count        uint64           `json:"count"`
+	Sum          *float64         `json:"sum,omitempty"`
+	Scale        int32            `json:"scale"`
+	ZeroCount    uint64           `json:"zeroCount,omitempty"`
+	Positive     otlpExpBuckets   `json:"positive"`
+}
+
+type otlpExpHistogram struct {
+	DataPoints             []otlpExpHistogramPoint `json:"dataPoints"`
+	AggregationTemporality int                     `json:"aggregationTemporality"`
 }
 
 type otlpScopeMetrics struct {
@@ -77,10 +99,11 @@ func sendOTLPMetrics(client *http.Client, addr string, rng *rand.Rand, n int) er
 		ts := now.Add(-time.Duration(rng.IntN(300)) * time.Second)
 		tsStr := fmt.Sprintf("%d", ts.UnixNano())
 
-		// Cycle through three metric shapes so the harness exercises sum+gauge
-		// + monotonic vs non-monotonic. Histograms intentionally omitted —
-		// metricsengine v0 has no query path for them.
-		switch i % 3 {
+		// Cycle through four metric shapes: monotonic sum, two gauge variants,
+		// and an exponential histogram. Explicit-bucket histograms are also
+		// accepted by the server but the exp variant exercises the
+		// interesting sketch codec.
+		switch i % 4 {
 		case 0:
 			pointsByService[svc] = append(pointsByService[svc], otlpMetric{
 				Name: "http_requests_total",
@@ -120,6 +143,32 @@ func sendOTLPMetrics(client *http.Client, addr string, rng *rand.Rand, n int) er
 					DataPoints: []otlpNumberPoint{{
 						TimeUnixNano: tsStr,
 						AsDouble:     &ratio,
+						Attributes: []otlpMetricAttr{
+							{Key: "host", Value: otlpMetricVal{StringValue: host}},
+						},
+					}},
+				},
+			})
+		case 3:
+			// Exponential histogram with 8 positive buckets, weighted toward
+			// the center — this gives the quantile path something meaningful
+			// to estimate. Offset shifts the distribution so different hosts
+			// land at slightly different latency centers.
+			counts := []uint64{1, 2, 4, 8, 8, 4, 2, 1}
+			sum := 0.42 * float64(rng.IntN(10)+1)
+			pointsByService[svc] = append(pointsByService[svc], otlpMetric{
+				Name: "rpc_latency_seconds",
+				ExponentialHistogram: &otlpExpHistogram{
+					AggregationTemporality: 2,
+					DataPoints: []otlpExpHistogramPoint{{
+						TimeUnixNano: tsStr,
+						Count:        30,
+						Sum:          &sum,
+						Scale:        2,
+						Positive: otlpExpBuckets{
+							Offset:       int32(rng.IntN(4)),
+							BucketCounts: counts,
+						},
 						Attributes: []otlpMetricAttr{
 							{Key: "host", Value: otlpMetricVal{StringValue: host}},
 						},
