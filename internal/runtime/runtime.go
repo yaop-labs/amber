@@ -47,6 +47,11 @@ type MetricsOptions struct {
 	MaxLabelsPerSeries  int
 	Retention           time.Duration
 	CompactionMinBlocks int
+	// DogfoodInterval enables the in-process selfobs → metric-store scraper.
+	// Zero (default) disables it. Recommended starting point: 30s — matches a
+	// typical Prometheus scrape, gives enough samples for rate() over a 5m
+	// window, and keeps overhead negligible.
+	DogfoodInterval time.Duration
 }
 
 type StorageOptions struct {
@@ -143,6 +148,12 @@ type Stack struct {
 	// MetricStore is the embedded metricsengine store. Nil when metrics
 	// are disabled via MetricsOptions.Disabled.
 	MetricStore *mestore.Store
+
+	// dogfoodStop, when non-nil, signals the self-scrape goroutine to exit.
+	// Close(dogfoodStop) then <-dogfoodDone is the shutdown handshake; both
+	// are nil when DogfoodInterval == 0.
+	dogfoodStop chan struct{}
+	dogfoodDone chan struct{}
 
 	logUploader  *uploader
 	spanUploader *uploader
@@ -352,6 +363,13 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.MetricStore = metricStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
+
+	if metricStore != nil && cfg.Metrics.DogfoodInterval > 0 {
+		s.dogfoodStop = make(chan struct{})
+		s.dogfoodDone = make(chan struct{})
+		go runDogfoodScraper(cfg.Metrics.DogfoodInterval, metricStore, cfg.Logger, s.dogfoodStop, s.dogfoodDone)
+	}
+
 	return s, nil
 }
 
@@ -371,6 +389,13 @@ func (s *Stack) Close(ctx context.Context) error {
 	case <-waitDone:
 	case <-ctx.Done():
 		return fmt.Errorf("runtime: batcher drain: %w", ctx.Err())
+	}
+
+	// Stop the dogfood scraper before MetricStore.Close — otherwise a tick
+	// fired mid-shutdown would AppendBatch into an already-closed store.
+	if s.dogfoodStop != nil {
+		close(s.dogfoodStop)
+		<-s.dogfoodDone
 	}
 
 	// Stop uploaders before closing managers: the worker holds a reference to

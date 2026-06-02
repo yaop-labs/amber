@@ -81,6 +81,7 @@ func run() error {
 			MaxLabelsPerSeries:  cfg.Metrics.MaxLabelsPerSeries,
 			Retention:           cfg.Metrics.Retention,
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
+			DogfoodInterval:     cfg.Metrics.DogfoodInterval,
 		},
 	})
 	if err != nil {
