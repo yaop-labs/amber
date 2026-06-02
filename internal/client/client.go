@@ -205,6 +205,17 @@ func (c *Client) MetricRate(ctx context.Context, q MetricRateQuery) (*MetricRate
 	return &resp, nil
 }
 
+// MetricNames lists all metric names currently visible in the head index.
+func (c *Client) MetricNames(ctx context.Context) ([]string, error) {
+	var resp struct {
+		Metrics []string `json:"metrics"`
+	}
+	if err := c.get(ctx, "/api/v1/metrics", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Metrics, nil
+}
+
 // Stats fetches admin storage/memory statistics.
 func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 	var resp Stats

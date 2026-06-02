@@ -162,6 +162,21 @@ func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	}
 }
 
+// LabelValues returns the sorted unique values for the given label name across
+// all in-memory series. Used for cheap metric-name enumeration on the read path.
+func (r *Registry) LabelValues(name string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for k := range r.postings {
+		if k.name == name {
+			out = append(out, k.value)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (r *Registry) Labels(id SeriesID) (model.LabelSet, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

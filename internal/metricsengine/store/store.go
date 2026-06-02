@@ -424,6 +424,13 @@ func (s *Store) BufferedSeries() int { return s.engine.BufferedSeries() }
 // not yet flushed. Cheap.
 func (s *Store) BufferedSamples() int { return s.engine.BufferedSamples() }
 
+// MetricNames returns the sorted unique metric names visible in the head index.
+// Sealed blocks are not scanned; the head registry covers all series that have
+// received at least one sample since the last flush.
+func (s *Store) MetricNames() []string {
+	return s.engine.Registry().LabelValues(model.MetricNameLabel)
+}
+
 func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options) ([]string, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err

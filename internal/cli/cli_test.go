@@ -146,3 +146,39 @@ func TestRunMetricsRateMissingMetric(t *testing.T) {
 		t.Error("expected error when metric name missing")
 	}
 }
+
+func TestRunMetricsList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/metrics" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Write([]byte(`{"metrics":["alpha_total","zeta_total"]}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "list", "--addr", srv.URL}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"alpha_total", "zeta_total"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunMetricsList_Empty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"metrics":[]}`))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if err := Run(context.Background(), []string{"metrics", "list", "--addr", srv.URL}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "no metrics") {
+		t.Errorf("expected '(no metrics)' for empty list, got:\n%s", buf.String())
+	}
+}

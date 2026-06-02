@@ -102,3 +102,76 @@ func TestMetricsRate_StoreDisabledReturns503(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+// TestMetricsList_ReturnsNames seeds two series with different __name__ values
+// and asserts both appear in GET /api/v1/metrics, sorted and deduplicated.
+func TestMetricsList_ReturnsNames(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := time.Now().UnixMilli()
+	for _, name := range []string{"alpha_total", "zeta_total", "alpha_total"} {
+		labels := metricsengine.LabelSet{
+			{Name: metricsengine.MetricNameLabel, Value: name},
+		}
+		if _, err := h.metricStore.AppendBatch([]metricsengine.Sample{
+			{Labels: labels, Type: metricsengine.MetricTypeCounter, Timestamp: now, Value: 1},
+		}); err != nil {
+			t.Fatalf("AppendBatch: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Metrics []string `json:"metrics"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Metrics) != 2 {
+		t.Fatalf("metrics = %v, want [alpha_total zeta_total]", resp.Metrics)
+	}
+	if resp.Metrics[0] != "alpha_total" || resp.Metrics[1] != "zeta_total" {
+		t.Fatalf("metrics order = %v, want sorted", resp.Metrics)
+	}
+}
+
+// TestMetricsList_EmptyStore returns an empty array (not null) when no series
+// have been ingested yet.
+func TestMetricsList_EmptyStore(t *testing.T) {
+	h := setupMetricsHarness(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Metrics []string `json:"metrics"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Metrics == nil {
+		t.Fatalf("metrics is null, want empty array")
+	}
+}
+
+// TestMetricsList_StoreDisabledReturns503 mirrors the rate handler guard.
+func TestMetricsList_StoreDisabledReturns503(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/metrics", NewMetricsListHandler(nil))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
