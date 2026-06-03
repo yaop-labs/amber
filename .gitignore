@@ -5,6 +5,7 @@
 /amber
 /amberctl
 /loadgen
+/loadharness
 *.exe
 *.exe~
 *.dll

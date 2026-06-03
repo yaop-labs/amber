@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	goruntime "runtime"
 	"os/signal"
 	"syscall"
 	"time"
@@ -117,6 +118,9 @@ func run() error {
 		selfobs.RegisterGaugeFunc("amber_metrics_store_head_samples", "Samples held in the in-memory metrics head, not yet flushed.", func() float64 {
 			return float64(stack.MetricStore.BufferedSamples())
 		})
+		selfobs.RegisterGaugeFunc("amber_metrics_active_series", "Total distinct series tracked by the metrics index registry (head + sealed, not yet evicted).", func() float64 {
+			return float64(stack.MetricStore.ActiveSeries())
+		})
 	}
 
 	if cfg.Retention.Logs.Enabled() || cfg.Retention.Spans.Enabled() {
@@ -188,6 +192,16 @@ func run() error {
 	}
 
 	if cfg.Debug.Pprof {
+		// Enable mutex + block profiling when pprof is on. Without these,
+		// the /debug/pprof/mutex and /debug/pprof/block endpoints exist
+		// (via pprof.Index) but always return empty samples. Fractions
+		// chosen to keep overhead negligible: 5 means every 5th mutex
+		// contention event is sampled; block rate=10000 means events
+		// blocking ≥10 µs are captured. Both can be lowered to 1 for a
+		// dedicated profiling run if needed.
+		goruntime.SetMutexProfileFraction(5)
+		goruntime.SetBlockProfileRate(10000)
+
 		pprofAddr := cfg.Debug.PprofAddr
 		if pprofAddr == "" {
 			pprofAddr = "localhost:6060"
