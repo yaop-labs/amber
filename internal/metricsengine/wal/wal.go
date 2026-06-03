@@ -60,6 +60,48 @@ func (w *WAL) AppendBatch(records []Record) error {
 	return w.file.Sync()
 }
 
+// AppendBatchUnsynced writes the records to the WAL file but does NOT call
+// fsync. Caller is responsible for ordering a Sync() before treating any
+// returned write as durable. This split is what enables group commit at the
+// engine level: many concurrent writers can each call AppendBatchUnsynced
+// without serialising on disk fsync, then a single committer goroutine
+// folds all pending bytes into one Sync() call.
+//
+// Threadsafe: still takes the WAL mutex so the file's append cursor stays
+// linear. Without this lock concurrent Write() calls on the same fd would
+// interleave bytes.
+func (w *WAL) AppendBatchUnsynced(records []Record) error {
+	if len(records) == 0 {
+		return nil
+	}
+	var batch []byte
+	for _, record := range records {
+		encoded, err := encodeRecord(record)
+		if err != nil {
+			return err
+		}
+		batch = append(batch, encoded...)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.file.Write(batch); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Sync flushes any pending writes to disk. Paired with AppendBatchUnsynced
+// for group commit: many unsynced writes followed by one Sync.
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	return w.file.Sync()
+}
+
 func encodeRecord(record Record) ([]byte, error) {
 	payload, err := json.Marshal(record)
 	if err != nil {
