@@ -213,6 +213,28 @@ func (r *Registry) LastTouch(id SeriesID) (int64, bool) {
 	return ts, ok
 }
 
+// UpdateLastTouch monotonically advances the last-touch timestamp for a
+// known series. Used by the boot path's reconcile-from-blocks: for every
+// sealed block, the max timestamp of each series sets a floor on its
+// last-touch so a series whose only evidence-of-life is on-disk blocks
+// does NOT get the lastTouch=0 sentinel from a bare Import, which would
+// pin it forever. Out-of-order updates do not regress the value (same
+// semantics as GetOrCreateAt).
+//
+// Returns false if the series id is unknown (the caller is expected to
+// Import first).
+func (r *Registry) UpdateLastTouch(id SeriesID, ts int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.labels[id]; !ok {
+		return false
+	}
+	if ts > r.lastTouch[id] {
+		r.lastTouch[id] = ts
+	}
+	return true
+}
+
 // LabelValues returns the sorted unique values for the given label name across
 // all in-memory series. Used for cheap metric-name enumeration on the read path.
 func (r *Registry) LabelValues(name string) []string {

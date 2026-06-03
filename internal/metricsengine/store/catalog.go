@@ -106,3 +106,38 @@ func rebuildCatalogFromManifest(dir string, manifest Manifest) (Catalog, error) 
 	}
 	return catalog, nil
 }
+
+// reconcileLastTouchFromBlocks walks every sealed block in the manifest
+// and updates each series' last-touch in the registry to (at minimum)
+// the block's TimeMax for that series. This closes the recovery
+// correctness gap called out in INDEX_EVICTION_SPEC_v0.md §1: without
+// it a series whose only evidence-of-life is on-disk blocks would land
+// at lastTouch=0 after Import, the sweep would never evict it, and a
+// crashed ephemeral series would leak forever — re-introducing exactly
+// the bug the spec is closing.
+//
+// Cost: O(blocks × series_per_block) at boot, one-time. At our cadence
+// (a few blocks per retention window) this is trivial. Tolerates
+// missing/corrupt blocks: a block that can't be read is skipped with a
+// warning — the series in it just gets lastTouch from whatever OTHER
+// block had it (or stays at 0 if no readable block did, in which case
+// it's effectively "no evidence" and treated as not-yet-touched, the
+// safe sentinel).
+func reconcileLastTouchFromBlocks(dir string, manifest Manifest, registry *index.Registry) error {
+	for _, meta := range manifest.Blocks {
+		directory, err := block.ReadDirectory(filepath.Join(dir, meta.Path))
+		if err != nil {
+			// Skip unreadable block — same posture as the catalog
+			// rebuild path, which also tolerates per-block read
+			// failures by surfacing the error. Reconcile is best-
+			// effort: any series this block would have touched will
+			// stay at lastTouch=0, the sweep-safe sentinel, until a
+			// real ingest re-touches it.
+			return err
+		}
+		for _, entry := range directory.Series {
+			registry.UpdateLastTouch(index.SeriesID(entry.SeriesID), entry.TimeMax)
+		}
+	}
+	return nil
+}

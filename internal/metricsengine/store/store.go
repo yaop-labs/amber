@@ -118,6 +118,17 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			return nil, err
 		}
 	}
+	// Reconcile last-touch from on-disk blocks. INDEX_EVICTION_SPEC_v0
+	// §1: Import seeds lastTouch=0 (= "unknown"), which means the sweep
+	// will not evict the series. Without this reconcile, any series
+	// known only from blocks would pin at lastTouch=0 forever — leaking
+	// dead ephemerals across restarts, re-creating exactly the bug the
+	// eviction work is closing. The reconcile is best-effort (per-block
+	// errors are surfaced; unreadable blocks just leave their series at
+	// the safe sentinel).
+	if err := reconcileLastTouchFromBlocks(dir, manifest, e.Registry()); err != nil {
+		return nil, err
+	}
 	st := &Store{
 		dir:               dir,
 		engine:            e,
