@@ -88,6 +88,32 @@ func TestSelectorHelpers(t *testing.T) {
 	}
 }
 
+func TestRegistryUpdateLastTouch(t *testing.T) {
+	reg := NewRegistry()
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+	id := reg.GetOrCreateAt(labels, 0) // imported-style: ts=0 sentinel
+
+	// Reconcile path: block-derived UpdateLastTouch advances 0 -> 5000.
+	if !reg.UpdateLastTouch(id, 5000) {
+		t.Fatal("UpdateLastTouch on known id returned false")
+	}
+	if ts, _ := reg.LastTouch(id); ts != 5000 {
+		t.Fatalf("after reconcile: ts=%d want 5000", ts)
+	}
+	// Out-of-order older does not regress.
+	reg.UpdateLastTouch(id, 1000)
+	if ts, _ := reg.LastTouch(id); ts != 5000 {
+		t.Fatalf("after stale UpdateLastTouch: ts=%d want 5000 unchanged", ts)
+	}
+	// Unknown id returns false, no panic on missing labels map entry.
+	if reg.UpdateLastTouch(SeriesID(99999), 100) {
+		t.Fatal("UpdateLastTouch on unknown id returned true")
+	}
+	if ts, ok := reg.LastTouch(SeriesID(99999)); ok || ts != 0 {
+		t.Fatalf("LastTouch on unknown id: ts=%d ok=%v want 0,false", ts, ok)
+	}
+}
+
 func TestRegistryLastTouch(t *testing.T) {
 	reg := NewRegistry()
 	labels := model.LabelSet{{Name: "job", Value: "api"}}

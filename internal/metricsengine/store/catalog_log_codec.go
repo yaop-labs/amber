@@ -1,0 +1,246 @@
+package store
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+
+	"github.com/yaop-labs/amber/internal/metricsengine/model"
+)
+
+// Catalog-log binary record format. INDEX_EVICTION_SPEC_v0.md §2; see
+// catalog_log.go for lifecycle. Self-contained codec — no file or sync
+// concerns live here, so the framing can be unit-tested without disk.
+//
+//	record   = total_len[4] | crc32[4] | type[1] | body[total_len-9]
+//	type=0x01 REGISTER:  series_id[8] | labels_len[4] | labels_blob[labels_len]
+//	type=0x03 EVICT:     series_id[8] | ts_unix_ms[8]
+//
+// CRC covers total_len|type|body (everything except the crc field). The
+// length prefix MUST be CRC-protected: a bit flip in total_len shifts the
+// next-record boundary and either cascades CRC failures or silently
+// validates garbage at the wrong offset. Verify CRC BEFORE trusting the
+// length for the next seek.
+//
+// All integers little-endian, fixed-width. No varint. Labels are encoded
+// as a length-prefixed sequence of (name_len[2]|name|value_len[2]|value)
+// pairs — simple, deterministic, no JSON/proto runtime dependency on the
+// recovery path.
+//
+// TOUCH (type=0x02) is reserved but NOT written by v0: §2 of the spec
+// chose to not log per-ingest touches (avoids steady-state write
+// amplification). Recovery instead reconstructs lastTouch from block
+// data (see store.go reconcileLastTouchFromBlocks). The slot is held so
+// a future coalesced-touch option can be added without a format break.
+
+const (
+	catalogRecordRegister byte = 0x01
+	catalogRecordTouch    byte = 0x02 // reserved, not written by v0
+	catalogRecordEvict    byte = 0x03
+
+	// Header = total_len[4] + crc[4]. Body lives after.
+	catalogHeaderLen = 8
+	// Minimum record = header + type[1]. Any record shorter is malformed.
+	catalogMinRecordLen = catalogHeaderLen + 1
+	// Cap a single record to refuse absurd allocations on corrupt input.
+	catalogMaxRecordLen = 1 << 20 // 1 MiB
+)
+
+var catalogCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+// ErrCatalogLogCorrupt is returned by the reader when a record's CRC does
+// not match its contents. Recovery refuses to proceed past a corrupt
+// record — same posture as the WAL — because silently skipping past
+// corruption is exactly how data losses go undetected.
+var ErrCatalogLogCorrupt = errors.New("catalog log: record CRC mismatch")
+
+// ErrCatalogLogTorn is returned when the reader encounters a partial
+// record at EOF. Recovery treats this as the normal end-of-life shape
+// (last fsync didn't cover the last append) — truncate the file to the
+// last good record boundary and continue.
+var ErrCatalogLogTorn = errors.New("catalog log: torn record at EOF")
+
+type catalogRecord struct {
+	typ      byte
+	seriesID uint64
+	labels   model.LabelSet // REGISTER only
+	ts       int64          // EVICT only
+}
+
+// encodeRegister returns the on-disk bytes for a REGISTER record.
+func encodeRegister(seriesID uint64, labels model.LabelSet) []byte {
+	body := encodeLabels(labels)
+	total := catalogHeaderLen + 1 + 8 + 4 + len(body)
+	out := make([]byte, total)
+	binary.LittleEndian.PutUint32(out[0:4], uint32(total))
+	// crc filled at end
+	out[8] = catalogRecordRegister
+	binary.LittleEndian.PutUint64(out[9:17], seriesID)
+	binary.LittleEndian.PutUint32(out[17:21], uint32(len(body)))
+	copy(out[21:], body)
+	crc := crc32.Checksum(out[0:4], catalogCRCTable)
+	crc = crc32.Update(crc, catalogCRCTable, out[8:])
+	binary.LittleEndian.PutUint32(out[4:8], crc)
+	return out
+}
+
+// encodeEvict returns the on-disk bytes for an EVICT record. ts is the
+// wall-clock at the moment the sweep decided to evict — preserved so an
+// operator inspecting the log can reconstruct an eviction timeline.
+func encodeEvict(seriesID uint64, ts int64) []byte {
+	total := catalogHeaderLen + 1 + 8 + 8
+	out := make([]byte, total)
+	binary.LittleEndian.PutUint32(out[0:4], uint32(total))
+	out[8] = catalogRecordEvict
+	binary.LittleEndian.PutUint64(out[9:17], seriesID)
+	binary.LittleEndian.PutUint64(out[17:25], uint64(ts))
+	crc := crc32.Checksum(out[0:4], catalogCRCTable)
+	crc = crc32.Update(crc, catalogCRCTable, out[8:])
+	binary.LittleEndian.PutUint32(out[4:8], crc)
+	return out
+}
+
+// encodeLabels serialises a LabelSet as a sequence of
+// (name_len[2]|name|value_len[2]|value) pairs. Caller-supplied LabelSet
+// is assumed canonical (sorted, no empty names); we don't re-canonicalise
+// in the codec — that's a hot-path concern handled at registration.
+func encodeLabels(labels model.LabelSet) []byte {
+	size := 0
+	for _, l := range labels {
+		size += 2 + len(l.Name) + 2 + len(l.Value)
+	}
+	out := make([]byte, size)
+	off := 0
+	for _, l := range labels {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(l.Name)))
+		off += 2
+		copy(out[off:off+len(l.Name)], l.Name)
+		off += len(l.Name)
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(l.Value)))
+		off += 2
+		copy(out[off:off+len(l.Value)], l.Value)
+		off += len(l.Value)
+	}
+	return out
+}
+
+func decodeLabels(in []byte) (model.LabelSet, error) {
+	var out model.LabelSet
+	for off := 0; off < len(in); {
+		if off+2 > len(in) {
+			return nil, fmt.Errorf("catalog log: truncated name length at %d", off)
+		}
+		nl := int(binary.LittleEndian.Uint16(in[off : off+2]))
+		off += 2
+		if off+nl > len(in) {
+			return nil, fmt.Errorf("catalog log: truncated name at %d (want %d bytes)", off, nl)
+		}
+		name := string(in[off : off+nl])
+		off += nl
+		if off+2 > len(in) {
+			return nil, fmt.Errorf("catalog log: truncated value length at %d", off)
+		}
+		vl := int(binary.LittleEndian.Uint16(in[off : off+2]))
+		off += 2
+		if off+vl > len(in) {
+			return nil, fmt.Errorf("catalog log: truncated value at %d (want %d bytes)", off, vl)
+		}
+		out = append(out, model.Label{Name: name, Value: string(in[off : off+vl])})
+		off += vl
+	}
+	return out, nil
+}
+
+// readRecord reads the next record from r. Returns:
+//   - (rec, n, nil)               on success; n = bytes consumed.
+//   - (_, 0, io.EOF)               at clean EOF (no record was partially read).
+//   - (_, n, ErrCatalogLogTorn)    when the record header reads but the body
+//                                  is short — n = how many bytes were
+//                                  consumed before the tear; caller should
+//                                  truncate the file to (current_offset - n)
+//                                  + bytes-already-read-cleanly-before-tear.
+//   - (_, _, ErrCatalogLogCorrupt) when CRC fails — caller MUST stop, log
+//                                  the offset, refuse to start unless the
+//                                  operator overrides.
+//   - (_, _, other err)            on lower-level I/O failures.
+func readRecord(r io.Reader) (catalogRecord, int, error) {
+	header := make([]byte, catalogHeaderLen)
+	n, err := io.ReadFull(r, header)
+	if err == io.EOF {
+		return catalogRecord{}, 0, io.EOF
+	}
+	if err == io.ErrUnexpectedEOF {
+		// Less than catalogHeaderLen bytes available — partial header.
+		return catalogRecord{}, n, ErrCatalogLogTorn
+	}
+	if err != nil {
+		return catalogRecord{}, n, err
+	}
+	total := int(binary.LittleEndian.Uint32(header[0:4]))
+	wantCRC := binary.LittleEndian.Uint32(header[4:8])
+	if total < catalogMinRecordLen || total > catalogMaxRecordLen {
+		// Length is structurally impossible. Could be corruption mid-prefix
+		// OR a torn-write that landed garbage in the length field. Either
+		// way, we cannot safely advance the read cursor — surface as
+		// corruption (same posture as a CRC mismatch).
+		return catalogRecord{}, n, fmt.Errorf("%w: invalid record length %d", ErrCatalogLogCorrupt, total)
+	}
+	body := make([]byte, total-catalogHeaderLen)
+	m, err := io.ReadFull(r, body)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// Header parsed but body short = torn write. The header bytes
+		// are NOT trusted yet (CRC unverified) so we cannot definitively
+		// say the prefix was good — but the caller's recovery posture
+		// for both cases is the same: truncate at the start of THIS
+		// record and continue.
+		return catalogRecord{}, n + m, ErrCatalogLogTorn
+	}
+	if err != nil {
+		return catalogRecord{}, n + m, err
+	}
+	gotCRC := crc32.Checksum(header[0:4], catalogCRCTable)
+	gotCRC = crc32.Update(gotCRC, catalogCRCTable, body)
+	if gotCRC != wantCRC {
+		return catalogRecord{}, n + m, fmt.Errorf("%w (offset-relative)", ErrCatalogLogCorrupt)
+	}
+	rec, err := decodeBody(body)
+	if err != nil {
+		return catalogRecord{}, n + m, fmt.Errorf("%w: %v", ErrCatalogLogCorrupt, err)
+	}
+	return rec, n + m, nil
+}
+
+func decodeBody(body []byte) (catalogRecord, error) {
+	if len(body) < 1 {
+		return catalogRecord{}, errors.New("empty body")
+	}
+	switch body[0] {
+	case catalogRecordRegister:
+		if len(body) < 1+8+4 {
+			return catalogRecord{}, errors.New("register body too short")
+		}
+		seriesID := binary.LittleEndian.Uint64(body[1:9])
+		labelsLen := int(binary.LittleEndian.Uint32(body[9:13]))
+		if 13+labelsLen != len(body) {
+			return catalogRecord{}, fmt.Errorf("register labels_len %d mismatches body size %d", labelsLen, len(body)-13)
+		}
+		labels, err := decodeLabels(body[13:])
+		if err != nil {
+			return catalogRecord{}, err
+		}
+		return catalogRecord{typ: catalogRecordRegister, seriesID: seriesID, labels: labels}, nil
+	case catalogRecordEvict:
+		if len(body) != 1+8+8 {
+			return catalogRecord{}, fmt.Errorf("evict body length %d != 17", len(body))
+		}
+		seriesID := binary.LittleEndian.Uint64(body[1:9])
+		ts := int64(binary.LittleEndian.Uint64(body[9:17]))
+		return catalogRecord{typ: catalogRecordEvict, seriesID: seriesID, ts: ts}, nil
+	case catalogRecordTouch:
+		return catalogRecord{}, errors.New("touch record type not implemented in v0")
+	default:
+		return catalogRecord{}, fmt.Errorf("unknown record type 0x%02x", body[0])
+	}
+}
