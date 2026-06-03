@@ -162,6 +162,17 @@ func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	}
 }
 
+// SeriesCount returns the number of distinct series currently tracked in the
+// registry — that is, every series the index has ever seen and not yet
+// evicted. Cheap (single RLock + len). Used by the load harness as the
+// "active series" gauge: under churn, time-sharded eviction should keep
+// this bounded; without eviction it grows unbounded with elapsed time.
+func (r *Registry) SeriesCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.labels)
+}
+
 // LabelValues returns the sorted unique values for the given label name across
 // all in-memory series. Used for cheap metric-name enumeration on the read path.
 func (r *Registry) LabelValues(name string) []string {

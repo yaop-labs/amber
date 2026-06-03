@@ -431,6 +431,14 @@ func (s *Store) MetricNames() []string {
 	return s.engine.Registry().LabelValues(model.MetricNameLabel)
 }
 
+// ActiveSeries returns the total number of distinct series tracked by the
+// index registry. Cheap (single RLock). This is the load-harness churn
+// signal: bounded under churn → time-sharded eviction works; grows
+// unbounded → series accumulate (VM failure mode).
+func (s *Store) ActiveSeries() int {
+	return s.engine.Registry().SeriesCount()
+}
+
 func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options) ([]string, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
