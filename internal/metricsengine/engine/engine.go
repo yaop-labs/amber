@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
 	"github.com/yaop-labs/amber/internal/metricsengine/head"
@@ -14,13 +15,21 @@ import (
 
 type Options struct {
 	WALPath string
+	// WALFlushInterval bounds how often the WAL committer goroutine fsyncs.
+	// Concurrent AppendBatch callers all funnel into this single fsync
+	// (Postgres-style group commit), so under load fsync amortises across
+	// many batches. Default 5ms. Durability bound: a successful
+	// AppendBatch return implies the records were fsync'd at most
+	// WALFlushInterval ago.
+	WALFlushInterval time.Duration
 }
 
 type Engine struct {
-	mu       sync.Mutex
-	registry *index.Registry
-	head     *head.Head
-	wal      *wal.WAL
+	mu        sync.Mutex
+	registry  *index.Registry
+	head      *head.Head
+	wal       *wal.WAL
+	committer *committer
 }
 
 func New() *Engine {
@@ -55,49 +64,72 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 			return nil, err
 		}
 		e.wal = w
+		e.committer = newCommitter(w, opts.WALFlushInterval)
 	}
 	return e, nil
 }
 
 func (e *Engine) Append(labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) (index.SeriesID, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if e.wal != nil {
-		if err := e.wal.Append(wal.Record{
-			Labels:    labels.Canonical(),
-			Type:      typ,
-			Timestamp: timestamp,
-			Value:     value,
-		}); err != nil {
-			return 0, err
-		}
+	// Group-commit path also applies to single-record Append: it's just
+	// AppendBatch with one record. The committer absorbs the overhead.
+	ids, err := e.AppendBatch([]model.Sample{{
+		Labels: labels, Type: typ, Timestamp: timestamp, Value: value,
+	}})
+	if err != nil {
+		return 0, err
 	}
-	return e.head.Append(labels, typ, timestamp, value), nil
+	return ids[0], nil
 }
 
+// AppendBatch is the group-commit ingest hot path. The expensive (and
+// previously serialising) part — WAL fsync — is moved OUT from under the
+// engine mutex into a single background committer that fsyncs a fixed
+// number of times per second regardless of how many writers are calling.
+// Each writer waits on a Cond until the committer's last fsync covers its
+// own seq; up to that point the call holds NO locks except briefly the
+// WAL's own append cursor lock (memcpy-only path, no I/O).
+//
+// In-memory head + registry update is still serialised by e.mu, but the
+// critical section there is microseconds (slice append + map insert),
+// not the previous 5-15ms of disk fsync.
+//
+// Ordering invariant: WAL fsync must complete BEFORE head append, so that
+// a crash between the two cannot leave head with a sample whose WAL
+// record was never fsync'd (replay would silently drop it on restart).
 func (e *Engine) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	ids := make([]index.SeriesID, 0, len(samples))
 	if len(samples) == 0 {
-		return ids, nil
+		return nil, nil
 	}
-	if e.wal != nil {
-		records := make([]wal.Record, 0, len(samples))
-		for _, sample := range samples {
-			records = append(records, wal.Record{
+
+	// 1. Canonicalise labels and build WAL records OUTSIDE any lock. This
+	//    is CPU-bound and embarrassingly parallel.
+	var records []wal.Record
+	if e.committer != nil {
+		records = make([]wal.Record, len(samples))
+		for i, sample := range samples {
+			records[i] = wal.Record{
 				Labels:    sample.Labels.Canonical(),
 				Type:      sample.Type,
 				Timestamp: sample.Timestamp,
 				Value:     sample.Value,
-			})
+			}
 		}
-		if err := e.wal.AppendBatch(records); err != nil {
+	}
+
+	// 2. WAL append + fsync via the group-commit committer. Concurrent
+	//    callers funnel their writes into one shared fsync. e.mu is NOT
+	//    held during this wait, so the head append step below remains
+	//    parallel across goroutines that finished fsync at the same tick.
+	if e.committer != nil {
+		if err := e.committer.Append(records); err != nil {
 			return nil, err
 		}
 	}
+
+	// 3. In-memory state under e.mu — microseconds.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ids := make([]index.SeriesID, 0, len(samples))
 	for _, sample := range samples {
 		ids = append(ids, e.head.Append(sample.Labels, sample.Type, sample.Timestamp, sample.Value))
 	}
@@ -165,6 +197,14 @@ func (e *Engine) Registry() *index.Registry {
 }
 
 func (e *Engine) Close() error {
+	if e.committer != nil {
+		// Drain pending fsyncs first so callers that returned successfully
+		// stay durable after Close. flushAndStop does one final tick before
+		// the goroutine exits.
+		if err := e.committer.flushAndStop(); err != nil {
+			return err
+		}
+	}
 	if e.wal == nil {
 		return nil
 	}
