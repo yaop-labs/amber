@@ -88,6 +88,53 @@ func TestSelectorHelpers(t *testing.T) {
 	}
 }
 
+func TestRegistryLastTouch(t *testing.T) {
+	reg := NewRegistry()
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+
+	// New series via GetOrCreateAt records the timestamp.
+	id := reg.GetOrCreateAt(labels, 100)
+	if ts, ok := reg.LastTouch(id); !ok || ts != 100 {
+		t.Fatalf("after first touch: ts=%d ok=%v, want ts=100 ok=true", ts, ok)
+	}
+
+	// A later touch advances the value.
+	reg.GetOrCreateAt(labels, 200)
+	if ts, _ := reg.LastTouch(id); ts != 200 {
+		t.Fatalf("after later touch: ts=%d, want 200", ts)
+	}
+
+	// An out-of-order older touch does NOT regress the value — last-touch
+	// tracks max-seen, so the sweep can age the series by its newest
+	// activity even when collectors backfill late.
+	reg.GetOrCreateAt(labels, 150)
+	if ts, _ := reg.LastTouch(id); ts != 200 {
+		t.Fatalf("after stale touch: ts=%d, want 200 (no regression)", ts)
+	}
+
+	// Bare GetOrCreate does not touch — preserves the existing value so
+	// non-ingest call sites (tests, future query-path hits) cannot reset
+	// the eviction clock.
+	reg.GetOrCreate(labels)
+	if ts, _ := reg.LastTouch(id); ts != 200 {
+		t.Fatalf("after GetOrCreate (no ts): ts=%d, want 200 unchanged", ts)
+	}
+
+	// Import seeds last-touch=0 = "unknown" sentinel so the sweep will not
+	// evict pre-step-2-catalog-log series until they're either re-touched
+	// by ingest or the append-log recovery replaces this with a real ts.
+	imported := SeriesID(999)
+	reg.Import(imported, model.LabelSet{{Name: "job", Value: "imported"}})
+	if ts, ok := reg.LastTouch(imported); !ok || ts != 0 {
+		t.Fatalf("after Import: ts=%d ok=%v, want ts=0 ok=true", ts, ok)
+	}
+
+	// Unknown id reports (0,false).
+	if ts, ok := reg.LastTouch(SeriesID(424242)); ok || ts != 0 {
+		t.Fatalf("unknown id: ts=%d ok=%v, want ts=0 ok=false", ts, ok)
+	}
+}
+
 func TestSelectorOptimizedOrdersCheapMatchersFirst(t *testing.T) {
 	selector := NewSelector(
 		LabelNotRegexp("pod", "canary-.+"),
