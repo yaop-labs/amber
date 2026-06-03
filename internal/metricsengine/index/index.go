@@ -88,6 +88,11 @@ type Registry struct {
 	byFP     map[uint64][]seriesEntry
 	labels   map[SeriesID]model.LabelSet
 	postings map[labelPair]map[SeriesID]struct{}
+	// lastTouch is the most recent ingest timestamp (Unix ms) per series.
+	// Updated by GetOrCreateAt on every append; read by the eviction sweep
+	// to decide whether a series is cold (now-lastTouch > retention).
+	// INDEX_EVICTION_SPEC_v0.md §1: cold-criterion = last_touch + retention.
+	lastTouch map[SeriesID]int64
 }
 
 type seriesEntry struct {
@@ -102,14 +107,27 @@ type labelPair struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		next:     1,
-		byFP:     make(map[uint64][]seriesEntry),
-		labels:   make(map[SeriesID]model.LabelSet),
-		postings: make(map[labelPair]map[SeriesID]struct{}),
+		next:      1,
+		byFP:      make(map[uint64][]seriesEntry),
+		labels:    make(map[SeriesID]model.LabelSet),
+		postings:  make(map[labelPair]map[SeriesID]struct{}),
+		lastTouch: make(map[SeriesID]int64),
 	}
 }
 
+// GetOrCreate looks up a series by its canonical labels, returning the
+// existing id or assigning a new one. Does NOT update last-touch — callers
+// on the ingest hot path should use GetOrCreateAt with the sample timestamp
+// so the eviction sweep can age the series correctly.
 func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
+	return r.GetOrCreateAt(labels, 0)
+}
+
+// GetOrCreateAt is GetOrCreate plus a last-touch update. ts is the sample's
+// Unix-ms timestamp; pass 0 from non-ingest call sites (the sweep only treats
+// non-zero last-touch as a real touch — see Sweep semantics). On the ingest
+// path head.Append always passes the sample ts so cold-detection works.
+func (r *Registry) GetOrCreateAt(labels model.LabelSet, ts int64) SeriesID {
 	canonical := labels.Canonical()
 	fp := canonical.Fingerprint()
 
@@ -118,6 +136,9 @@ func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
 
 	for _, entry := range r.byFP[fp] {
 		if entry.labels.Equal(canonical) {
+			if ts > r.lastTouch[entry.id] {
+				r.lastTouch[entry.id] = ts
+			}
 			return entry.id
 		}
 	}
@@ -126,6 +147,7 @@ func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
 	r.next++
 	r.byFP[fp] = append(r.byFP[fp], seriesEntry{id: id, labels: canonical})
 	r.labels[id] = canonical
+	r.lastTouch[id] = ts
 	for _, label := range canonical {
 		key := labelPair{name: label.Name, value: label.Value}
 		if r.postings[key] == nil {
@@ -136,6 +158,11 @@ func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
 	return id
 }
 
+// Import re-registers a series at a specific ID. Used by catalog recovery on
+// startup. lastTouch is set to 0 (= unknown) — the recovery path will replace
+// this with the actual last touch once the append-only catalog log (step 2
+// of INDEX_EVICTION_SPEC_v0) is in place; until then the sweep must treat
+// lastTouch=0 as "do not evict" (no real touch observed yet).
 func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	canonical := labels.Canonical()
 	fp := canonical.Fingerprint()
@@ -150,6 +177,7 @@ func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	}
 	r.byFP[fp] = append(r.byFP[fp], seriesEntry{id: id, labels: canonical})
 	r.labels[id] = canonical
+	r.lastTouch[id] = 0
 	for _, label := range canonical {
 		key := labelPair{name: label.Name, value: label.Value}
 		if r.postings[key] == nil {
@@ -171,6 +199,18 @@ func (r *Registry) SeriesCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.labels)
+}
+
+// LastTouch returns the most recent ingest timestamp (Unix ms) for the given
+// series, or (0,false) if the series is unknown. A non-zero return means the
+// series has been touched by at least one GetOrCreateAt with a non-zero ts
+// — this is what the eviction sweep keys on (cold = now-lastTouch>retention,
+// with lastTouch=0 treated as "no real touch yet, do not evict").
+func (r *Registry) LastTouch(id SeriesID) (int64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ts, ok := r.lastTouch[id]
+	return ts, ok
 }
 
 // LabelValues returns the sorted unique values for the given label name across

@@ -30,7 +30,7 @@ func New(registry *index.Registry) *Head {
 }
 
 func (h *Head) Append(labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) index.SeriesID {
-	id := h.registry.GetOrCreate(labels)
+	id := h.registry.GetOrCreateAt(labels, timestamp)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
