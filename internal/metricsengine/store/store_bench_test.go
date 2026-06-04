@@ -1,6 +1,7 @@
 package store
 
 import (
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -9,6 +10,38 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/query"
 )
+
+// measureQueryAllocs runs fn b.N times and reports the per-iteration
+// allocations as custom benchmark metrics (`query_B/op` and `query_allocs/op`).
+// Unlike b.ReportAllocs() — which includes setup that ran before
+// b.ResetTimer because runtime/pprof samples allocations across the whole
+// process — this helper takes a fresh MemStats snapshot AFTER setup finished
+// and a forced GC, so the delta is purely the work done inside fn.
+//
+// Use this helper for any "what does the query path itself allocate" question.
+// Use b.ReportAllocs() for total program allocs including setup. The two will
+// disagree by a lot for benchmarks where setup is much heavier than the
+// measured work (true for every query bench against a pre-built store).
+func measureQueryAllocs(b *testing.B, fn func()) {
+	b.Helper()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fn()
+	}
+	b.StopTimer()
+
+	runtime.ReadMemStats(&after)
+	if b.N > 0 {
+		bytesPerOp := float64(after.TotalAlloc-before.TotalAlloc) / float64(b.N)
+		allocsPerOp := float64(after.Mallocs-before.Mallocs) / float64(b.N)
+		b.ReportMetric(bytesPerOp, "query_B/op")
+		b.ReportMetric(allocsPerOp, "query_allocs/op")
+	}
+}
 
 func BenchmarkStoreAppendBatch(b *testing.B) {
 	st, err := Open(b.TempDir())
@@ -136,6 +169,73 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality(b *testing.B) 
 			b.Fatal("expected rate steps")
 		}
 	}
+}
+
+// BenchmarkRateRangeStepsMultiBlockCleanAllocs is the same workload as
+// BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality but uses
+// measureQueryAllocs to report ONLY the per-query allocations. The standard
+// b.ReportAllocs metric for the original benchmark is inflated by store
+// setup (10k series × 10 samples ingested + flushed twice); this clean
+// variant is what we use to track sync.Pool / arena perf PRs.
+func BenchmarkRateRangeStepsMultiBlockCleanAllocs(b *testing.B) {
+	st := buildBenchStoreBlocks(b, 10_000, 10, 2)
+	rangeSelector := query.RangeSelector{
+		Selector: index.NewSelector(index.MetricName("bench_gauge")),
+		Window:   4 * time.Second,
+	}
+	measureQueryAllocs(b, func() {
+		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(steps) == 0 {
+			b.Fatal("expected rate steps")
+		}
+	})
+}
+
+// BenchmarkRateRangeStepsSmallSelectorCleanAllocs measures the dashboard
+// shape: tight selector (job=target matches ~100 of 10000 series), realistic
+// step count, multi-block store. The hot path is selector evaluation +
+// per-step buffer building, NOT label canonicalisation.
+func BenchmarkRateRangeStepsSmallSelectorCleanAllocs(b *testing.B) {
+	st := buildBenchStoreBlocks(b, 10_000, 10, 2)
+	rangeSelector := query.RangeSelector{
+		Selector: index.NewSelector(
+			index.MetricName("bench_gauge"),
+			index.LabelEqual("job", "target"),
+		),
+		Window: 4 * time.Second,
+	}
+	measureQueryAllocs(b, func() {
+		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(steps) == 0 {
+			b.Fatal("expected rate steps")
+		}
+	})
+}
+
+// BenchmarkRateRangeStepsManyStepsCleanAllocs stresses per-step buffer
+// allocations: 60 steps over the full range instead of the default 5. If
+// pooling rateSample slices pays off, the win will show up here first.
+func BenchmarkRateRangeStepsManyStepsCleanAllocs(b *testing.B) {
+	st := buildBenchStoreBlocks(b, 10_000, 60, 2)
+	rangeSelector := query.RangeSelector{
+		Selector: index.NewSelector(index.MetricName("bench_gauge")),
+		Window:   4 * time.Second,
+	}
+	measureQueryAllocs(b, func() {
+		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 59_000, time.Second, "job")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(steps) == 0 {
+			b.Fatal("expected rate steps")
+		}
+	})
 }
 
 func BenchmarkStoreRateByLabelRangeStepsMultiBlockMaxGapHighCardinality(b *testing.B) {

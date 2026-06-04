@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
@@ -114,25 +115,110 @@ func BenchmarkHistogramQuantileMergePath(b *testing.B) {
 		b.Fatal(err)
 	}
 	sel := index.NewSelector(index.MetricName("lat"))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	
+	for b.Loop() {
 		if _, err := s.HistogramQuantile(sel, 0.99, fullRange()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}		 
+
+func BenchmarkHistogramQuantileDecodeAllBaseline(b *testing.B) {
+	sketches, _ := buildDataset(5, 120, 2000, 11)
+	
+	for b.Loop() {
+		// Naive baseline: materialize all raw points and sort to find the quantile.
+		pts := expandToPoints(sketches)
+		sort.Float64s(pts)
+		idx := max(int(math.Ceil(0.99*float64(len(pts)))) - 1, 0)
+		_ = pts[idx]
+	}
+}
+
+// BenchmarkHistogramWriteBlock measures end-to-end block-write throughput for
+// a realistic batch: 100 series × 60 ticks of exp-histogram each. This is the
+// hot path of POST /v1/metrics for histogram workloads.
+func BenchmarkHistogramWriteBlock(b *testing.B) {
+	const seriesCount, ticks, perTick = 100, 60, 500
+
+	allSketches := make([][]*ExponentialHistogram, seriesCount)
+	for i := range allSketches {
+		allSketches[i], _ = buildDataset(4, ticks, perTick, int64(i+1))
+	}
+
+	b.ReportAllocs()
+	
+	for b.Loop() {
+		b.StopTimer()
+		dir := b.TempDir()
+		s, err := OpenStore(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		series := make([]ExpSeries, seriesCount)
+		for sIdx := range seriesCount {
+			ts := make([]int64, ticks)
+			for t := range ticks {
+				ts[t] = int64(t * 60_000)
+			}
+			series[sIdx] = ExpSeries{
+				ID:         uint64(sIdx + 1),
+				Labels:     lbls("__name__", "rpc_latency", "host", "h"+strconv.Itoa(sIdx)),
+				Timestamps: ts,
+				Sketches:   allSketches[sIdx],
+			}
+		}
+		b.StartTimer()
+		if _, err := s.WriteBlock(series, nil); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkHistogramQuantileDecodeAllBaseline(b *testing.B) {
-	sketches, _ := buildDataset(5, 120, 2000, 11)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// Naive baseline: materialize all raw points and sort to find the quantile.
-		pts := expandToPoints(sketches)
-		sort.Float64s(pts)
-		idx := int(math.Ceil(0.99*float64(len(pts)))) - 1
-		if idx < 0 {
-			idx = 0
+// BenchmarkHistogramQuantileByLabel exercises the per-group merge path used by
+// /api/v1/metrics/quantile?by=. Each group merges sketches across blocks and
+// across series within the group, then evaluates a single quantile.
+func BenchmarkHistogramQuantileByLabel(b *testing.B) {
+	const seriesPerHost, ticks, perTick = 5, 60, 500
+	const hosts = 20
+
+	dir := b.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var series []ExpSeries
+	id := uint64(1)
+	for h := range hosts {
+		for k := range seriesPerHost {
+			sk, _ := buildDataset(4, ticks, perTick, int64(h*100+k))
+			ts := make([]int64, ticks)
+			for t := range ticks {
+				ts[t] = int64(t * 60_000)
+			}
+			series = append(series, ExpSeries{
+				ID:         id,
+				Labels:     lbls("__name__", "rpc_latency", "host", "h"+strconv.Itoa(h), "shard", strconv.Itoa(k)),
+				Timestamps: ts,
+				Sketches:   sk,
+			})
+			id++
 		}
-		_ = pts[idx]
+	}
+	if _, err := s.WriteBlock(series, nil); err != nil {
+		b.Fatal(err)
+	}
+	sel := index.NewSelector(index.MetricName("rpc_latency"))
+
+	b.ReportAllocs()
+	
+	for b.Loop() {
+		out, err := s.HistogramQuantileBy(sel, 0.99, fullRange(), []string{"host"})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(out) != hosts {
+			b.Fatalf("expected %d groups, got %d", hosts, len(out))
+		}
 	}
 }
