@@ -46,6 +46,12 @@ const (
 	catalogMinRecordLen = catalogHeaderLen + 1
 	// Cap a single record to refuse absurd allocations on corrupt input.
 	catalogMaxRecordLen = 1 << 20 // 1 MiB
+
+	// Body layouts (the bytes after the 8-byte header).
+	//   REGISTER body = type[1] | series_id[8] | labels_len[4] | labels_blob
+	//   EVICT    body = type[1] | series_id[8] | ts_unix_ms[8]
+	catalogRegisterHeader = 1 + 8 + 4
+	catalogEvictBody      = 1 + 8 + 8
 )
 
 var catalogCRCTable = crc32.MakeTable(crc32.Castagnoli)
@@ -218,22 +224,27 @@ func decodeBody(body []byte) (catalogRecord, error) {
 	}
 	switch body[0] {
 	case catalogRecordRegister:
-		if len(body) < 1+8+4 {
+		if len(body) < catalogRegisterHeader {
 			return catalogRecord{}, errors.New("register body too short")
 		}
 		seriesID := binary.LittleEndian.Uint64(body[1:9])
 		labelsLen := int(binary.LittleEndian.Uint32(body[9:13]))
-		if 13+labelsLen != len(body) {
-			return catalogRecord{}, fmt.Errorf("register labels_len %d mismatches body size %d", labelsLen, len(body)-13)
+		// labels_len MUST exactly span the remaining bytes: a smaller value
+		// means there are unaccounted-for bytes between the labels blob and
+		// the next record boundary (would silently corrupt the labels read
+		// on the next call); a larger value means the framing claims more
+		// labels-data than was written.
+		if catalogRegisterHeader+labelsLen != len(body) {
+			return catalogRecord{}, fmt.Errorf("register labels_len %d mismatches body size %d", labelsLen, len(body)-catalogRegisterHeader)
 		}
-		labels, err := decodeLabels(body[13:])
+		labels, err := decodeLabels(body[catalogRegisterHeader:])
 		if err != nil {
 			return catalogRecord{}, err
 		}
 		return catalogRecord{typ: catalogRecordRegister, seriesID: seriesID, labels: labels}, nil
 	case catalogRecordEvict:
-		if len(body) != 1+8+8 {
-			return catalogRecord{}, fmt.Errorf("evict body length %d != 17", len(body))
+		if len(body) != catalogEvictBody {
+			return catalogRecord{}, fmt.Errorf("evict body length %d != %d", len(body), catalogEvictBody)
 		}
 		seriesID := binary.LittleEndian.Uint64(body[1:9])
 		ts := int64(binary.LittleEndian.Uint64(body[9:17]))

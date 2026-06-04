@@ -39,6 +39,19 @@ type Store struct {
 	closeErr          error
 	backgroundErrMu   sync.RWMutex
 	backgroundErr     error
+
+	// Catalog log — the append-only persistence path that replaces (or in
+	// 3a.2 lives alongside) the JSON saveCatalog write path. Nil until
+	// the boot path opens it. Writes happen under s.mu inside
+	// ensureCatalog; reads only happen at boot (loadCatalogLogState).
+	catalogLog *catalogLog
+
+	// Eviction sweep — background goroutine, lifecycle owned here.
+	// stopSweep signals the goroutine to exit; sweepDone closes when it
+	// has. Sweep interval and retention come from opts.Retention; if
+	// retention <= 0 the sweep is disabled entirely.
+	stopSweep chan struct{}
+	sweepDone chan struct{}
 }
 
 type Stats struct {
@@ -72,9 +85,37 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	catalog, err := loadCatalog(dir)
+	// Catalog source-of-truth: the append-only log
+	// (INDEX_EVICTION_SPEC_v0 §2). If the log + snapshot reconstruct
+	// non-empty state, that wins. Otherwise fall back to the legacy
+	// JSON catalog (rolled-out store before 3a, or pre-existing
+	// production data). On a brand new store both yield empty and the
+	// block-rebuild branch below populates from blocks.
+	logLive, logHighest, err := loadCatalogLogState(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("catalog log recovery: %w", err)
+	}
+	var catalog Catalog
+	if len(logLive) > 0 {
+		// Build catalog from the log's live set, deterministic by id.
+		ids := make([]uint64, 0, len(logLive))
+		for id := range logLive {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		catalog = Catalog{NextID: logHighest + 1}
+		for _, id := range ids {
+			catalog.Series = append(catalog.Series, CatalogEntry{ID: id, Labels: logLive[id]})
+		}
+		if catalog.NextID == 0 {
+			catalog.NextID = 1
+		}
+	} else {
+		// Fall back to the legacy JSON catalog.
+		catalog, err = loadCatalog(dir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	e, err := engine.OpenWithRegistry(catalog.Registry(), engine.Options{WALPath: filepath.Join(dir, "head.wal")})
 	if err != nil {
@@ -105,6 +146,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			}
 		}
 	}
+	rebuiltFromBlocks := false
 	if len(catalog.Series) == 0 && len(manifest.Blocks) > 0 {
 		catalog, err = rebuildCatalogFromManifest(dir, manifest)
 		if err != nil {
@@ -117,6 +159,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
+		rebuiltFromBlocks = true
 	}
 	// Reconcile last-touch from on-disk blocks. INDEX_EVICTION_SPEC_v0
 	// §1: Import seeds lastTouch=0 (= "unknown"), which means the sweep
@@ -129,6 +172,64 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := reconcileLastTouchFromBlocks(dir, manifest, e.Registry()); err != nil {
 		return nil, err
 	}
+	// Open the append-only catalog log. This is the source of truth for
+	// REGISTER/EVICT events from 3a onward; loadCatalog (JSON) is kept
+	// as a recovery fallback for stores opened by pre-3a binaries
+	// (INDEX_EVICTION_SPEC_v0 §F).
+	catLog, err := openCatalogLog(dir)
+	if err != nil {
+		return nil, err
+	}
+	// If the catalog came from a block-rebuild (= no log yet, no JSON
+	// catalog, but blocks exist), seed the log with one REGISTER per
+	// recovered series so subsequent boots use the log as source of
+	// truth instead of falling back to JSON again. Seeding runs BEFORE
+	// startCommitter so each REGISTER fsyncs synchronously — the seed
+	// must be durable before normal ingest is allowed to start.
+	if rebuiltFromBlocks {
+		for _, entry := range catalog.Series {
+			if err := catLog.AppendRegister(entry.ID, entry.Labels); err != nil {
+				catLog.Close()
+				return nil, fmt.Errorf("seed catalog log from rebuild: %w", err)
+			}
+		}
+	}
+	// Start group-commit on the catalog log. From here on, AppendRegister
+	// and AppendEvict batch fsyncs through the committer goroutine —
+	// fixes the per-REGISTER fsync regression caught by control_3a
+	// (75 vs 96 samples/sec). 5ms flush interval = same default as the
+	// engine's WAL committer. Crash safety relies on
+	// reconcileLastTouchFromBlocks recovering any series whose REGISTER
+	// was lost in the last fsync window — see catalog_log_committer.go
+	// header comment.
+	catLog.startCommitter(5 * time.Millisecond)
+	// Bucketing for the sweep. Granularity = retention / 12 with floor
+	// of 1s — small enough to give bounded held-lock duration per
+	// sweep tick (only one expired bucket at a time), large enough to
+	// keep the bucket-of-id map small.
+	//
+	// LOAD-BEARING INVARIANT (INDEX_EVICTION_SPEC_v0 §1 + hard rule):
+	// the index eviction threshold MUST equal the block retention
+	// threshold. Both derive from the SAME opts.Retention here — that
+	// is the single source of truth. If they ever drift:
+	//   - eviction > retention => block exists, series evicted from
+	//     index => query for that block's labels returns empty
+	//     (data loss surface).
+	//   - eviction < retention => series evicted from index, block
+	//     dropped by retention but the index still holds an entry =>
+	//     impossible by construction (eviction precedes block drop).
+	// The first case is the dangerous one. Don't introduce a separate
+	// EvictionInterval option without enforcing equality with Retention
+	// or auditing the failure mode above; pinned by
+	// TestStoreEvictionBoundaryEqualsBlockRetention.
+	if opts.Retention > 0 {
+		retentionMs := opts.Retention.Milliseconds()
+		gran := retentionMs / 12
+		if gran < 1000 {
+			gran = 1000
+		}
+		e.Registry().SetEvictionBucketing(retentionMs, gran)
+	}
 	st := &Store{
 		dir:               dir,
 		engine:            e,
@@ -138,8 +239,10 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		catalog:           catalog,
 		directoryCache:    make(map[string]block.Directory),
 		allowGlobFallback: allowGlobFallback,
+		catalogLog:        catLog,
 	}
 	st.startBackground()
+	st.startEvictionSweep()
 	return st, nil
 }
 
@@ -228,6 +331,10 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	registered := make([]struct {
+		id     uint64
+		labels model.LabelSet
+	}, 0, len(keys))
 	for _, key := range keys {
 		id := s.catalog.NextID
 		if id == 0 {
@@ -237,8 +344,25 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		labels := newSeries[key]
 		s.catalog.Series = append(s.catalog.Series, CatalogEntry{ID: id, Labels: labels})
 		s.engine.Registry().Import(index.SeriesID(id), labels)
+		registered = append(registered, struct {
+			id     uint64
+			labels model.LabelSet
+		}{id: id, labels: labels})
 	}
-	return saveCatalog(s.dir, s.catalog)
+	// Persist to the append-only catalog log. INDEX_EVICTION_SPEC_v0
+	// §2: REGISTER per new series, O(1) per add. Replaces the legacy
+	// JSON saveCatalog rewrite (which was O(N) per add under s.mu —
+	// the catalog-mutex bottleneck identified in loadtest_v0 §4).
+	// loadCatalog (JSON) is still read at boot as a rollback-safety
+	// fallback for stores that pre-date 3a.
+	if s.catalogLog != nil {
+		for _, r := range registered {
+			if err := s.catalogLog.AppendRegister(r.id, r.labels); err != nil {
+				return fmt.Errorf("catalog log append: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) Flush() (string, error) {
@@ -1921,6 +2045,7 @@ func (s *Store) Close() error {
 			close(s.stopBackground)
 			<-s.backgroundDone
 		}
+		s.stopEvictionSweep()
 		if s.engine.BufferedSeries() > 0 {
 			if _, err := s.Flush(); err != nil && !errors.Is(err, ErrNoSamples) {
 				s.closeErr = err
@@ -1928,6 +2053,11 @@ func (s *Store) Close() error {
 		}
 		if err := s.engine.Close(); err != nil && s.closeErr == nil {
 			s.closeErr = err
+		}
+		if s.catalogLog != nil {
+			if err := s.catalogLog.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
 		}
 	})
 	return s.closeErr

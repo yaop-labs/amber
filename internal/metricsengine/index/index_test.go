@@ -1,6 +1,7 @@
 package index
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
@@ -159,6 +160,107 @@ func TestRegistryLastTouch(t *testing.T) {
 	if ts, ok := reg.LastTouch(SeriesID(424242)); ok || ts != 0 {
 		t.Fatalf("unknown id: ts=%d ok=%v, want ts=0 ok=false", ts, ok)
 	}
+}
+
+func TestRegistrySweepEvictsColdSeries(t *testing.T) {
+	reg := NewRegistry()
+	reg.SetEvictionBucketing(60_000, 5_000) // retention 60s, bucket 5s
+
+	// At t=1000, three series. All touched then.
+	hot := reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "api"}}, 1000)
+	cold1 := reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "worker"}}, 1000)
+	cold2 := reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "scheduler"}}, 1000)
+
+	// At t=70_000, only `hot` was touched again. Sweep at t=70_000 with
+	// retention 60_000 should evict cold1, cold2 (last touched at 1000,
+	// threshold = 70000-60000 = 10000 > 1000) but keep hot.
+	reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "api"}}, 70_000)
+
+	evicted := reg.Sweep(70_000)
+
+	gotEvicted := map[SeriesID]bool{}
+	for _, id := range evicted {
+		gotEvicted[id] = true
+	}
+	if !gotEvicted[cold1] || !gotEvicted[cold2] {
+		t.Fatalf("evicted=%v want cold1=%d cold2=%d", evicted, cold1, cold2)
+	}
+	if gotEvicted[hot] {
+		t.Fatalf("hot series %d was evicted", hot)
+	}
+	if reg.SeriesCount() != 1 {
+		t.Fatalf("SeriesCount=%d want 1", reg.SeriesCount())
+	}
+	// Evicted series must be gone from byFP / postings too — re-registering
+	// should yield a NEW id (not the old one).
+	newID := reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "worker"}}, 70_000)
+	if newID == cold1 {
+		t.Fatalf("re-registered worker got recycled id %d", newID)
+	}
+}
+
+func TestRegistrySweepIgnoresSentinelZero(t *testing.T) {
+	// lastTouch=0 = the Import sentinel. Sweep must NEVER evict these:
+	// they're series whose only evidence-of-life is the catalog log
+	// recovery that hasn't been reconciled to a real timestamp yet
+	// (the block-derived reconcile path).
+	reg := NewRegistry()
+	reg.SetEvictionBucketing(60_000, 5_000)
+
+	imported := SeriesID(42)
+	reg.Import(imported, model.LabelSet{{Name: "job", Value: "imported"}})
+
+	// Even after a long time, sweep must not evict the lastTouch=0 entry.
+	evicted := reg.Sweep(10_000_000)
+	for _, id := range evicted {
+		if id == imported {
+			t.Fatalf("sweep evicted sentinel-0 series %d", id)
+		}
+	}
+	if reg.SeriesCount() != 1 {
+		t.Fatalf("SeriesCount=%d want 1", reg.SeriesCount())
+	}
+}
+
+func TestRegistrySweepBucketingMatchesFullScan(t *testing.T) {
+	// Same series + touches in two registries, one bucketed, one not.
+	// Sweep must evict the same set.
+	mk := func(bucketed bool) *Registry {
+		reg := NewRegistry()
+		if bucketed {
+			reg.SetEvictionBucketing(60_000, 5_000)
+		} else {
+			// Set retention without bucketing — the full-scan path uses
+			// bucketRetention as its threshold.
+			reg.bucketRetention = 60_000
+		}
+		for i := 0; i < 50; i++ {
+			ts := int64(1000 + i*1500) // staggered touches
+			reg.GetOrCreateAt(model.LabelSet{{Name: "id", Value: strconv.Itoa(i)}}, ts)
+		}
+		return reg
+	}
+	bucketed := mk(true)
+	full := mk(false)
+	const now = 80_000
+	bEvicted := toSet(bucketed.Sweep(now))
+	fEvicted := toSet(full.Sweep(now))
+	if len(bEvicted) != len(fEvicted) {
+		t.Fatalf("bucketed evicted=%d full evicted=%d, must match", len(bEvicted), len(fEvicted))
+	}
+	for id := range bEvicted {
+		if !fEvicted[id] {
+			t.Fatalf("bucketed evicted %d that full did not", id)
+		}
+	}
+}
+
+func toSet(ids []SeriesID) map[SeriesID]bool {
+	m := make(map[SeriesID]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m
 }
 
 func TestSelectorOptimizedOrdersCheapMatchersFirst(t *testing.T) {

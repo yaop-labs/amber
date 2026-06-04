@@ -109,20 +109,33 @@ func rebuildCatalogFromManifest(dir string, manifest Manifest) (Catalog, error) 
 
 // reconcileLastTouchFromBlocks walks every sealed block in the manifest
 // and updates each series' last-touch in the registry to (at minimum)
-// the block's TimeMax for that series. This closes the recovery
-// correctness gap called out in INDEX_EVICTION_SPEC_v0.md §1: without
-// it a series whose only evidence-of-life is on-disk blocks would land
-// at lastTouch=0 after Import, the sweep would never evict it, and a
-// crashed ephemeral series would leak forever — re-introducing exactly
-// the bug the spec is closing.
+// the block's TimeMax for that series. Closes two distinct boot-time
+// correctness gaps; both are pinned by tests (see doc.go invariants 3
+// and 5).
+//
+// Gap (a) — sentinel-zero leak. Without this pass, a series whose
+// only evidence-of-life is on-disk blocks would land at lastTouch=0
+// after Import, the sweep would never evict it, and a crashed
+// ephemeral series would leak forever. (INDEX_EVICTION_SPEC_v0 §1.)
+// Pinned by TestReconcileLastTouchFromBlocks.
+//
+// Gap (b) — group-commit safety net for a lost REGISTER. The catalog
+// log uses group commit; a crash in the last <= flushInterval window
+// may drop an in-flight REGISTER. If the dropped record is for a
+// series whose samples already reached a block (independent WAL+block
+// path), the block carries the labels but the catalog log does not.
+// The UpdateLastTouch->GetOrCreateAt fallback below resurrects the
+// series by labels — Import-by-id would fail (id collision with
+// another series the registry allocated post-crash), but
+// GetOrCreateAt(labels) uses labels as the durable identity, which is
+// what matters. Pinned by TestCatalogLogLostRegisterByBlockReconcileAlone.
 //
 // Cost: O(blocks × series_per_block) at boot, one-time. At our cadence
 // (a few blocks per retention window) this is trivial. Tolerates
-// missing/corrupt blocks: a block that can't be read is skipped with a
-// warning — the series in it just gets lastTouch from whatever OTHER
-// block had it (or stays at 0 if no readable block did, in which case
-// it's effectively "no evidence" and treated as not-yet-touched, the
-// safe sentinel).
+// missing/corrupt blocks: a block that can't be read returns an error
+// to the caller — the boot path treats this as fatal because a block
+// listed in the manifest but unreadable is a data-integrity signal
+// worth refusing-to-start over.
 func reconcileLastTouchFromBlocks(dir string, manifest Manifest, registry *index.Registry) error {
 	for _, meta := range manifest.Blocks {
 		directory, err := block.ReadDirectory(filepath.Join(dir, meta.Path))
@@ -136,7 +149,19 @@ func reconcileLastTouchFromBlocks(dir string, manifest Manifest, registry *index
 			return err
 		}
 		for _, entry := range directory.Series {
-			registry.UpdateLastTouch(index.SeriesID(entry.SeriesID), entry.TimeMax)
+			if !registry.UpdateLastTouch(index.SeriesID(entry.SeriesID), entry.TimeMax) {
+				// The series id from this block is not known to the
+				// registry — typically because its REGISTER was lost
+				// in the last fsync window before a crash (catalog
+				// group-commit safety, see catalog_log_committer.go
+				// header). Resurrect by labels: GetOrCreateAt either
+				// finds an existing entry with these labels (allocated
+				// from a different on-disk source, e.g. WAL replay)
+				// and advances its lastTouch, or creates a fresh
+				// entry. Either way the labels are now known to the
+				// registry; subsequent Match calls find them.
+				registry.GetOrCreateAt(entry.Labels, entry.TimeMax)
+			}
 		}
 	}
 	return nil
