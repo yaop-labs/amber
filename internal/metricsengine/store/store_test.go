@@ -117,8 +117,21 @@ func TestStoreRebuildsMissingCatalog(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(dir, catalogFileName)); err != nil {
-		t.Fatal(err)
+	// Remove every catalog persistence file so the reopen has to
+	// rebuild from blocks. As of INDEX_EVICTION_SPEC_v0 §2 the source
+	// of truth is the append-only log (catalog.log + catalog.snapshot);
+	// the legacy JSON catalog (catalogFileName) is kept as a fallback
+	// but is no longer the primary write target. Remove all of them.
+	for _, name := range []string{
+		catalogFileName,
+		catalogLogFileName,
+		catalogLogOldFileName,
+		catalogSnapshotFileName,
+		catalogSnapshotTmpFileName,
+	} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
 	}
 
 	reopened, err := Open(dir)

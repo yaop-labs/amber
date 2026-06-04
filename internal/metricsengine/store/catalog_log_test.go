@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -104,6 +105,56 @@ func TestCatalogLogTornAtEOF(t *testing.T) {
 	st2, _ := os.Stat(logPath)
 	if st2.Size() != st.Size() {
 		t.Fatalf("torn tail not truncated: before=%d after=%d", st.Size(), st2.Size())
+	}
+}
+
+// TestCatalogLogTornTailIsIdempotentAcrossReboots covers the invariant
+// the load-bearing replay path relies on: after a torn-tail recovery
+// truncates and syncs, a SECOND immediate load yields the same state
+// and does no further truncation. Without this property a series of
+// crashes could compound, each chopping a few more records.
+func TestCatalogLogTornTailIsIdempotentAcrossReboots(t *testing.T) {
+	dir := t.TempDir()
+	cl, err := openCatalogLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(1); i <= 5; i++ {
+		mustRegister(t, cl, i, model.LabelSet{{Name: "id", Value: strconv.FormatUint(i, 10)}})
+	}
+	cl.Close()
+
+	// Tear the tail.
+	logPath := filepath.Join(dir, catalogLogFileName)
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{0xff, 0xff, 0x00, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	live1, highest1, err := loadCatalogLogState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizeAfter1, _ := os.Stat(logPath)
+
+	// Second load must yield identical state and the file must not
+	// shrink further — the truncate from the first load was final.
+	live2, highest2, err := loadCatalogLogState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizeAfter2, _ := os.Stat(logPath)
+
+	if len(live1) != len(live2) || highest1 != highest2 {
+		t.Fatalf("second load diverged: live1=%v highest1=%d, live2=%v highest2=%d",
+			live1, highest1, live2, highest2)
+	}
+	if sizeAfter1.Size() != sizeAfter2.Size() {
+		t.Fatalf("file shrunk on second load: %d -> %d", sizeAfter1.Size(), sizeAfter2.Size())
 	}
 }
 
@@ -217,11 +268,11 @@ func TestCatalogLogCrashBetweenSnapshotAndTruncate(t *testing.T) {
 
 	// Simulate a crash AFTER 3a (snapshot rename) but BEFORE 3b (log
 	// rename) — the live log is still in place, the snapshot is new.
-	rotationStop = "post-3a"
-	defer func() { rotationStop = "" }()
+	cl.rotationStop = "post-3a"
 	if err := cl.rotateLog(); !errors.Is(err, errSimulatedCrash) {
 		t.Fatalf("rotation err=%v, want errSimulatedCrash", err)
 	}
+	cl.rotationStop = ""
 	cl.Close()
 
 	// On-disk state: snapshot exists with {1,2}; log still contains
@@ -292,9 +343,9 @@ func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			rotationStop = tc.name
+			cl.rotationStop = tc.name
 			err = cl.rotateLog()
-			rotationStop = ""
+			cl.rotationStop = ""
 			if !errors.Is(err, errSimulatedCrash) {
 				t.Fatalf("rotation err=%v want errSimulatedCrash", err)
 			}

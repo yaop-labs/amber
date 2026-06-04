@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
@@ -88,11 +89,35 @@ type catalogLog struct {
 
 	mu sync.Mutex
 	f  *os.File
+
+	// committer batches fsyncs across concurrent AppendRegister /
+	// AppendEvict callers (Postgres-style group commit). When nil, the
+	// log falls back to per-op fsync (used during boot-time seeding
+	// before the committer is started, and in tests that don't need
+	// the goroutine). See catalog_log_committer.go.
+	committer *catalogCommitter
+
+	// rotationStop is a test-only crash-injection hook scoped to this
+	// catalogLog instance. Production callers leave it empty. When the
+	// background compaction goroutine lands in step 3, a package-global
+	// hook would race with concurrent rotations from real production
+	// code in another test; the per-instance field keeps each test's
+	// crash injection isolated to its own log.
+	//
+	// Valid values match the lifecycle step boundaries: "post-3a",
+	// "post-3b", "post-3c", "post-3d". See rotateLog for what each one
+	// halts after.
+	rotationStop string
 }
 
 // openCatalogLog opens (or creates) the live catalog.log file for append.
 // Called by Store after recovery — at this point all the recovery files
 // have been merged and (if needed) cleaned up.
+//
+// The returned log has NO committer attached. Callers that want
+// group-commit on the ingest hot path must call startCommitter after
+// any boot-time seeding (which uses the synchronous Append path so the
+// seed is durable before normal ingest starts).
 func openCatalogLog(dir string) (*catalogLog, error) {
 	f, err := os.OpenFile(filepath.Join(dir, catalogLogFileName),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -102,22 +127,63 @@ func openCatalogLog(dir string) (*catalogLog, error) {
 	return &catalogLog{dir: dir, f: f}, nil
 }
 
-// AppendRegister writes a REGISTER record and fsyncs. v0 fsyncs per
-// record (no group commit) — at the catalog cadence (registrations only,
-// not per-sample) the fsync cost is dominated by the existing WAL fsync
-// path. If catalog registrations ever become hot enough to want batching,
-// the same group-commit shape as engine.committer can be added here.
+// startCommitter switches AppendRegister/AppendEvict from per-op fsync
+// to group-commit through a background goroutine. Idempotent: a second
+// call is a no-op.
+//
+// flushInterval is the maximum time an AppendRegister waits for its
+// fsync. 5ms is the engine's WAL default; catalog log writes are far
+// rarer than WAL writes (registrations, not samples) so the same value
+// is fine.
+func (c *catalogLog) startCommitter(flushInterval time.Duration) {
+	if c.committer != nil {
+		return
+	}
+	c.committer = newCatalogCommitter(c, flushInterval)
+}
+
+// AppendRegister writes a REGISTER record and fsyncs. Routed through the
+// group-commit committer so concurrent appenders share fsyncs (Postgres-
+// style) — see catalog_log_committer.go. Without group commit the per-
+// REGISTER fsync was 22% off the ingest knee (see loadtest_v0 3a control).
+//
+// Durability: AppendRegister returns only AFTER the record's bytes are
+// fsync'd. A crash before return MAY leave the record absent on disk;
+// the caller treats it as ingest failure. A successful return means the
+// REGISTER is durable.
+//
+// Group-commit safety w.r.t. crash: a batched fsync window <= flush
+// interval. If a crash drops a REGISTER from the catalog log but the
+// series' samples already landed in the WAL/blocks (which they will if
+// the engine's WAL group-commit fsync'd them — independent path),
+// reconcileLastTouchFromBlocks on next boot re-registers the series from
+// the block's directory entry. So a lost REGISTER is NOT a lost series.
+// The coupling holds because the block path's durability is independent
+// of the catalog log's. See TestCatalogLogLostRegisterRecoveredFromBlocks.
 func (c *catalogLog) AppendRegister(seriesID uint64, labels model.LabelSet) error {
-	rec := encodeRegister(seriesID, labels)
-	return c.appendAndSync(rec)
+	if c.committer != nil {
+		return c.committer.Append(encodeRegister(seriesID, labels))
+	}
+	return c.appendAndSync(encodeRegister(seriesID, labels))
 }
 
-// AppendEvict writes an EVICT record and fsyncs.
+// AppendEvict writes an EVICT record and fsyncs. Routed through the
+// group-commit committer (same path as AppendRegister).
+//
+// Crash safety: a lost EVICT means the series stays in the catalog on
+// next boot until the next sweep re-evicts it — idempotent, no data
+// loss. Sweep at that point re-detects it as cold (lastTouch unchanged
+// from the previous run, reconcile-from-blocks gives the same value).
 func (c *catalogLog) AppendEvict(seriesID uint64, ts int64) error {
-	rec := encodeEvict(seriesID, ts)
-	return c.appendAndSync(rec)
+	if c.committer != nil {
+		return c.committer.Append(encodeEvict(seriesID, ts))
+	}
+	return c.appendAndSync(encodeEvict(seriesID, ts))
 }
 
+// appendAndSync is the non-grouped path. Used when the committer isn't
+// running (boot-time seeding from rebuilt manifest happens before the
+// committer starts; flushing the snapshot file uses its own helper).
 func (c *catalogLog) appendAndSync(rec []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -130,8 +196,42 @@ func (c *catalogLog) appendAndSync(rec []byte) error {
 	return nil
 }
 
-// Close flushes and closes the live log.
+// writeUnsynced writes the bytes to the live log without fsync. Called
+// by the committer; the committer's tick() does the fsync.
+func (c *catalogLog) writeUnsynced(rec []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.f == nil {
+		return fmt.Errorf("catalog log: closed")
+	}
+	if _, err := c.f.Write(rec); err != nil {
+		return fmt.Errorf("catalog log: write: %w", err)
+	}
+	return nil
+}
+
+// sync calls fsync on the live log. Used by the committer's tick().
+func (c *catalogLog) sync() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.f == nil {
+		return fmt.Errorf("catalog log: closed")
+	}
+	return c.f.Sync()
+}
+
+// Close drains the committer (if running), then flushes and closes the
+// live log. Idempotent for repeated Close calls.
+//
+// Order matters: the committer's flushAndStop does a final tick which
+// calls c.sync(); that acquires c.mu. So we must NOT hold c.mu while
+// draining the committer. After flushAndStop returns, the goroutine has
+// exited and won't touch c.f anymore.
 func (c *catalogLog) Close() error {
+	if c.committer != nil {
+		c.committer.flushAndStop()
+		c.committer = nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.f == nil {
@@ -184,18 +284,6 @@ func writeSnapshot(dir string, series []liveSeries) error {
 	return syncDir(dir)
 }
 
-// rotationStop is a test-only hook: if set, rotateLog returns
-// errSimulatedCrash after the named step is complete and before the next
-// one begins. Used by catalog_log_test.go to exercise every transition in
-// the lifecycle's crash matrix without killing a process. Production
-// builds leave it nil — the dead branch costs one comparison per
-// rotation, negligible.
-//
-// Valid step names: "post-3a" (snapshot rename done), "post-3b" (log
-// rename done), "post-3c" (new log created), "post-3d" (dir fsynced),
-// "post-3e" (log.old cleanup attempted).
-var rotationStop string
-
 var errSimulatedCrash = errors.New("simulated crash for rotation test")
 
 // rotateLog performs the atomic snapshot-and-log swap (lifecycle step 3).
@@ -224,7 +312,7 @@ func (c *catalogLog) rotateLog() error {
 	if err := os.Rename(snapTmp, snap); err != nil {
 		return fmt.Errorf("catalog log: rename snapshot: %w", err)
 	}
-	if rotationStop == "post-3a" {
+	if c.rotationStop == "post-3a" {
 		return errSimulatedCrash
 	}
 	// 3b: log -> log.old. Crash here: snapshot is new, log.old exists,
@@ -233,7 +321,7 @@ func (c *catalogLog) rotateLog() error {
 	if err := os.Rename(logPath, logOld); err != nil {
 		return fmt.Errorf("catalog log: rename log: %w", err)
 	}
-	if rotationStop == "post-3b" {
+	if c.rotationStop == "post-3b" {
 		return errSimulatedCrash
 	}
 	// 3c: create new empty log + open for append.
@@ -241,7 +329,7 @@ func (c *catalogLog) rotateLog() error {
 	if err != nil {
 		return fmt.Errorf("catalog log: create new log: %w", err)
 	}
-	if rotationStop == "post-3c" {
+	if c.rotationStop == "post-3c" {
 		newF.Close()
 		return errSimulatedCrash
 	}
@@ -267,7 +355,7 @@ func (c *catalogLog) rotateLog() error {
 		_ = old.Close()
 	}
 
-	if rotationStop == "post-3d" {
+	if c.rotationStop == "post-3d" {
 		return errSimulatedCrash
 	}
 
@@ -348,6 +436,15 @@ func loadCatalogLogState(dir string) (live map[uint64]model.LabelSet, highestID 
 // Missing file is not an error (a fresh store has no snapshot or log).
 // Torn write at EOF is handled by truncating the file to the last
 // consistent record boundary.
+//
+// Invariant on goodOffset: it tracks the file position AFTER the last
+// successfully-decoded record. We compute it via Seek(0, SeekCurrent)
+// rather than summing readRecord's `n` return because on a torn-tail
+// case readRecord may have advanced the cursor by a partial header (no
+// `n` returned can describe "what was cleanly consumed before the
+// tear" — only the file's actual current-position can). Truncate(goodOffset)
+// therefore drops exactly the torn bytes and nothing more; the file
+// after recovery contains only complete, CRC-verified records.
 func replayCatalogFile(path string, live map[uint64]model.LabelSet, highestID *uint64) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if os.IsNotExist(err) {
@@ -366,6 +463,10 @@ func replayCatalogFile(path string, live map[uint64]model.LabelSet, highestID *u
 		}
 		if errors.Is(recErr, ErrCatalogLogTorn) {
 			// Truncate at the last good boundary and stop. Tolerated.
+			// After truncate, file size == goodOffset and every record
+			// before that position is intact + CRC-verified — a property
+			// the next boot's recovery relies on (otherwise a second
+			// torn-tail would compound).
 			if err := f.Truncate(goodOffset); err != nil {
 				return fmt.Errorf("truncate torn tail at %d: %w", goodOffset, err)
 			}

@@ -93,6 +93,21 @@ type Registry struct {
 	// to decide whether a series is cold (now-lastTouch > retention).
 	// INDEX_EVICTION_SPEC_v0.md §1: cold-criterion = last_touch + retention.
 	lastTouch map[SeriesID]int64
+
+	// Bucketed timing-wheel for the eviction sweep
+	// (INDEX_EVICTION_SPEC_v0.md §3). Each series is in exactly one
+	// bucket keyed by (last_touch + retention) / bucketGranularity, so
+	// the sweep can iterate only the expired bucket — O(|bucket|) — vs
+	// O(|live|) for a naive full scan. The lab predicted 82× savings at
+	// our churn profile.
+	//
+	// bucketGranularity == 0 disables bucketing (Sweep falls back to a
+	// full scan). The Store sets it via SetEvictionBucketing(retention,
+	// granularity) at boot.
+	bucketGranularity int64
+	bucketRetention   int64
+	buckets           map[int64]map[SeriesID]struct{}
+	bucketOf          map[SeriesID]int64
 }
 
 type seriesEntry struct {
@@ -112,7 +127,84 @@ func NewRegistry() *Registry {
 		labels:    make(map[SeriesID]model.LabelSet),
 		postings:  make(map[labelPair]map[SeriesID]struct{}),
 		lastTouch: make(map[SeriesID]int64),
+		buckets:   make(map[int64]map[SeriesID]struct{}),
+		bucketOf:  make(map[SeriesID]int64),
 	}
+}
+
+// SetEvictionBucketing enables the bucketed timing-wheel for the eviction
+// sweep. retention and granularity are both in milliseconds.
+//
+// Idempotent: calling with the same parameters is a no-op. Calling with
+// different parameters re-buckets every existing series; safe but O(N)
+// and intended only as a boot-time configuration step.
+func (r *Registry) SetEvictionBucketing(retention, granularity int64) {
+	if granularity <= 0 || retention <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bucketRetention == retention && r.bucketGranularity == granularity {
+		return
+	}
+	r.bucketRetention = retention
+	r.bucketGranularity = granularity
+	// Re-bucket every known series. Buckets may already exist from
+	// a previous setting — clear and rebuild.
+	r.buckets = make(map[int64]map[SeriesID]struct{})
+	r.bucketOf = make(map[SeriesID]int64)
+	for id, lt := range r.lastTouch {
+		r.placeInBucketLocked(id, lt)
+	}
+}
+
+// placeInBucketLocked computes the bucket epoch for a given last-touch and
+// inserts the series there. lastTouch=0 means the sentinel — the series is
+// placed in bucket 0 conventionally (the sweep skips bucket 0 explicitly).
+// Caller must hold r.mu (write).
+func (r *Registry) placeInBucketLocked(id SeriesID, lastTouch int64) {
+	if r.bucketGranularity <= 0 {
+		return
+	}
+	var epoch int64
+	if lastTouch > 0 {
+		epoch = (lastTouch + r.bucketRetention) / r.bucketGranularity
+	}
+	if r.buckets[epoch] == nil {
+		r.buckets[epoch] = make(map[SeriesID]struct{})
+	}
+	r.buckets[epoch][id] = struct{}{}
+	r.bucketOf[id] = epoch
+}
+
+// rebucketIfMovedLocked recomputes a series' bucket after lastTouch
+// changed; if the new epoch differs from the current one, moves it. Cheap
+// on the common case (touches within the same bucket window).
+func (r *Registry) rebucketIfMovedLocked(id SeriesID, newLastTouch int64) {
+	if r.bucketGranularity <= 0 {
+		return
+	}
+	newEpoch := int64(0)
+	if newLastTouch > 0 {
+		newEpoch = (newLastTouch + r.bucketRetention) / r.bucketGranularity
+	}
+	oldEpoch, ok := r.bucketOf[id]
+	if ok && oldEpoch == newEpoch {
+		return
+	}
+	if ok {
+		if b := r.buckets[oldEpoch]; b != nil {
+			delete(b, id)
+			if len(b) == 0 {
+				delete(r.buckets, oldEpoch)
+			}
+		}
+	}
+	if r.buckets[newEpoch] == nil {
+		r.buckets[newEpoch] = make(map[SeriesID]struct{})
+	}
+	r.buckets[newEpoch][id] = struct{}{}
+	r.bucketOf[id] = newEpoch
 }
 
 // GetOrCreate looks up a series by its canonical labels, returning the
@@ -127,7 +219,23 @@ func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
 // Unix-ms timestamp; pass 0 from non-ingest call sites (the sweep only treats
 // non-zero last-touch as a real touch — see Sweep semantics). On the ingest
 // path head.Append always passes the sample ts so cold-detection works.
+//
+// Returns (id, created). created==true means this call registered a new
+// series — the caller (Store.ensureCatalog) uses this to decide whether
+// to append a REGISTER record to the catalog log.
 func (r *Registry) GetOrCreateAt(labels model.LabelSet, ts int64) SeriesID {
+	id, _ := r.getOrCreateAtInternal(labels, ts)
+	return id
+}
+
+// GetOrCreateAtReportCreated is GetOrCreateAt that also reports whether
+// a new series was registered. Separate entry point to avoid changing
+// the signature head.Append already calls.
+func (r *Registry) GetOrCreateAtReportCreated(labels model.LabelSet, ts int64) (SeriesID, bool) {
+	return r.getOrCreateAtInternal(labels, ts)
+}
+
+func (r *Registry) getOrCreateAtInternal(labels model.LabelSet, ts int64) (SeriesID, bool) {
 	canonical := labels.Canonical()
 	fp := canonical.Fingerprint()
 
@@ -138,8 +246,9 @@ func (r *Registry) GetOrCreateAt(labels model.LabelSet, ts int64) SeriesID {
 		if entry.labels.Equal(canonical) {
 			if ts > r.lastTouch[entry.id] {
 				r.lastTouch[entry.id] = ts
+				r.rebucketIfMovedLocked(entry.id, ts)
 			}
-			return entry.id
+			return entry.id, false
 		}
 	}
 
@@ -155,7 +264,8 @@ func (r *Registry) GetOrCreateAt(labels model.LabelSet, ts int64) SeriesID {
 		}
 		r.postings[key][id] = struct{}{}
 	}
-	return id
+	r.placeInBucketLocked(id, ts)
+	return id, true
 }
 
 // Import re-registers a series at a specific ID. Used by catalog recovery on
@@ -185,6 +295,7 @@ func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 		}
 		r.postings[key][id] = struct{}{}
 	}
+	r.placeInBucketLocked(id, 0)
 	if id >= r.next {
 		r.next = id + 1
 	}
@@ -231,8 +342,131 @@ func (r *Registry) UpdateLastTouch(id SeriesID, ts int64) bool {
 	}
 	if ts > r.lastTouch[id] {
 		r.lastTouch[id] = ts
+		r.rebucketIfMovedLocked(id, ts)
 	}
 	return true
+}
+
+// Sweep evicts every series whose last-touch is older than now-retention
+// (Unix ms). Series with lastTouch=0 (the Import sentinel) are NEVER
+// evicted by Sweep — the reconcile-from-blocks path is responsible for
+// setting them to a real value, after which the next sweep can evict them
+// if appropriate.
+//
+// When bucketing is enabled (Store.SetEvictionBucketing called at boot),
+// Sweep iterates only the expired buckets — O(|evicted|) — not every
+// series. Bucket granularity sets the worst-case lag between "series is
+// cold" and "sweep evicts it" (a series whose expiry epoch ends partway
+// through a bucket window waits until the bucket's epoch is fully past).
+// This is bounded by `granularity`; the sweep budget is a knob, not a
+// correctness concern.
+//
+// Returns the evicted series IDs. The caller (Store) writes EVICT records
+// to the catalog log AFTER Sweep returns (i.e. after the write lock
+// releases) — log fsync is too slow to hold the registry lock for.
+// Idempotent: a crash between the in-memory eviction and the log write
+// leaves the series gone from in-memory but still alive in the log;
+// recovery re-Imports it, the next sweep re-evicts.
+func (r *Registry) Sweep(now int64) []SeriesID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.bucketGranularity <= 0 {
+		// Fallback to full scan.
+		return r.sweepFullLocked(now, r.bucketRetention)
+	}
+	threshold := now - r.bucketRetention
+	if threshold <= 0 {
+		return nil
+	}
+	// A series in bucket `e` becomes evictable when wall-clock crosses
+	// `e * granularity` (the floor of its expiry timestamp). So at time
+	// `now`, every bucket whose epoch <= now/granularity is expired.
+	expiredEpochCeil := now / r.bucketGranularity
+	var evicted []SeriesID
+	for epoch, bucket := range r.buckets {
+		if epoch == 0 || epoch > expiredEpochCeil {
+			// epoch == 0 = the sentinel bucket for lastTouch=0 series
+			// (Import-without-reconcile, or callers that pass ts=0
+			// explicitly). NEVER evicted by sweep — must be touched
+			// by ingest or reconciled from a block first.
+			continue
+		}
+		for id := range bucket {
+			lt := r.lastTouch[id]
+			if lt == 0 || lt > threshold {
+				// Defensive: the bucket placed the series for an
+				// earlier last_touch, but a touch arrived after the
+				// bucket walk started. With our locking this can't
+				// happen — placement and sweep both hold r.mu — but
+				// the check costs one map lookup and avoids a class
+				// of correctness bugs if the placement logic ever
+				// changes.
+				continue
+			}
+			r.evictLocked(id)
+			evicted = append(evicted, id)
+		}
+	}
+	return evicted
+}
+
+func (r *Registry) sweepFullLocked(now, retention int64) []SeriesID {
+	if retention <= 0 {
+		return nil
+	}
+	threshold := now - retention
+	var evicted []SeriesID
+	for id, lt := range r.lastTouch {
+		if lt == 0 || lt > threshold {
+			continue
+		}
+		r.evictLocked(id)
+		evicted = append(evicted, id)
+	}
+	return evicted
+}
+
+// evictLocked removes a series from all index structures. Caller must
+// hold r.mu (write).
+func (r *Registry) evictLocked(id SeriesID) {
+	labels, ok := r.labels[id]
+	if !ok {
+		return
+	}
+	delete(r.labels, id)
+	delete(r.lastTouch, id)
+	if epoch, ok := r.bucketOf[id]; ok {
+		if b := r.buckets[epoch]; b != nil {
+			delete(b, id)
+			if len(b) == 0 {
+				delete(r.buckets, epoch)
+			}
+		}
+		delete(r.bucketOf, id)
+	}
+	// Remove from byFP.
+	fp := labels.Fingerprint()
+	entries := r.byFP[fp]
+	for i, e := range entries {
+		if e.id == id {
+			r.byFP[fp] = append(entries[:i], entries[i+1:]...)
+			break
+		}
+	}
+	if len(r.byFP[fp]) == 0 {
+		delete(r.byFP, fp)
+	}
+	// Remove from postings.
+	for _, label := range labels {
+		key := labelPair{name: label.Name, value: label.Value}
+		if posting := r.postings[key]; posting != nil {
+			delete(posting, id)
+			if len(posting) == 0 {
+				delete(r.postings, key)
+			}
+		}
+	}
 }
 
 // LabelValues returns the sorted unique values for the given label name across
