@@ -38,7 +38,18 @@ func Snapshot() []Sample {
 	fms := append([]funcMetric(nil), funcMetrics...)
 	regMu.RUnlock()
 
-	var out []Sample
+	capacity := len(fms)
+	for _, cv := range cvs {
+		cv.mu.RLock()
+		capacity += len(cv.children)
+		cv.mu.RUnlock()
+	}
+	for _, hv := range hvs {
+		hv.mu.RLock()
+		capacity += 2 * len(hv.children)
+		hv.mu.RUnlock()
+	}
+	out := make([]Sample, 0, capacity)
 	for _, cv := range cvs {
 		out = appendCounterVec(out, cv)
 	}
