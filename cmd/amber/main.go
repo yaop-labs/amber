@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	goruntime "runtime"
 	"os/signal"
+	goruntime "runtime"
 	"syscall"
 	"time"
 

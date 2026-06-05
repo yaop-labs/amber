@@ -159,30 +159,20 @@ func decodeLabels(in []byte) (model.LabelSet, error) {
 	return out, nil
 }
 
-// readRecord reads the next record from r. Returns:
-//   - (rec, n, nil)               on success; n = bytes consumed.
-//   - (_, 0, io.EOF)               at clean EOF (no record was partially read).
-//   - (_, n, ErrCatalogLogTorn)    when the record header reads but the body
-//                                  is short — n = how many bytes were
-//                                  consumed before the tear; caller should
-//                                  truncate the file to (current_offset - n)
-//                                  + bytes-already-read-cleanly-before-tear.
-//   - (_, _, ErrCatalogLogCorrupt) when CRC fails — caller MUST stop, log
-//                                  the offset, refuse to start unless the
-//                                  operator overrides.
-//   - (_, _, other err)            on lower-level I/O failures.
-func readRecord(r io.Reader) (catalogRecord, int, error) {
+// readRecord reads the next record from r. Torn records are reported without
+// advancing recovery state; callers truncate at the last known-good offset.
+func readRecord(r io.Reader) (catalogRecord, error) {
 	header := make([]byte, catalogHeaderLen)
-	n, err := io.ReadFull(r, header)
+	_, err := io.ReadFull(r, header)
 	if err == io.EOF {
-		return catalogRecord{}, 0, io.EOF
+		return catalogRecord{}, io.EOF
 	}
 	if err == io.ErrUnexpectedEOF {
 		// Less than catalogHeaderLen bytes available — partial header.
-		return catalogRecord{}, n, ErrCatalogLogTorn
+		return catalogRecord{}, ErrCatalogLogTorn
 	}
 	if err != nil {
-		return catalogRecord{}, n, err
+		return catalogRecord{}, err
 	}
 	total := int(binary.LittleEndian.Uint32(header[0:4]))
 	wantCRC := binary.LittleEndian.Uint32(header[4:8])
@@ -191,31 +181,31 @@ func readRecord(r io.Reader) (catalogRecord, int, error) {
 		// OR a torn-write that landed garbage in the length field. Either
 		// way, we cannot safely advance the read cursor — surface as
 		// corruption (same posture as a CRC mismatch).
-		return catalogRecord{}, n, fmt.Errorf("%w: invalid record length %d", ErrCatalogLogCorrupt, total)
+		return catalogRecord{}, fmt.Errorf("%w: invalid record length %d", ErrCatalogLogCorrupt, total)
 	}
 	body := make([]byte, total-catalogHeaderLen)
-	m, err := io.ReadFull(r, body)
+	_, err = io.ReadFull(r, body)
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		// Header parsed but body short = torn write. The header bytes
 		// are NOT trusted yet (CRC unverified) so we cannot definitively
 		// say the prefix was good — but the caller's recovery posture
 		// for both cases is the same: truncate at the start of THIS
 		// record and continue.
-		return catalogRecord{}, n + m, ErrCatalogLogTorn
+		return catalogRecord{}, ErrCatalogLogTorn
 	}
 	if err != nil {
-		return catalogRecord{}, n + m, err
+		return catalogRecord{}, err
 	}
 	gotCRC := crc32.Checksum(header[0:4], catalogCRCTable)
 	gotCRC = crc32.Update(gotCRC, catalogCRCTable, body)
 	if gotCRC != wantCRC {
-		return catalogRecord{}, n + m, fmt.Errorf("%w (offset-relative)", ErrCatalogLogCorrupt)
+		return catalogRecord{}, fmt.Errorf("%w (offset-relative)", ErrCatalogLogCorrupt)
 	}
 	rec, err := decodeBody(body)
 	if err != nil {
-		return catalogRecord{}, n + m, fmt.Errorf("%w: %v", ErrCatalogLogCorrupt, err)
+		return catalogRecord{}, fmt.Errorf("%w: %v", ErrCatalogLogCorrupt, err)
 	}
-	return rec, n + m, nil
+	return rec, nil
 }
 
 func decodeBody(body []byte) (catalogRecord, error) {

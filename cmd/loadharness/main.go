@@ -42,14 +42,18 @@ var (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	flag.Parse()
 	if *flagRate <= 0 || *flagDuration <= 0 || *flagSeries <= 0 || *flagBatch <= 0 {
 		fmt.Fprintln(os.Stderr, "rate, duration, series, batch must all be > 0")
-		os.Exit(2)
+		return 2
 	}
 	if *flagWarmup >= *flagDuration {
 		fmt.Fprintln(os.Stderr, "warmup must be shorter than duration")
-		os.Exit(2)
+		return 2
 	}
 
 	cfg := config{
@@ -70,7 +74,7 @@ func main() {
 	mix, err := parseMix(cfg.MixSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --mix: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -79,7 +83,7 @@ func main() {
 	// Sanity check: amber up?
 	if err := healthCheck(cfg.Addr); err != nil {
 		fmt.Fprintf(os.Stderr, "amber not reachable at %s: %v\nstart amber first (e.g. ./amber config.yaml) and try again.\n", cfg.Addr, err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Printf("→ loadharness\n")
@@ -118,12 +122,13 @@ func main() {
 	if *flagOut == "" {
 		fmt.Println(report.Render())
 	} else {
-		if err := os.WriteFile(*flagOut, []byte(report.Render()), 0o644); err != nil {
+		if err := os.WriteFile(*flagOut, []byte(report.Render()), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		fmt.Printf("report written to %s\n", *flagOut)
 	}
+	return 0
 }
 
 type config struct {

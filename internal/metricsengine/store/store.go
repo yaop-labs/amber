@@ -189,7 +189,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if rebuiltFromBlocks {
 		for _, entry := range catalog.Series {
 			if err := catLog.AppendRegister(entry.ID, entry.Labels); err != nil {
-				catLog.Close()
+				_ = catLog.Close()
 				return nil, fmt.Errorf("seed catalog log from rebuild: %w", err)
 			}
 		}
