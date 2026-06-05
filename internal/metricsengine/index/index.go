@@ -383,7 +383,7 @@ func (r *Registry) Sweep(now int64) []SeriesID {
 	// `e * granularity` (the floor of its expiry timestamp). So at time
 	// `now`, every bucket whose epoch <= now/granularity is expired.
 	expiredEpochCeil := now / r.bucketGranularity
-	var evicted []SeriesID
+	evicted := make([]SeriesID, 0, len(r.lastTouch))
 	for epoch, bucket := range r.buckets {
 		if epoch == 0 || epoch > expiredEpochCeil {
 			// epoch == 0 = the sentinel bucket for lastTouch=0 series
@@ -416,7 +416,7 @@ func (r *Registry) sweepFullLocked(now, retention int64) []SeriesID {
 		return nil
 	}
 	threshold := now - retention
-	var evicted []SeriesID
+	evicted := make([]SeriesID, 0, len(r.lastTouch))
 	for id, lt := range r.lastTouch {
 		if lt == 0 || lt > threshold {
 			continue
