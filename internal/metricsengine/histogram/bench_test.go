@@ -115,22 +115,22 @@ func BenchmarkHistogramQuantileMergePath(b *testing.B) {
 		b.Fatal(err)
 	}
 	sel := index.NewSelector(index.MetricName("lat"))
-	
+
 	for b.Loop() {
 		if _, err := s.HistogramQuantile(sel, 0.99, fullRange()); err != nil {
 			b.Fatal(err)
 		}
 	}
-}		 
+}
 
 func BenchmarkHistogramQuantileDecodeAllBaseline(b *testing.B) {
 	sketches, _ := buildDataset(5, 120, 2000, 11)
-	
+
 	for b.Loop() {
 		// Naive baseline: materialize all raw points and sort to find the quantile.
 		pts := expandToPoints(sketches)
 		sort.Float64s(pts)
-		idx := max(int(math.Ceil(0.99*float64(len(pts)))) - 1, 0)
+		idx := max(int(math.Ceil(0.99*float64(len(pts))))-1, 0)
 		_ = pts[idx]
 	}
 }
@@ -147,7 +147,7 @@ func BenchmarkHistogramWriteBlock(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		b.StopTimer()
 		dir := b.TempDir()
@@ -187,7 +187,7 @@ func BenchmarkHistogramQuantileByLabel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	var series []ExpSeries
+	series := make([]ExpSeries, 0, seriesPerHost*hosts)
 	id := uint64(1)
 	for h := range hosts {
 		for k := range seriesPerHost {
@@ -211,7 +211,7 @@ func BenchmarkHistogramQuantileByLabel(b *testing.B) {
 	sel := index.NewSelector(index.MetricName("rpc_latency"))
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		out, err := s.HistogramQuantileBy(sel, 0.99, fullRange(), []string{"host"})
 		if err != nil {

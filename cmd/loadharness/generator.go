@@ -28,10 +28,10 @@ import (
 // faster than it is. We carefully do NOT do that.
 
 type generator struct {
-	cfg      config
-	mix      *mix
-	catalog  *catalog
-	client   *http.Client
+	cfg       config
+	mix       *mix
+	catalog   *catalog
+	client    *http.Client
 	startWall time.Time
 
 	hist       *latencyHist
@@ -110,6 +110,7 @@ func (g *generator) Run(ctx context.Context) runResult {
 	samplesPerReq := g.cfg.Batch
 
 	var tick uint64
+	// #nosec G404 -- deterministic pseudo-random batches are intentional for repeatable load tests.
 	rng := rand.New(rand.NewPCG(g.cfg.Seed, g.cfg.Seed*1009))
 
 	// Reuse a single Timer instead of allocating one per tick via time.After.
@@ -181,6 +182,7 @@ type workItem struct {
 
 func (g *generator) worker(ctx context.Context, wg *sync.WaitGroup, work <-chan workItem, steady *latencyHist, warmupCutoff time.Time, workerID uint64) {
 	defer wg.Done()
+	// #nosec G404 -- deterministic pseudo-random batches are intentional for repeatable load tests.
 	rng := rand.New(rand.NewPCG(workerID, g.cfg.Seed^workerID))
 	bodyBuf := bytes.NewBuffer(make([]byte, 0, 4096))
 

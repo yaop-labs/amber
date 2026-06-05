@@ -123,9 +123,9 @@ func TestEncodeIntegerValuesDominatesEveryStrategy(t *testing.T) {
 		"random-noise": {
 			-42, 178, -913, 4501, -2, 999_999, -123_456, 7, 8888, -1,
 		},
-		"all-zero": {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-		"single-value":  {42},
-		"two-values":    {1, 1_000_000_000},
+		"all-zero":     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		"single-value": {42},
+		"two-values":   {1, 1_000_000_000},
 		"pathological-mixed": {
 			0, 1_000_000, 0, 1_000_000, 0, 1_000_000, 0, 1_000_000,
 		},

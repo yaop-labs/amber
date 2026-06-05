@@ -34,8 +34,8 @@ type telemetrySample struct {
 	IngestAccepted  float64 // counter sum across all kind labels
 	IngestRejected  float64
 	IngestUnsuppd   float64
-	Mallocs         float64 // counter
-	Frees           float64 // counter
+	Mallocs         float64            // counter
+	Frees           float64            // counter
 	Raw             map[string]float64 // every numeric series the scrape returned
 }
 

@@ -19,8 +19,8 @@ import (
 
 const (
 	// 1 µs to 60 s, exponential. Edges generated lazily on first use.
-	latencyMinNs = 1_000     // 1 µs
-	latencyMaxNs = 60_000_000_000 // 60 s
+	latencyMinNs     = 1_000          // 1 µs
+	latencyMaxNs     = 60_000_000_000 // 60 s
 	bucketsPerDecade = 6
 )
 

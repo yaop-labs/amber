@@ -55,6 +55,7 @@ func newCatalog(totalSeries int, stableFraction float64, seed uint64) *catalog {
 	stableCount := int(float64(totalSeries) * stableFraction)
 	ephemeralCount := totalSeries - stableCount
 
+	// #nosec G404 -- deterministic pseudo-random labels are intentional for repeatable load tests.
 	rng := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15))
 
 	stable := make([]seriesLabels, stableCount)
@@ -77,6 +78,7 @@ func newCatalog(totalSeries int, stableFraction float64, seed uint64) *catalog {
 }
 
 func makeEphemeral(n int, baseSeed, generation uint64) []seriesLabels {
+	// #nosec G404 -- deterministic pseudo-random labels are intentional for repeatable load tests.
 	rng := rand.New(rand.NewPCG(baseSeed^generation, generation))
 	out := make([]seriesLabels, n)
 	for i := range out {
@@ -129,6 +131,7 @@ func (c *catalog) Rotate(fraction float64) {
 	next := make([]seriesLabels, len(cur))
 	copy(next, cur)
 	rotateN := int(float64(len(cur)) * fraction)
+	// #nosec G404 -- deterministic pseudo-random labels are intentional for repeatable load tests.
 	rng := rand.New(rand.NewPCG(c.rotateSeed^gen, gen))
 	// Replace the first rotateN entries with fresh ones. Random selection
 	// (vs first-N) would be more realistic but the dashboard query never

@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -457,7 +456,7 @@ func replayCatalogFile(path string, live map[uint64]model.LabelSet, highestID *u
 
 	var goodOffset int64
 	for {
-		rec, _, recErr := readRecord(f)
+		rec, recErr := readRecord(f)
 		if recErr == io.EOF {
 			break
 		}
@@ -499,16 +498,4 @@ func replayCatalogFile(path string, live map[uint64]model.LabelSet, highestID *u
 		goodOffset = off
 	}
 	return nil
-}
-
-// liveSeriesFromMap builds a deterministic snapshot input from a live
-// map. Sorted by id so the on-disk snapshot is byte-stable for any
-// given live set (useful for tests that hash the snapshot).
-func liveSeriesFromMap(live map[uint64]model.LabelSet) []liveSeries {
-	out := make([]liveSeries, 0, len(live))
-	for id, labels := range live {
-		out = append(out, liveSeries{ID: id, Labels: labels})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
 }

@@ -508,7 +508,7 @@ func TestCatalogLogCodecRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec, _, err := readRecord(bytes.NewReader(tc.enc))
+			rec, err := readRecord(bytes.NewReader(tc.enc))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -534,7 +534,7 @@ func TestCatalogLogCodecCRCDetectsLengthFlip(t *testing.T) {
 	enc := encodeRegister(42, model.LabelSet{{Name: "job", Value: "api"}})
 	// Flip a bit in total_len[0..4].
 	enc[0] ^= 0x10
-	_, _, err := readRecord(bytes.NewReader(enc))
+	_, err := readRecord(bytes.NewReader(enc))
 	if err == nil {
 		t.Fatal("CRC did not catch total_len corruption")
 	}
@@ -549,14 +549,14 @@ func TestCatalogLogCodecCRCDetectsLengthFlip(t *testing.T) {
 func TestCatalogLogCodecPartialHeaderIsTorn(t *testing.T) {
 	enc := encodeRegister(42, model.LabelSet{{Name: "job", Value: "api"}})
 	short := enc[:5] // first 5 bytes of an 8-byte header
-	_, _, err := readRecord(bytes.NewReader(short))
+	_, err := readRecord(bytes.NewReader(short))
 	if !errors.Is(err, ErrCatalogLogTorn) {
 		t.Fatalf("err=%v want ErrCatalogLogTorn", err)
 	}
 }
 
 func TestCatalogLogCodecCleanEOF(t *testing.T) {
-	_, _, err := readRecord(bytes.NewReader(nil))
+	_, err := readRecord(bytes.NewReader(nil))
 	if err != io.EOF {
 		t.Fatalf("err=%v want io.EOF", err)
 	}
