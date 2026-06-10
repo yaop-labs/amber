@@ -14,7 +14,34 @@ import (
 
 const maxRecordSize = 16 << 20
 
+// RecordKind discriminates the binary WAL record types.
+type RecordKind uint8
+
+const (
+	// KindSeries declares id → labels. Written once per series per WAL
+	// generation (between truncates), so samples don't repeat the label set.
+	KindSeries RecordKind = 1
+	// KindSample is one (id, type, timestamp, value) point.
+	KindSample RecordKind = 2
+	// KindLegacySample is produced only by the decoder for records written
+	// by the pre-binary JSON format: a sample carrying its own labels.
+	KindLegacySample RecordKind = 3
+)
+
+// Record is the logical WAL record. Which fields are meaningful depends on
+// Kind: Series uses ID+Labels; Sample uses ID+Type+Timestamp+Value;
+// LegacySample uses Labels+Type+Timestamp+Value.
 type Record struct {
+	Kind      RecordKind
+	ID        uint64
+	Labels    model.LabelSet
+	Type      model.MetricType
+	Timestamp int64
+	Value     int64
+}
+
+// legacyRecord mirrors the retired JSON format for decoding old WAL files.
+type legacyRecord struct {
 	Labels    model.LabelSet   `json:"labels"`
 	Type      model.MetricType `json:"type"`
 	Timestamp int64            `json:"timestamp"`
@@ -94,10 +121,31 @@ func (w *WAL) Sync() error {
 	return w.file.Sync()
 }
 
+// Binary payload layouts (framing — len[4]|crc[4] — is unchanged, so the
+// tolerant replay/repair logic applies to both formats):
+//
+//	series: kind[1] | uvarint id | uvarint nLabels | (uvarint len|name, uvarint len|value)*
+//	sample: kind[1] | uvarint id | type[1] | zigzag-varint ts | zigzag-varint value
+//
+// Legacy JSON payloads start with '{' (0x7B), which no RecordKind uses, so
+// the decoder routes on the first byte and mixed-format files replay fine.
 func encodeRecord(record Record) ([]byte, error) {
-	payload, err := json.Marshal(record)
-	if err != nil {
-		return nil, err
+	var payload []byte
+	switch record.Kind {
+	case KindSeries:
+		payload = appendUvarint([]byte{byte(KindSeries)}, record.ID)
+		payload = appendUvarint(payload, uint64(len(record.Labels)))
+		for _, label := range record.Labels {
+			payload = appendString(payload, label.Name)
+			payload = appendString(payload, label.Value)
+		}
+	case KindSample:
+		payload = appendUvarint([]byte{byte(KindSample)}, record.ID)
+		payload = append(payload, byte(record.Type))
+		payload = appendZigZag(payload, record.Timestamp)
+		payload = appendZigZag(payload, record.Value)
+	default:
+		return nil, errors.New("wal: unknown record kind")
 	}
 	if len(payload) > maxRecordSize {
 		return nil, errors.New("wal: record too large")
@@ -106,6 +154,123 @@ func encodeRecord(record Record) ([]byte, error) {
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
 	return append(header[:], payload...), nil
+}
+
+func decodeRecord(payload []byte) (Record, error) {
+	if len(payload) == 0 {
+		return Record{}, errors.New("wal: empty record payload")
+	}
+	if payload[0] == '{' {
+		var legacy legacyRecord
+		if err := json.Unmarshal(payload, &legacy); err != nil {
+			return Record{}, err
+		}
+		return Record{
+			Kind:      KindLegacySample,
+			Labels:    legacy.Labels,
+			Type:      legacy.Type,
+			Timestamp: legacy.Timestamp,
+			Value:     legacy.Value,
+		}, nil
+	}
+	r := byteReader{buf: payload[1:]}
+	switch RecordKind(payload[0]) {
+	case KindSeries:
+		rec := Record{Kind: KindSeries}
+		rec.ID = r.uvarint()
+		n := r.uvarint()
+		if n > uint64(maxRecordSize) {
+			return Record{}, errors.New("wal: series record label count out of range")
+		}
+		labels := make(model.LabelSet, 0, n)
+		for i := uint64(0); i < n; i++ {
+			labels = append(labels, model.Label{Name: r.str(), Value: r.str()})
+		}
+		rec.Labels = labels
+		if r.err != nil || r.remaining() != 0 {
+			return Record{}, errors.New("wal: malformed series record")
+		}
+		return rec, nil
+	case KindSample:
+		rec := Record{Kind: KindSample}
+		rec.ID = r.uvarint()
+		rec.Type = model.MetricType(r.byte())
+		rec.Timestamp = r.zigzag()
+		rec.Value = r.zigzag()
+		if r.err != nil || r.remaining() != 0 {
+			return Record{}, errors.New("wal: malformed sample record")
+		}
+		return rec, nil
+	default:
+		return Record{}, errors.New("wal: unknown record kind")
+	}
+}
+
+func appendUvarint(buf []byte, v uint64) []byte {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], v)
+	return append(buf, tmp[:n]...)
+}
+
+func appendZigZag(buf []byte, v int64) []byte {
+	return appendUvarint(buf, uint64(v<<1)^uint64(v>>63))
+}
+
+func appendString(buf []byte, s string) []byte {
+	buf = appendUvarint(buf, uint64(len(s)))
+	return append(buf, s...)
+}
+
+type byteReader struct {
+	buf []byte
+	err error
+}
+
+func (r *byteReader) remaining() int { return len(r.buf) }
+
+func (r *byteReader) uvarint() uint64 {
+	if r.err != nil {
+		return 0
+	}
+	v, n := binary.Uvarint(r.buf)
+	if n <= 0 {
+		r.err = errors.New("wal: bad uvarint")
+		return 0
+	}
+	r.buf = r.buf[n:]
+	return v
+}
+
+func (r *byteReader) zigzag() int64 {
+	v := r.uvarint()
+	return int64(v>>1) ^ -int64(v&1)
+}
+
+func (r *byteReader) byte() byte {
+	if r.err != nil {
+		return 0
+	}
+	if len(r.buf) == 0 {
+		r.err = errors.New("wal: short record")
+		return 0
+	}
+	b := r.buf[0]
+	r.buf = r.buf[1:]
+	return b
+}
+
+func (r *byteReader) str() string {
+	n := r.uvarint()
+	if r.err != nil {
+		return ""
+	}
+	if n > uint64(len(r.buf)) {
+		r.err = errors.New("wal: string length out of range")
+		return ""
+	}
+	s := string(r.buf[:n])
+	r.buf = r.buf[n:]
+	return s
 }
 
 func (w *WAL) Truncate() error {
@@ -213,8 +378,8 @@ func replayValid(path string, fn func(Record) error, repair bool) (RecoverStats,
 			corrupt = true
 			break
 		}
-		var record Record
-		if err := json.Unmarshal(payload, &record); err != nil {
+		record, err := decodeRecord(payload)
+		if err != nil {
 			// CRC matched but the payload does not decode: still treat as
 			// corruption rather than failing open — the alternative is a
 			// store that cannot start without manual surgery.

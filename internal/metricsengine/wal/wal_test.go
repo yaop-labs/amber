@@ -2,6 +2,8 @@ package wal
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,13 +17,19 @@ func TestReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Record{
-		Labels:    model.LabelSet{{Name: "job", Value: "api"}},
+	series := Record{
+		Kind:   KindSeries,
+		ID:     7,
+		Labels: model.LabelSet{{Name: "job", Value: "api"}},
+	}
+	sample := Record{
+		Kind:      KindSample,
+		ID:        7,
 		Type:      model.MetricTypeCounter,
 		Timestamp: 1000,
 		Value:     42,
 	}
-	if err := w.Append(want); err != nil {
+	if err := w.AppendBatch([]Record{series, sample}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -35,11 +43,16 @@ func TestReplay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("len(got) = %d, want 1", len(got))
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
 	}
-	if got[0].Value != want.Value || got[0].Timestamp != want.Timestamp {
-		t.Fatalf("got %+v, want %+v", got[0], want)
+	if got[0].Kind != KindSeries || got[0].ID != 7 || len(got[0].Labels) != 1 ||
+		got[0].Labels[0].Name != "job" || got[0].Labels[0].Value != "api" {
+		t.Fatalf("series record = %+v", got[0])
+	}
+	if got[1].Kind != KindSample || got[1].ID != 7 || got[1].Type != model.MetricTypeCounter ||
+		got[1].Timestamp != 1000 || got[1].Value != 42 {
+		t.Fatalf("sample record = %+v", got[1])
 	}
 }
 
@@ -49,7 +62,11 @@ func TestAppendBatchReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AppendBatch([]Record{{Value: 1}, {Value: 2}, {Value: 3}}); err != nil {
+	if err := w.AppendBatch([]Record{
+		{Kind: KindSample, ID: 1, Value: 1},
+		{Kind: KindSample, ID: 1, Value: 2},
+		{Kind: KindSample, ID: 1, Value: 3},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -75,7 +92,7 @@ func appendRecords(t *testing.T, path string, values ...int64) {
 		t.Fatal(err)
 	}
 	for _, v := range values {
-		if err := w.Append(Record{Value: v, Timestamp: v}); err != nil {
+		if err := w.Append(Record{Kind: KindSample, ID: 1, Value: v, Timestamp: v}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -247,7 +264,7 @@ func TestTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Append(Record{Value: 1}); err != nil {
+	if err := w.Append(Record{Kind: KindSample, ID: 1, Value: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Truncate(); err != nil {
@@ -262,5 +279,110 @@ func TestTruncate(t *testing.T) {
 	}
 	if got != 0 {
 		t.Fatalf("replayed %d records after truncate", got)
+	}
+}
+
+// writeLegacyJSONRecord writes a record in the retired JSON format: the
+// binary decoder must keep reading those (mixed files appear right after an
+// upgrade, before the first flush truncates the WAL).
+func writeLegacyJSONRecord(t *testing.T, path string, rec legacyRecord) {
+	t.Helper()
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [8]byte
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(header[:], payload...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplayLegacyJSONRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "head.wal")
+	writeLegacyJSONRecord(t, path, legacyRecord{
+		Labels:    model.LabelSet{{Name: "job", Value: "api"}},
+		Type:      model.MetricTypeGauge,
+		Timestamp: 500,
+		Value:     9,
+	})
+
+	// Binary records appended after the legacy ones (post-upgrade writes).
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendBatch([]Record{
+		{Kind: KindSeries, ID: 3, Labels: model.LabelSet{{Name: "job", Value: "db"}}},
+		{Kind: KindSample, ID: 3, Type: model.MetricTypeCounter, Timestamp: 600, Value: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []Record
+	if err := Replay(path, func(r Record) error {
+		got = append(got, r)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("records = %d, want 3", len(got))
+	}
+	if got[0].Kind != KindLegacySample || got[0].Value != 9 || len(got[0].Labels) != 1 {
+		t.Fatalf("legacy record = %+v", got[0])
+	}
+	if got[1].Kind != KindSeries || got[2].Kind != KindSample {
+		t.Fatalf("binary records = %+v / %+v", got[1], got[2])
+	}
+}
+
+func TestEncodeRejectsUnknownKind(t *testing.T) {
+	w, err := Open(filepath.Join(t.TempDir(), "head.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Append(Record{}); err == nil {
+		t.Fatal("zero-kind record accepted")
+	}
+}
+
+func TestRecordCodecRoundTrip(t *testing.T) {
+	cases := []Record{
+		{Kind: KindSeries, ID: 0, Labels: nil},
+		{Kind: KindSeries, ID: 1 << 60, Labels: model.LabelSet{{Name: "a", Value: ""}, {Name: "b", Value: "ц"}}},
+		{Kind: KindSample, ID: 1, Type: model.MetricTypeGauge, Timestamp: -5, Value: -42},
+		{Kind: KindSample, ID: 1 << 62, Type: model.MetricTypeHistogram, Timestamp: 1 << 50, Value: -(1 << 50)},
+	}
+	for _, want := range cases {
+		framed, err := encodeRecord(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := decodeRecord(framed[8:])
+		if err != nil {
+			t.Fatalf("decode %+v: %v", want, err)
+		}
+		if got.Kind != want.Kind || got.ID != want.ID || got.Type != want.Type ||
+			got.Timestamp != want.Timestamp || got.Value != want.Value || len(got.Labels) != len(want.Labels) {
+			t.Fatalf("round trip: got %+v, want %+v", got, want)
+		}
+		for i := range want.Labels {
+			if got.Labels[i] != want.Labels[i] {
+				t.Fatalf("label %d: got %+v, want %+v", i, got.Labels[i], want.Labels[i])
+			}
+		}
 	}
 }

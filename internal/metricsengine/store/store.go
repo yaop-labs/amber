@@ -343,8 +343,11 @@ func (s *Store) Flush() (string, error) {
 	if err := s.engine.PrepareFlushBlock(path); err != nil {
 		return "", err
 	}
+	// PrepareFlushBlock holds the engine's flush gate; release it on every
+	// error path before CommitFlush, or appends would block forever.
 	dir, err := block.ReadDirectory(path)
 	if err != nil {
+		s.engine.AbortFlush()
 		return "", err
 	}
 	minTime, maxTime, _ := dir.TimeRange()
@@ -356,6 +359,7 @@ func (s *Store) Flush() (string, error) {
 		LabelValues: labelValues(dir),
 	}
 	if err := writeFlushPendingMarker(path, "prepared"); err != nil {
+		s.engine.AbortFlush()
 		return "", err
 	}
 	if err := s.engine.CommitFlush(); err != nil {

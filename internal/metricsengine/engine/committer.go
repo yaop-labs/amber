@@ -46,13 +46,25 @@ func newCommitter(w *wal.WAL, flushInterval time.Duration) *committer {
 // On error, the caller should treat ingest as failed and leave in-memory state
 // unchanged.
 func (c *committer) Append(records []wal.Record) error {
+	seq, err := c.enqueue(records)
+	if err != nil {
+		return err
+	}
+	return c.waitSynced(seq)
+}
+
+// enqueue writes records to the WAL without waiting for the fsync, returning
+// the sequence to pass to waitSynced. Callers that must control file order
+// across goroutines (series-before-sample) serialize their enqueue calls and
+// wait outside the serializing lock, preserving group commit.
+func (c *committer) enqueue(records []wal.Record) (uint64, error) {
 	if len(records) == 0 {
-		return nil
+		return 0, nil
 	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return errCommitterClosed
+		return 0, errCommitterClosed
 	}
 	c.nextSeq++
 	mySeq := c.nextSeq
@@ -66,14 +78,24 @@ func (c *committer) Append(records []wal.Record) error {
 			c.lastWrittenSeq = mySeq
 		}
 		c.mu.Unlock()
-		return err
+		return 0, err
 	}
 
 	c.mu.Lock()
 	if mySeq > c.lastWrittenSeq {
 		c.lastWrittenSeq = mySeq
 	}
-	for c.syncedSeq.Load() < mySeq {
+	c.mu.Unlock()
+	return mySeq, nil
+}
+
+// waitSynced blocks until the given sequence is covered by a completed fsync.
+func (c *committer) waitSynced(seq uint64) error {
+	if seq == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	for c.syncedSeq.Load() < seq {
 		if c.closed {
 			c.mu.Unlock()
 			return errCommitterClosed
