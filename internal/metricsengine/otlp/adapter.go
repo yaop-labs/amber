@@ -42,11 +42,38 @@ type Batch struct {
 	Points             []Point
 }
 
+// maxScaledFloat is float64(math.MaxInt64) == 2^63: the magnitude at which a
+// scaled float no longer fits the int64 value model.
+const maxScaledFloat = float64(math.MaxInt64)
+
+// scaledFloatValue converts a float to the int64 value model as
+// round(value*scale). ok is false for NaN, ±Inf, and values whose scaled
+// form overflows int64 — storing those would produce garbage samples.
+func scaledFloatValue(value float64, scale int64) (int64, bool) {
+	scaled := math.Round(value * float64(scale))
+	if math.IsNaN(scaled) || scaled >= maxScaledFloat || scaled <= -maxScaledFloat {
+		return 0, false
+	}
+	return int64(scaled), true
+}
+
+// Samples converts a batch to storage samples. Float points that cannot be
+// represented in the int64 value model (NaN — OTLP uses it as a staleness
+// marker — ±Inf, and overflow at the point's scale) are skipped, not stored
+// as garbage. Use SamplesSkipped to observe how many were dropped.
 func Samples(batch Batch) ([]model.Sample, error) {
+	samples, _, err := SamplesSkipped(batch)
+	return samples, err
+}
+
+// SamplesSkipped is Samples plus the count of float points that were dropped
+// because their value cannot be encoded (NaN, ±Inf, int64 overflow).
+func SamplesSkipped(batch Batch) ([]model.Sample, int, error) {
 	samples := make([]model.Sample, 0, len(batch.Points))
+	skipped := 0
 	for _, point := range batch.Points {
 		if point.Name == "" {
-			return nil, errors.New("otlp: metric name is required")
+			return nil, 0, errors.New("otlp: metric name is required")
 		}
 		value := point.IntValue
 		if point.NumberKind == NumberFloat {
@@ -55,11 +82,16 @@ func Samples(batch Batch) ([]model.Sample, error) {
 				scale = 1000
 			}
 			if scale < 0 {
-				return nil, fmt.Errorf("otlp: scale for %q must be positive", point.Name)
+				return nil, 0, fmt.Errorf("otlp: scale for %q must be positive", point.Name)
 			}
-			value = int64(math.Round(point.FloatValue * float64(scale)))
+			v, ok := scaledFloatValue(point.FloatValue, scale)
+			if !ok {
+				skipped++
+				continue
+			}
+			value = v
 		} else if point.NumberKind != NumberInt {
-			return nil, fmt.Errorf("otlp: unsupported number kind for %q", point.Name)
+			return nil, 0, fmt.Errorf("otlp: unsupported number kind for %q", point.Name)
 		}
 		samples = append(samples, model.Sample{
 			Labels:    labelsForPoint(batch, point),
@@ -68,7 +100,7 @@ func Samples(batch Batch) ([]model.Sample, error) {
 			Value:     value,
 		})
 	}
-	return samples, nil
+	return samples, skipped, nil
 }
 
 func labelsForPoint(batch Batch, point Point) model.LabelSet {

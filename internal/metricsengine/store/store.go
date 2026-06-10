@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
 	"github.com/yaop-labs/amber/internal/metricsengine/engine"
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
@@ -47,6 +48,10 @@ type Store struct {
 	// stopSweep and sweepDone own the eviction sweep lifecycle.
 	stopSweep chan struct{}
 	sweepDone chan struct{}
+
+	// dirLock guards dir against a second store instance (this process or
+	// another) writing the same WAL/blocks/manifest.
+	dirLock *fslock.Lock
 }
 
 type Stats struct {
@@ -80,6 +85,16 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	dirLock, err := fslock.Acquire(dir)
+	if err != nil {
+		return nil, fmt.Errorf("store: dir %s already in use? %w", dir, err)
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = dirLock.Release()
+		}
+	}()
 	// Prefer the append-only catalog log. Fall back to the legacy JSON catalog
 	// when opening an older store or an empty log.
 	logLive, logHighest, err := loadCatalogLogState(dir)
@@ -190,9 +205,11 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		directoryCache:    make(map[string]block.Directory),
 		allowGlobFallback: allowGlobFallback,
 		catalogLog:        catLog,
+		dirLock:           dirLock,
 	}
 	st.startBackground()
 	st.startEvictionSweep()
+	opened = true
 	return st, nil
 }
 
@@ -504,6 +521,12 @@ func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 	return deleted, nil
 }
 
+// Compact merges all blocks into one. When Retention is configured, samples
+// older than the retention cutoff are dropped during the merge: retention
+// otherwise only deletes whole blocks (DeleteBefore), and a continuously
+// re-compacted block always carries a fresh MaxTime, so without this drop
+// expired data would survive every retention pass and disk usage would grow
+// without bound.
 func (s *Store) Compact() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -516,6 +539,13 @@ func (s *Store) Compact() (string, error) {
 		return "", ErrNoSamples
 	}
 
+	var cutoff int64
+	hasCutoff := false
+	if s.opts.Retention > 0 {
+		cutoff = s.clock().Add(-s.opts.Retention).UnixMilli()
+		hasCutoff = true
+	}
+
 	grouped := make(map[string]block.Series)
 	for _, path := range paths {
 		decoded, err := block.ReadFile(path)
@@ -523,6 +553,13 @@ func (s *Store) Compact() (string, error) {
 			return "", err
 		}
 		for _, series := range decoded {
+			timestamps, values := series.Timestamps, series.Values
+			if hasCutoff {
+				timestamps, values = dropExpiredSamples(timestamps, values, cutoff)
+				if len(timestamps) == 0 {
+					continue
+				}
+			}
 			key := series.Entry.Labels.Key()
 			current := grouped[key]
 			if current.ID == 0 {
@@ -530,8 +567,8 @@ func (s *Store) Compact() (string, error) {
 				current.Type = series.Entry.Type
 				current.Labels = series.Entry.Labels
 			}
-			current.Timestamps = append(current.Timestamps, series.Timestamps...)
-			current.Values = append(current.Values, series.Values...)
+			current.Timestamps = append(current.Timestamps, timestamps...)
+			current.Values = append(current.Values, values...)
 			grouped[key] = current
 		}
 	}
@@ -540,6 +577,21 @@ func (s *Store) Compact() (string, error) {
 	for _, series := range grouped {
 		merged = append(merged, compactSeriesSamples(series))
 	}
+
+	// Everything expired: delete the old blocks without writing a new one.
+	if len(merged) == 0 {
+		oldBlocks := append([]BlockMeta(nil), s.manifest.Blocks...)
+		s.manifest.Blocks = nil
+		if err := saveManifest(s.dir, s.manifest); err != nil {
+			return "", err
+		}
+		for _, meta := range oldBlocks {
+			_ = os.Remove(filepath.Join(s.dir, meta.Path))
+		}
+		s.directoryCache = make(map[string]block.Directory)
+		return "", nil
+	}
+
 	path := s.nextBlockPathWithPrefix("compact")
 	if err := block.WriteFile(path, merged); err != nil {
 		return "", err
@@ -1207,6 +1259,29 @@ func validateLabels(labels model.LabelSet, opts Options) error {
 		}
 	}
 	return nil
+}
+
+// dropExpiredSamples returns the samples at or after cutoffMillis. Block
+// samples are stored sorted by timestamp, so this is a binary search plus a
+// subslice; unsorted input (not produced by WriteFile) still works because
+// the slow path filters element-wise.
+func dropExpiredSamples(timestamps []int64, values []int64, cutoffMillis int64) ([]int64, []int64) {
+	if len(timestamps) == 0 || len(timestamps) != len(values) {
+		return timestamps, values
+	}
+	if sort.SliceIsSorted(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] }) {
+		i := sort.Search(len(timestamps), func(i int) bool { return timestamps[i] >= cutoffMillis })
+		return timestamps[i:], values[i:]
+	}
+	keptTS := make([]int64, 0, len(timestamps))
+	keptVals := make([]int64, 0, len(values))
+	for i, ts := range timestamps {
+		if ts >= cutoffMillis {
+			keptTS = append(keptTS, ts)
+			keptVals = append(keptVals, values[i])
+		}
+	}
+	return keptTS, keptVals
 }
 
 type compactSample struct {
@@ -2101,6 +2176,9 @@ func (s *Store) Close() error {
 			if err := s.catalogLog.Close(); err != nil && s.closeErr == nil {
 				s.closeErr = err
 			}
+		}
+		if err := s.dirLock.Release(); err != nil && s.closeErr == nil {
+			s.closeErr = err
 		}
 	})
 	return s.closeErr

@@ -1405,6 +1405,8 @@ func TestStoreRecoversPreparedFlushWithoutManifest(t *testing.T) {
 	if err := st.engine.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Simulated crash: release the dir lock the way process death would.
+	st.dirLock.Release()
 
 	recovered, err := Open(dir)
 	if err != nil {
@@ -1453,6 +1455,8 @@ func TestStoreRecoversCommittedPendingFlushWithoutManifest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Simulated crash: release the dir lock the way process death would.
+	st.dirLock.Release()
 
 	recovered, err := Open(dir)
 	if err != nil {
@@ -1914,5 +1918,212 @@ func TestStoreCompactDeduplicatesOverlappingSamples(t *testing.T) {
 	}
 	if len(series[0].Values) != 2 || series[0].Timestamps[0] != 0 || series[0].Values[0] != 2 || series[0].Timestamps[1] != 1000 || series[0].Values[1] != 3 {
 		t.Fatalf("series = %+v, want duplicate timestamp to keep latest value", series[0])
+	}
+}
+
+// Regression test: a torn write at the tail of head.wal (crash mid-append)
+// must not make the store unopenable. The valid prefix is recovered, the
+// corrupt tail is truncated, and ingest continues.
+func TestStoreOpensAfterTornWALTail(t *testing.T) {
+	dir := t.TempDir()
+
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+	if _, err := st.Append(labels, model.MetricTypeCounter, 1000, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(labels, model.MetricTypeCounter, 2000, 20); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate crash: no store Close, no Flush — samples live only in the
+	// WAL. Engine/catalog committers are stopped directly so their file
+	// handles do not interfere with the corruption below, and the dir lock
+	// is released the way the kernel would on process death.
+	st.engine.Close()
+	st.catalogLog.Close()
+	st.dirLock.Release()
+
+	// Torn write: partial record at the tail.
+	walPath := filepath.Join(dir, "head.wal")
+	f, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{0xFF, 0x00, 0x00, 0x00, 0xAA, 0xBB}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("store must open after torn WAL tail, got: %v", err)
+	}
+	defer st2.Close()
+
+	if got := st2.BufferedSamples(); got != 2 {
+		t.Errorf("BufferedSamples = %d, want 2 (valid prefix recovered)", got)
+	}
+	// Ingest must keep working after recovery.
+	if _, err := st2.Append(labels, model.MetricTypeCounter, 3000, 30); err != nil {
+		t.Fatalf("append after recovery: %v", err)
+	}
+}
+
+// Compaction must enforce retention on the sample level. Without this, the
+// continuously re-compacted block always carries a fresh MaxTime, whole-block
+// retention (DeleteBefore) never fires, and expired data accumulates forever.
+func TestCompactDropsExpiredSamples(t *testing.T) {
+	now := time.UnixMilli(10_000_000)
+	st, err := OpenWithOptions(t.TempDir(), Options{
+		Retention: time.Hour,
+		Clock:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+	cutoff := now.Add(-time.Hour).UnixMilli()
+	oldTS := cutoff - 60_000
+	freshTS := cutoff + 60_000
+
+	// Block 1: expired samples only.
+	if _, err := st.Append(labels, model.MetricTypeCounter, oldTS, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Block 2: one expired, one fresh sample.
+	if _, err := st.Append(labels, model.MetricTypeCounter, oldTS+1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(labels, model.MetricTypeCounter, freshTS, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	series, err := st.Select(index.NewSelector(index.LabelEqual("job", "api")), query.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 {
+		t.Fatalf("len(series) = %d, want 1", len(series))
+	}
+	if got := len(series[0].Timestamps); got != 1 {
+		t.Fatalf("samples after compact = %d (%v), want 1 fresh sample", got, series[0].Timestamps)
+	}
+	if series[0].Timestamps[0] != freshTS || series[0].Values[0] != 3 {
+		t.Errorf("surviving sample = (%d, %d), want (%d, 3)",
+			series[0].Timestamps[0], series[0].Values[0], freshTS)
+	}
+}
+
+// When every sample is expired, Compact must delete the old blocks without
+// writing a new one.
+func TestCompactAllExpiredRemovesBlocks(t *testing.T) {
+	now := time.UnixMilli(10_000_000)
+	st, err := OpenWithOptions(t.TempDir(), Options{
+		Retention: time.Hour,
+		Clock:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+	oldTS := now.Add(-2 * time.Hour).UnixMilli()
+
+	for i := range 2 {
+		if _, err := st.Append(labels, model.MetricTypeCounter, oldTS+int64(i), int64(i)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	path, err := st.Compact()
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if path != "" {
+		t.Errorf("Compact wrote block %q for fully-expired data", path)
+	}
+	blocks, err := st.Blocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 0 {
+		t.Errorf("blocks after all-expired compact = %v, want none", blocks)
+	}
+}
+
+// Without retention configured, Compact must keep every sample (previous
+// behavior).
+func TestCompactWithoutRetentionKeepsEverything(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+	for i := range 2 {
+		if _, err := st.Append(labels, model.MetricTypeCounter, int64(i)*1000, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	series, err := st.Select(index.NewSelector(index.LabelEqual("job", "api")), query.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || len(series[0].Timestamps) != 2 {
+		t.Fatalf("expected 1 series with 2 samples, got %+v", series)
+	}
+}
+
+// Two stores must never share a directory: the second Open fails fast
+// instead of silently corrupting the WAL and manifest.
+func TestStoreRejectsSecondOpenSameDir(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if _, err := Open(dir); err == nil {
+		t.Fatal("second Open on the same dir must fail while the first store is open")
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after Close: %v", err)
+	}
+	if err := st2.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

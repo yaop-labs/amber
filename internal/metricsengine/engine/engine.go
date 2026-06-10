@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -25,6 +26,10 @@ type Engine struct {
 	head      *head.Head
 	wal       *wal.WAL
 	committer *committer
+
+	// walRecovery captures what RecoverReplay found at open time. A non-zero
+	// TruncatedBytes means a corrupt or torn WAL tail was dropped.
+	walRecovery wal.RecoverStats
 }
 
 func New() *Engine {
@@ -48,12 +53,18 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 		head:     head.New(registry),
 	}
 	if opts.WALPath != "" {
-		if err := wal.Replay(opts.WALPath, func(record wal.Record) error {
+		// RecoverReplay tolerates a corrupt or torn tail (crash mid-write):
+		// it replays the valid prefix and truncates the garbage in place so
+		// the WAL stays appendable and replayable. A hard error here would
+		// make the store unopenable after any torn write.
+		stats, err := wal.RecoverReplay(opts.WALPath, func(record wal.Record) error {
 			e.head.Append(record.Labels, record.Type, record.Timestamp, record.Value)
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, err
 		}
+		e.walRecovery = stats
 		w, err := wal.Open(opts.WALPath)
 		if err != nil {
 			return nil, err
@@ -110,12 +121,26 @@ func (e *Engine) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 	return ids, nil
 }
 
+// maxScaledFloat is float64(math.MaxInt64) == 2^63. Scaled values at or
+// beyond this magnitude cannot be represented in the int64 value model.
+const maxScaledFloat = float64(math.MaxInt64)
+
+// AppendScaledFloat stores a float64 as round(value*scale) in the int64
+// value model. Values smaller than 1/scale collapse to 0; NaN, ±Inf, and
+// values whose scaled form overflows int64 are rejected instead of being
+// stored as garbage.
 func (e *Engine) AppendScaledFloat(labels model.LabelSet, typ model.MetricType, timestamp int64, value float64, scale int64) (index.SeriesID, error) {
 	if scale <= 0 {
 		return 0, errors.New("engine: scale must be positive")
 	}
-	scaled := int64(math.Round(value * float64(scale)))
-	return e.Append(labels, typ, timestamp, scaled)
+	scaled := math.Round(value * float64(scale))
+	if math.IsNaN(scaled) {
+		return 0, errors.New("engine: cannot store NaN value")
+	}
+	if scaled >= maxScaledFloat || scaled <= -maxScaledFloat {
+		return 0, fmt.Errorf("engine: value %v at scale %d overflows int64", value, scale)
+	}
+	return e.Append(labels, typ, timestamp, int64(scaled))
 }
 
 func (e *Engine) FlushBlock(path string) error {
@@ -168,6 +193,13 @@ func (e *Engine) Snapshot() []block.Series {
 
 func (e *Engine) Registry() *index.Registry {
 	return e.registry
+}
+
+// WALRecoveryStats reports what the open-time WAL replay found. A non-zero
+// TruncatedBytes means a corrupt or torn tail was dropped — worth surfacing
+// as a metric or log line by the embedding layer.
+func (e *Engine) WALRecoveryStats() wal.RecoverStats {
+	return e.walRecovery
 }
 
 func (e *Engine) Close() error {

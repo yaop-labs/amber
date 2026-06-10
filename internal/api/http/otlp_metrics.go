@@ -116,21 +116,29 @@ func (h *OTLPHandler) ingestScalar(metric *metricspb.Metric, resourceAttrs, scop
 		ScopeAttributes:    scopeAttrs,
 		Points:             addPoints,
 	}
-	samples, err := metricsengine.OTLPSamples(batch)
+	samples, skipped, err := metricsengine.OTLPSamplesSkipped(batch)
 	if err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("conversion").Add(uint64(len(addPoints)))
 		h.log.Warn("otlp metric sample conversion failed", "metric", metric.Name, "err", err)
 		return 0, len(addPoints)
+	}
+	if skipped > 0 {
+		// NaN/±Inf/int64-overflow float points: unencodable in the int64
+		// value model, dropped by the adapter instead of stored as garbage.
+		selfobs.MetricsIngestRejected.WithLabelValues("value_unencodable").Add(uint64(skipped))
+	}
+	if len(samples) == 0 {
+		return 0, skipped
 	}
 	if _, err := h.metricStore.AppendBatch(samples); err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("append").Add(uint64(len(samples)))
 		if !errors.Is(err, metricsengine.ErrNoSamples) {
 			h.log.Warn("otlp metric append failed", "metric", metric.Name, "err", err)
 		}
-		return 0, len(samples)
+		return 0, len(samples) + skipped
 	}
 	selfobs.MetricsIngestAccepted.WithLabelValues(kind.label).Add(uint64(len(samples)))
-	return len(samples), 0
+	return len(samples), skipped
 }
 
 // expSeriesFor converts one OTLP ExponentialHistogram metric into adapter

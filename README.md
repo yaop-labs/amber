@@ -213,6 +213,23 @@ curl "http://localhost:8080/api/v1/admin/segments" \
 - sparse index size
 - heap usage snapshot
 
+## Metrics value model (alpha)
+
+The embedded metrics engine stores every sample as an **int64**. OTLP float
+points are converted to `round(value × scale)`:
+
+- the default scale is **1000** (three decimal digits of precision);
+- values smaller than `1/scale` collapse to `0`;
+- `NaN` (OTLP staleness marker), `±Inf`, and values whose scaled form
+  overflows int64 are **dropped at ingest** and counted in the
+  `metrics_ingest_rejected{reason="value_unencodable"}` self-metric;
+- the scale is recorded in the reserved `__scale__` label, so the same metric
+  sent with different scales produces different series.
+
+If you need more than 3 decimal digits, set an explicit per-point scale.
+A native float codec is on the roadmap; until then size your scale to the
+precision your data actually carries.
+
 ## Configuration
 
 See [config.example.yaml](config.example.yaml) for all options. Key settings:

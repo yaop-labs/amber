@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -87,5 +88,35 @@ func TestPrepareAndCommitFlush(t *testing.T) {
 	}
 	if e.BufferedSeries() != 0 {
 		t.Fatalf("BufferedSeries after commit = %d, want 0", e.BufferedSeries())
+	}
+}
+
+func TestAppendScaledFloatRejectsUnencodable(t *testing.T) {
+	e := New()
+	labels := model.LabelSet{{Name: "job", Value: "api"}}
+
+	cases := []struct {
+		name  string
+		value float64
+		scale int64
+	}{
+		{"nan", math.NaN(), 1000},
+		{"pos_inf", math.Inf(1), 1000},
+		{"neg_inf", math.Inf(-1), 1000},
+		{"overflow", 1e18, 1000},
+		{"neg_overflow", -1e18, 1000},
+	}
+	for _, tc := range cases {
+		if _, err := e.AppendScaledFloat(labels, model.MetricTypeGauge, 1000, tc.value, tc.scale); err == nil {
+			t.Errorf("%s: AppendScaledFloat(%v, scale=%d) succeeded, want error", tc.name, tc.value, tc.scale)
+		}
+	}
+	if got := e.BufferedSamples(); got != 0 {
+		t.Errorf("BufferedSamples = %d after rejected appends, want 0", got)
+	}
+
+	// Sanity: a representable value still works.
+	if _, err := e.AppendScaledFloat(labels, model.MetricTypeGauge, 1000, 1.234, 1000); err != nil {
+		t.Fatalf("valid AppendScaledFloat: %v", err)
 	}
 }

@@ -57,6 +57,11 @@ type S3Storage struct {
 }
 
 // Metrics configures the embedded metrics store.
+//
+// Value model (alpha): samples are stored as int64. Floats are scaled
+// integers — round(value × scale), scale 1000 by default — so precision is
+// bounded by the scale, and NaN/±Inf/overflowing values are rejected at
+// ingest. See the "Metrics value model" section in the README.
 type Metrics struct {
 	Disabled            bool
 	Dir                 string

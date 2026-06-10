@@ -117,6 +117,7 @@ var IncreaseByLabelSteps = query.IncreaseByLabelSteps
 var IncreaseByLabelStepsInBlockWithDirectory = query.IncreaseByLabelStepsInBlockWithDirectory
 var PlanExecution = query.PlanExecution
 var OTLPSamples = otlp.Samples
+var OTLPSamplesSkipped = otlp.SamplesSkipped
 
 var ErrNoSamples = store.ErrNoSamples
 var ErrInvalidLabels = store.ErrInvalidLabels
