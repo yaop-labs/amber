@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/bootstrap"
+	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
@@ -152,6 +153,10 @@ type Stack struct {
 
 	// bootstrapWG waits for the sealed-index bootstrap goroutine.
 	bootstrapWG sync.WaitGroup
+
+	// lock guards the data directory against a second amber process or a
+	// second embedded Open on the same path.
+	lock *fslock.Lock
 }
 
 // IsReady reports whether bootstrap finished loading sealed indexes.
@@ -162,6 +167,19 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		return nil, errors.New("runtime: DataDir required")
 	}
 	cfg := opts.withDefaults()
+
+	// Exclusive lock on the data dir: a second writer (another amber process
+	// or another embedded Open) would silently corrupt WAL/segments/meta.
+	dirLock, err := fslock.Acquire(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: data dir %s already in use? %w", cfg.DataDir, err)
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = dirLock.Release()
+		}
+	}()
 
 	logDir := filepath.Join(cfg.DataDir, "logs")
 	spanDir := filepath.Join(cfg.DataDir, "spans")
@@ -334,6 +352,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			Retention:          cfg.Metrics.Retention,
 			MaxActiveSeries:    cfg.Metrics.MaxActiveSeries,
 			MaxLabelsPerSeries: cfg.Metrics.MaxLabelsPerSeries,
+			// Histogram blocks are written one per OTLP request; auto-compact
+			// keeps the file count bounded (0 → store default of 64).
+			CompactMinBlocks: cfg.Metrics.CompactionMinBlocks,
 		})
 		if err != nil {
 			if logUp != nil {
@@ -362,6 +383,8 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.HistogramStore = histStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
+	s.lock = dirLock
+	opened = true
 
 	s.bootstrapWG.Go(func() {
 		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
@@ -449,6 +472,12 @@ func (s *Stack) Close(ctx context.Context) error {
 	}()
 	select {
 	case err := <-closeDone:
+		// Release the dir lock only after a clean close; on timeout paths
+		// components may still touch files, so the lock stays held until
+		// process exit (the kernel drops it then).
+		if rerr := s.lock.Release(); rerr != nil && err == nil {
+			err = fmt.Errorf("runtime: release dir lock: %w", rerr)
+		}
 		return err
 	case <-ctx.Done():
 		return fmt.Errorf("runtime: shutdown: %w", ctx.Err())

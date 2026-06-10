@@ -351,3 +351,30 @@ func TestEmbedded_QueryTraceReturnsBothSides(t *testing.T) {
 		t.Errorf("span trace_id: got %x, want %x", got.Spans[0].TraceID, traceID)
 	}
 }
+
+// A second Open on the same data dir must fail fast instead of letting two
+// writers corrupt the WAL, segments, and meta files.
+func TestEmbedded_SecondOpenSameDirFails(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := amber.Open(dir)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+
+	if _, err := amber.Open(dir); err == nil {
+		t.Fatal("second Open on the same data dir must fail while the first DB is open")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := amber.Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after Close: %v", err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

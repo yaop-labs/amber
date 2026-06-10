@@ -144,12 +144,12 @@ func (u *uploader) uploadOne(seg storage.SegmentMeta) error {
 
 // backoffDelay returns the retry delay for a 1-based attempt count.
 func backoffDelay(attempts uint32) time.Duration {
-	exp := min(attempts - 1, 20)
+	exp := min(attempts-1, 20)
 	d := uploadBackoffInitial << exp
 	if d <= 0 || d > uploadBackoffMax {
 		d = uploadBackoffMax
 	}
 	jitter := time.Duration(rand.Int64N(int64(d) / 2)) //nolint:gosec
-	out := min(d - d/4 + jitter, uploadBackoffMax)
+	out := min(d-d/4+jitter, uploadBackoffMax)
 	return out
 }
