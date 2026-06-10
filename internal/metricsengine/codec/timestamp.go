@@ -1,10 +1,16 @@
 package codec
 
+import "errors"
+
 type TimestampStrategy uint8
 
 const (
 	TimestampStrategyDeltaOfDelta TimestampStrategy = iota + 1
 	TimestampStrategyRegular
+	// TimestampStrategyDeltaOfDeltaPacked carries the same delta-of-delta
+	// stream with a fixed-width bit-packed payload (bitpack.go) — wins on
+	// jittered-but-bounded scrape grids where every residual is small.
+	TimestampStrategyDeltaOfDeltaPacked
 )
 
 func (s TimestampStrategy) String() string {
@@ -13,6 +19,8 @@ func (s TimestampStrategy) String() string {
 		return "delta_of_delta"
 	case TimestampStrategyRegular:
 		return "regular"
+	case TimestampStrategyDeltaOfDeltaPacked:
+		return "delta_of_delta_packed"
 	default:
 		return "unknown"
 	}
@@ -59,10 +67,25 @@ func EncodeTimestamps(timestamps []int64) TimestampEncoding {
 			prevDelta = delta
 		}
 	}
+	varint := EncodeSignedVarints(transformed)
+	// Packed candidate: transformed[0] (absolute first timestamp) and
+	// transformed[1] (first delta) would poison the fixed width, so they ride
+	// in the Base/Step fields and only the dod residuals are packed.
+	// isRegular returns true for len ≤ 2, so this branch always has ≥ 3.
+	packed := EncodeBitPacked(transformed[2:])
+	if len(packed) < len(varint) {
+		return TimestampEncoding{
+			Strategy: TimestampStrategyDeltaOfDeltaPacked,
+			Count:    len(timestamps),
+			Base:     transformed[0],
+			Step:     transformed[1],
+			Payload:  packed,
+		}
+	}
 	return TimestampEncoding{
 		Strategy: TimestampStrategyDeltaOfDelta,
 		Count:    len(timestamps),
-		Payload:  EncodeSignedVarints(transformed),
+		Payload:  varint,
 	}
 }
 
@@ -74,7 +97,23 @@ func DecodeTimestamps(enc TimestampEncoding) ([]int64, error) {
 		}
 		return out, nil
 	}
-	values, err := DecodeSignedVarints(enc.Payload, enc.Count)
+	var values []int64
+	var err error
+	if enc.Strategy == TimestampStrategyDeltaOfDeltaPacked {
+		if enc.Count < 3 {
+			return nil, errors.New("codec: packed timestamp encoding requires at least 3 samples")
+		}
+		residuals, derr := DecodeBitPackedInto(enc.Payload, enc.Count-2, nil)
+		if derr != nil {
+			return nil, derr
+		}
+		values = make([]int64, enc.Count)
+		values[0] = enc.Base
+		values[1] = enc.Step
+		copy(values[2:], residuals)
+	} else {
+		values, err = DecodeSignedVarints(enc.Payload, enc.Count)
+	}
 	if err != nil {
 		return nil, err
 	}

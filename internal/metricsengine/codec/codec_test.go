@@ -141,10 +141,14 @@ func TestEncodeIntegerValuesDominatesEveryStrategy(t *testing.T) {
 			}
 
 			chosen := EncodeIntegerValues(values)
-			candidates := map[string]int{
-				"direct-residual": len(encodeDirectResidual(values).Payload),
-				"delta":           len(encodeDelta(values).Payload),
-				"delta-of-delta":  len(encodeDeltaOfDelta(values).Payload),
+			candidates := map[string]int{}
+			for _, tr := range []valueTransform{
+				residualTransform(values),
+				deltaTransform(values),
+				deltaOfDeltaTransform(values),
+			} {
+				candidates[tr.strategy.String()+"-varint"] = len(EncodeSignedVarints(tr.data))
+				candidates[tr.strategy.String()+"-packed"] = len(EncodeBitPacked(tr.data))
 			}
 
 			for cand, size := range candidates {
