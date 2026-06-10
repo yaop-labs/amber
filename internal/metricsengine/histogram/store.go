@@ -25,6 +25,13 @@ type Store struct {
 	clock func() time.Time
 	mu    sync.Mutex
 	seq   int
+
+	// pendingDrop hides source blocks from blockPaths while a finished
+	// compaction deletes them, so readers never see a merged block together
+	// with its sources. Guarded by pendingMu (blockPaths is called from both
+	// locked and unlocked contexts).
+	pendingMu   sync.Mutex
+	pendingDrop map[string]struct{}
 }
 
 // Options configures histogram retention and cardinality limits.
@@ -32,7 +39,11 @@ type Options struct {
 	Retention          time.Duration
 	MaxActiveSeries    int
 	MaxLabelsPerSeries int
-	Clock              func() time.Time
+	// CompactMinBlocks triggers auto-compaction in WriteBlock once the
+	// block-file count reaches the threshold. 0 uses the default (64),
+	// negative disables auto-compaction.
+	CompactMinBlocks int
+	Clock            func() time.Time
 }
 
 // OpenStore opens a histogram store rooted at dir.
@@ -51,6 +62,9 @@ func OpenStoreWithOptions(dir string, opts Options) (*Store, error) {
 	clock := opts.Clock
 	if clock == nil {
 		clock = time.Now
+	}
+	if err := recoverCompaction(dir); err != nil {
+		return nil, fmt.Errorf("histogram: compaction recovery: %w", err)
 	}
 	s := &Store{dir: dir, opts: opts, clock: clock}
 	paths, err := s.blockPaths()
@@ -76,7 +90,10 @@ func (tr TimeRange) contains(ts int64) bool { return ts >= tr.Start && ts <= tr.
 
 func (tr TimeRange) overlaps(mn, mx int64) bool { return mn <= tr.End && mx >= tr.Start }
 
-// WriteBlock writes a new immutable block and returns its path.
+// WriteBlock writes a new immutable block and returns its path. When the
+// block-file count reaches Options.CompactMinBlocks the write also triggers
+// an inline compaction, so the returned file may already have been merged
+// into a compacted block by the time the call returns.
 func (s *Store) WriteBlock(exp []ExpSeries, explicit []ExplicitSeries) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -91,16 +108,50 @@ func (s *Store) WriteBlock(exp []ExpSeries, explicit []ExplicitSeries) (string, 
 	if err := s.enforceRetentionLocked(nil); err != nil {
 		return "", err
 	}
+	if threshold := s.compactMinBlocks(); threshold > 0 {
+		paths, err := s.rawBlockPaths()
+		if err != nil {
+			return "", err
+		}
+		if len(paths) >= threshold {
+			if _, err := s.compactLocked(); err != nil {
+				return "", fmt.Errorf("histogram: auto-compact: %w", err)
+			}
+		}
+	}
 	return path, nil
 }
 
-func (s *Store) blockPaths() ([]string, error) {
+// rawBlockPaths lists every block file on disk, sorted.
+func (s *Store) rawBlockPaths() ([]string, error) {
 	paths, err := filepath.Glob(filepath.Join(s.dir, "hblock-*.mhb"))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(paths)
 	return paths, nil
+}
+
+// blockPaths lists the blocks visible to readers: rawBlockPaths minus any
+// sources of a compaction that is finishing its deletes.
+func (s *Store) blockPaths() ([]string, error) {
+	paths, err := s.rawBlockPaths()
+	if err != nil {
+		return nil, err
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if len(s.pendingDrop) == 0 {
+		return paths, nil
+	}
+	visible := paths[:0]
+	for _, path := range paths {
+		if _, drop := s.pendingDrop[filepath.Base(path)]; drop {
+			continue
+		}
+		visible = append(visible, path)
+	}
+	return visible, nil
 }
 
 func nextBlockSeq(paths []string) int {
@@ -178,6 +229,9 @@ func (s *Store) seriesKeysLocked() (map[string]struct{}, error) {
 	keys := make(map[string]struct{})
 	for _, path := range paths {
 		dir, err := ReadDirectory(path)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -202,6 +256,9 @@ func (s *Store) enforceRetentionLocked(paths []string) error {
 	cutoff := s.clock().Add(-s.opts.Retention).UnixMilli()
 	for _, path := range paths {
 		dir, err := ReadDirectory(path)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -224,6 +281,9 @@ func (s *Store) MetricNames() ([]string, error) {
 	seen := make(map[string]struct{})
 	for _, path := range paths {
 		dir, err := ReadDirectory(path)
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -259,11 +319,19 @@ func (s *Store) Stats() (Stats, error) {
 	st := Stats{Blocks: len(paths)}
 	for _, path := range paths {
 		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			st.Blocks--
+			continue
+		}
 		if err != nil {
 			return Stats{}, err
 		}
 		st.Bytes += info.Size()
 		dir, err := ReadDirectory(path)
+		if os.IsNotExist(err) {
+			st.Blocks--
+			continue
+		}
 		if err != nil {
 			return Stats{}, err
 		}
@@ -304,6 +372,12 @@ func (s *Store) collectExp(selector index.Selector, tr TimeRange) (map[uint64]*m
 	out := make(map[uint64]*matchedExp)
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			// Block merged away by a concurrent compaction after listing;
+			// its data is in the merged block, which this listing has seen
+			// or the next one will.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -415,6 +489,9 @@ func (s *Store) Summary(selector index.Selector, tr TimeRange) (Synopsis, error)
 	var acc Synopsis
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue // merged away by a concurrent compaction
+		}
 		if err != nil {
 			return Synopsis{}, err
 		}
@@ -485,6 +562,9 @@ func (s *Store) ExplicitQuantile(selector index.Selector, q float64, tr TimeRang
 	var merged *ExplicitBucketHistogram
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue // merged away by a concurrent compaction
+		}
 		if err != nil {
 			return 0, err
 		}
