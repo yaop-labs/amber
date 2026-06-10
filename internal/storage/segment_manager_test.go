@@ -128,6 +128,109 @@ func TestSegmentManager_Rotate_Manual(t *testing.T) {
 	}
 }
 
+// Regression test for the rotate() ordering bug: the WAL must be truncated
+// BEFORE the next segment is created. The old order (createNewSegment, then
+// wal.Truncate) had a crash window where meta already contained a fresh
+// unsealed segment with LastSyncedSeq=0, so replayWAL re-applied the entire
+// WAL into it — duplicating every record of the just-sealed segment.
+//
+// With the fixed order the only reachable crash state is "sealed segment in
+// meta, no unsealed segment, WAL not yet truncated". This test constructs
+// exactly that state (by restoring a pre-rotate WAL snapshot) and verifies
+// reopen drops the orphan WAL records instead of replaying them.
+func TestSegmentManager_Rotate_CrashBeforeWALTruncate_NoDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	policy := RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 0}
+
+	sm1, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	const n = 100
+	base := time.Now().UnixNano()
+	items := make([]BatchItem, 0, n)
+	for i := range n {
+		items = append(items, BatchItem{
+			Data: fmt.Appendf(nil, "rot-rec-%05d", i),
+			TS:   base + int64(i),
+		})
+	}
+	if err := sm1.WriteBatch(items); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+
+	// Snapshot the WAL while it still holds all n records.
+	walPath := filepath.Join(dir, walFileName)
+	walCopy, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	if len(walCopy) == 0 {
+		t.Fatal("wal unexpectedly empty before rotate")
+	}
+
+	if err := sm1.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if err := sm1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Simulate the crash state: seal is durable in meta, but the WAL was not
+	// truncated yet.
+	if err := os.WriteFile(walPath, walCopy, 0o600); err != nil {
+		t.Fatalf("restore wal: %v", err)
+	}
+
+	sm2, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer sm2.Close()
+
+	// Orphan WAL records must be dropped, not replayed into a fresh segment.
+	if size, err := sm2.wal.Size(); err != nil {
+		t.Fatalf("wal size: %v", err)
+	} else if size != 0 {
+		t.Errorf("wal not truncated after orphan-drop recovery: %d bytes", size)
+	}
+	if got := sm2.ActiveRecordCount(); got != 0 {
+		t.Errorf("active segment has %d records, want 0 (WAL replayed into it?)", got)
+	}
+
+	seen := make(map[string]int, n)
+	for _, seg := range sm2.Segments() {
+		if seg.RecordCount == 0 {
+			continue
+		}
+		sr, err := OpenSegmentReader(filepath.Join(dir, seg.FileName), nil)
+		if err != nil {
+			t.Fatalf("reader %s: %v", seg.FileName, err)
+		}
+		scanErr := sr.Scan(func(data []byte) error {
+			seen[string(data)]++
+			return nil
+		})
+		_ = sr.Close()
+		if scanErr != nil {
+			t.Fatalf("scan %s: %v", seg.FileName, scanErr)
+		}
+	}
+
+	for i := range n {
+		key := fmt.Sprintf("rot-rec-%05d", i)
+		switch seen[key] {
+		case 0:
+			t.Errorf("record %d lost", i)
+		case 1:
+			// OK
+		default:
+			t.Errorf("record %d duplicated ×%d", i, seen[key])
+		}
+	}
+}
+
 func TestSegmentManager_Rotate_EmptySegment_NoOp(t *testing.T) {
 	sm, _ := newTestManager(t)
 	before := len(sm.Segments())

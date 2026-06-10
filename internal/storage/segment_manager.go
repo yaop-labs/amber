@@ -385,6 +385,17 @@ func (sm *SegmentManager) rotate() error {
 		return err
 	}
 
+	// Truncate the WAL BEFORE creating the next segment. The sealed segment is
+	// fsync'd via SegmentWriter.Close, so every WAL record that fed it is
+	// durable. A crash between here and createNewSegment leaves meta with no
+	// unsealed segment, which replayWAL handles by dropping orphan records.
+	// The reverse order (create first, truncate last) had a crash window where
+	// replay would re-apply the entire WAL into the fresh empty segment,
+	// duplicating every record of the just-sealed one.
+	if err := sm.wal.Truncate(); err != nil {
+		return fmt.Errorf("segmgr: rotate truncate wal: %w", err)
+	}
+
 	if sm.onSeal != nil || sm.onSealComplete != nil {
 		onSeal := sm.onSeal
 		onSealComplete := sm.onSealComplete
@@ -400,14 +411,7 @@ func (sm *SegmentManager) rotate() error {
 		}()
 	}
 
-	if err := sm.createNewSegment(); err != nil {
-		return err
-	}
-
-	// Old segment is sealed and fsync'd via SegmentWriter.Close, so every WAL
-	// record that fed it is now durable. The new active is empty. Drop the
-	// WAL so it stays bounded.
-	return sm.wal.Truncate()
+	return sm.createNewSegment()
 }
 
 func (sm *SegmentManager) Rotate() error {
