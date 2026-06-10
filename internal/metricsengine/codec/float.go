@@ -20,7 +20,7 @@ import (
 // non-conforming values bypass the decimal path entirely.
 //
 // This is the codec core for the float-gauge value model; wiring it through
-// model/WAL/head/block is staged separately (see docs/metricsengine/ROADMAP.md).
+// model/WAL/head/block is staged separately (see the metricsengine ROADMAP).
 
 // maxDecimalExp bounds the per-block exponent: 10^14 keeps mantissas of
 // magnitudes up to ~9·10^4 comfortably inside both float64 integer exactness
