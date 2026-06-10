@@ -32,6 +32,7 @@ type traceSummary struct {
 }
 
 const traceSummaryPageSize = 2000
+const traceSummaryMaxSpans = 100_000
 
 func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -71,7 +72,7 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	summaries, total, err := collectTraceSummaries(
+	summaries, total, truncated, err := collectTraceSummaries(
 		func(q *query.SpanQuery) (*query.SpanResult, error) {
 			return h.exec.ExecSpan(r.Context(), q)
 		},
@@ -92,24 +93,36 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"traces": summaries,
-		"total":  total,
+		"traces":    summaries,
+		"total":     total,
+		"truncated": truncated,
 	})
 }
 
 func collectTraceSummaries(
 	fetch func(*query.SpanQuery) (*query.SpanResult, error),
 	base query.SpanQuery,
-) ([]traceSummary, int, error) {
+) ([]traceSummary, int, bool, error) {
 	page := base
 	page.Limit = traceSummaryPageSize
 	page.Cursor = ""
 
 	var allSpans []model.SpanEntry
+	truncated := false
 	for {
 		result, err := fetch(&page)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
+		}
+		remaining := traceSummaryMaxSpans - len(allSpans)
+		if remaining <= 0 {
+			truncated = true
+			break
+		}
+		if len(result.Spans) > remaining {
+			allSpans = append(allSpans, result.Spans[:remaining]...)
+			truncated = true
+			break
 		}
 		allSpans = append(allSpans, result.Spans...)
 
@@ -123,7 +136,7 @@ func collectTraceSummaries(
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].StartTime.After(summaries[j].StartTime)
 	})
-	return summaries, len(summaries), nil
+	return summaries, len(summaries), truncated, nil
 }
 
 func buildTraceSummaries(spans []model.SpanEntry) []traceSummary {

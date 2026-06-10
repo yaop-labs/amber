@@ -53,6 +53,11 @@ ingest:
   batch_size: 2000
   batch_timeout: 50ms
   queue_size: 5000
+  logs:
+    queue_size: 7000
+  spans:
+    batch_size: 500
+    breaker_threshold: 3
 api:
   http_addr: ":9090"
   grpc_addr: ":4318"
@@ -88,6 +93,15 @@ retention:
 	}
 	if cfg.Ingest.BatchTimeout != 50*time.Millisecond {
 		t.Errorf("BatchTimeout: got %v", cfg.Ingest.BatchTimeout)
+	}
+	if cfg.Ingest.Logs.QueueSize != 7000 {
+		t.Errorf("Ingest.Logs.QueueSize: got %d", cfg.Ingest.Logs.QueueSize)
+	}
+	if cfg.Ingest.Spans.BatchSize != 500 {
+		t.Errorf("Ingest.Spans.BatchSize: got %d", cfg.Ingest.Spans.BatchSize)
+	}
+	if cfg.Ingest.Spans.BreakerThreshold != 3 {
+		t.Errorf("Ingest.Spans.BreakerThreshold: got %d", cfg.Ingest.Spans.BreakerThreshold)
 	}
 	if cfg.API.GRPCAddr != ":4318" {
 		t.Errorf("GRPCAddr: got %q", cfg.API.GRPCAddr)
@@ -175,6 +189,14 @@ func TestValidate_InvalidQueueSize(t *testing.T) {
 	cfg.Ingest.QueueSize = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for queue_size=0")
+	}
+}
+
+func TestValidate_InvalidLaneQueueSize(t *testing.T) {
+	cfg := Default()
+	cfg.Ingest.Logs.QueueSize = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for negative logs queue_size")
 	}
 }
 

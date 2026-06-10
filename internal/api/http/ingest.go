@@ -30,7 +30,7 @@ type ingestRequest struct {
 }
 
 func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.batcher.IsBreakerOpen() {
+	if h.batcher.IsLogBreakerOpen() {
 		writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
 		return
 	}

@@ -168,10 +168,8 @@ func (c *Client) Trace(ctx context.Context, id string) (*Trace, error) {
 	return &resp, nil
 }
 
-// MetricRateQuery is the input to GET /api/v1/metrics/rate. Window is
-// mandatory; End defaults server-side to "now" when zero. Selector adds extra
-// label= matchers on top of the implicit `__name__=Metric` one. By empty
-// means "no grouping" — the server returns a single bucket keyed by "".
+// MetricRateQuery is the input to GET /api/v1/metrics/rate.
+// Window is required. End defaults server-side to now when zero.
 type MetricRateQuery struct {
 	Metric   string
 	Window   time.Duration
@@ -205,11 +203,8 @@ func (c *Client) MetricRate(ctx context.Context, q MetricRateQuery) (*MetricRate
 	return &resp, nil
 }
 
-// MetricQuantileQuery is the input to GET /api/v1/metrics/quantile. Quantile
-// is mandatory and must be in [0, 1]. Window is optional — zero means
-// unbounded (the server quantiles over everything). End is honored only when
-// Window is non-zero. By selects a single grouping label, empty means "no
-// grouping" (a single bucket keyed by "").
+// MetricQuantileQuery is the input to GET /api/v1/metrics/quantile.
+// Quantile is required and must be in [0, 1]. A zero Window is unbounded.
 type MetricQuantileQuery struct {
 	Metric   string
 	Quantile float64

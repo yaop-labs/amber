@@ -8,6 +8,21 @@ ingest:
   batch_size: 1000
   batch_timeout: 100ms
   queue_size: 100000
+  breaker_threshold: 10
+
+  # Optional per-signal overrides. Zero/omitted values inherit from ingest.*.
+  # Use these when one signal needs tighter isolation without changing the
+  # product shape: one binary, separate internal ingest lanes.
+  logs:
+    batch_size: 0
+    batch_timeout: 0s
+    queue_size: 0
+    breaker_threshold: 0
+  spans:
+    batch_size: 0
+    batch_timeout: 0s
+    queue_size: 0
+    breaker_threshold: 0
 
 api:
   http_addr: ":8080"

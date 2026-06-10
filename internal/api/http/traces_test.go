@@ -25,7 +25,7 @@ func TestCollectTraceSummariesAggregatesAcrossSpanPages(t *testing.T) {
 
 	// The fetch mock uses cursor as an opaque "next index into all" so we
 	// can test the pagination-loop without exercising the real codec.
-	summaries, total, err := collectTraceSummaries(func(q *query.SpanQuery) (*query.SpanResult, error) {
+	summaries, total, truncated, err := collectTraceSummaries(func(q *query.SpanQuery) (*query.SpanResult, error) {
 		start := 0
 		if q.Cursor != "" {
 			n, perr := strconv.Atoi(q.Cursor)
@@ -52,6 +52,9 @@ func TestCollectTraceSummariesAggregatesAcrossSpanPages(t *testing.T) {
 	}, query.SpanQuery{})
 	if err != nil {
 		t.Fatalf("collectTraceSummaries() error = %v", err)
+	}
+	if truncated {
+		t.Fatal("truncated = true, want false")
 	}
 
 	if total != 3 {

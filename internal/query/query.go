@@ -7,6 +7,12 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
+const (
+	DefaultLimit = 100
+	MaxLogLimit  = 100_000
+	MaxSpanLimit = 100_000
+)
+
 type LogQuery struct {
 	From     time.Time
 	To       time.Time
@@ -32,7 +38,10 @@ func (q *LogQuery) Validate() error {
 		return fmt.Errorf("query: from cannot be after to")
 	}
 	if q.Limit == 0 {
-		q.Limit = 100
+		q.Limit = DefaultLimit
+	}
+	if q.Limit > MaxLogLimit {
+		return fmt.Errorf("query: limit cannot exceed %d", MaxLogLimit)
 	}
 	if _, err := DecodeCursor(q.Cursor); err != nil {
 		return fmt.Errorf("query: %w", err)
@@ -105,7 +114,10 @@ func (q *SpanQuery) Validate() error {
 		return fmt.Errorf("query: span from cannot be after to")
 	}
 	if q.Limit == 0 {
-		q.Limit = 100
+		q.Limit = DefaultLimit
+	}
+	if q.Limit > MaxSpanLimit {
+		return fmt.Errorf("query: span limit cannot exceed %d", MaxSpanLimit)
 	}
 	if _, err := DecodeCursor(q.Cursor); err != nil {
 		return fmt.Errorf("query: %w", err)

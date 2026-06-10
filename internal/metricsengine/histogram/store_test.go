@@ -3,7 +3,12 @@ package histogram
 import (
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
@@ -15,6 +20,130 @@ func lbls(pairs ...string) model.LabelSet {
 		ls = append(ls, model.Label{Name: pairs[i], Value: pairs[i+1]})
 	}
 	return ls.Canonical()
+}
+
+func TestStoreResumesSequencePastHoles(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	series := ExpSeries{
+		ID:         1,
+		Labels:     lbls("__name__", "lat", "job", "api"),
+		Timestamps: []int64{1000},
+		Sketches:   []*ExponentialHistogram{FromValues(4, []float64{1, 2, 3})},
+	}
+	if _, err := s.WriteBlock([]ExpSeries{series}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteBlock([]ExpSeries{series}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "hblock-000000.mhb")); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := reopened.WriteBlock([]ExpSeries{series}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Base(path); got != "hblock-000002.mhb" {
+		t.Fatalf("next block = %s, want hblock-000002.mhb", got)
+	}
+}
+
+func TestStoreRetentionRemovesExpiredBlocks(t *testing.T) {
+	dir := t.TempDir()
+	now := time.UnixMilli(10_000_000)
+	s, err := OpenStoreWithOptions(dir, Options{
+		Retention: time.Hour,
+		Clock:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := now.Add(-2 * time.Hour).UnixMilli()
+	newer := now.Add(-10 * time.Minute).UnixMilli()
+	mkSeries := func(ts int64) ExpSeries {
+		return ExpSeries{
+			ID:         1,
+			Labels:     lbls("__name__", "lat", "ts", strconvFormatInt(ts)),
+			Timestamps: []int64{ts},
+			Sketches:   []*ExponentialHistogram{FromValues(4, []float64{1, 2, 3})},
+		}
+	}
+	if _, err := s.WriteBlock([]ExpSeries{mkSeries(old)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteBlock([]ExpSeries{mkSeries(newer)}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := s.blockPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("block count = %d, want 1; paths=%v", len(paths), paths)
+	}
+	dirMeta, err := ReadDirectory(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, maxTS, ok := dirMeta.TimeRange(); !ok || maxTS != newer {
+		t.Fatalf("remaining block max ts = %d ok=%v, want %d", maxTS, ok, newer)
+	}
+}
+
+func TestStoreRejectsHistogramCardinalityLimit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStoreWithOptions(dir, Options{MaxActiveSeries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkSeries := func(job string) ExpSeries {
+		return ExpSeries{
+			ID:         1,
+			Labels:     lbls("__name__", "lat", "job", job),
+			Timestamps: []int64{1000},
+			Sketches:   []*ExponentialHistogram{FromValues(4, []float64{1, 2, 3})},
+		}
+	}
+	if _, err := s.WriteBlock([]ExpSeries{mkSeries("api")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.WriteBlock([]ExpSeries{mkSeries("worker")}, nil)
+	if err == nil || !strings.Contains(err.Error(), "active series limit exceeded") {
+		t.Fatalf("err = %v, want active series limit", err)
+	}
+}
+
+func TestStoreRejectsHistogramLabelLimit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenStoreWithOptions(dir, Options{MaxLabelsPerSeries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	series := ExpSeries{
+		ID:         1,
+		Labels:     lbls("__name__", "lat", "job", "api"),
+		Timestamps: []int64{1000},
+		Sketches:   []*ExponentialHistogram{FromValues(4, []float64{1, 2, 3})},
+	}
+	_, err = s.WriteBlock([]ExpSeries{series}, nil)
+	if err == nil || !strings.Contains(err.Error(), "label limit exceeded") {
+		t.Fatalf("err = %v, want label limit", err)
+	}
+}
+
+func strconvFormatInt(v int64) string {
+	return strconv.FormatInt(v, 10)
 }
 
 // expSemEqual compares two exp-histograms ignoring representation (leading/
@@ -313,8 +442,6 @@ func TestStoreStats(t *testing.T) {
 	}
 }
 
-// TestStoreStatsEmpty confirms zero-state behavior — used by the HTTP stats
-// endpoint to render "-" for time range when nothing has been written.
 func TestStoreStatsEmpty(t *testing.T) {
 	s, err := OpenStore(t.TempDir())
 	if err != nil {

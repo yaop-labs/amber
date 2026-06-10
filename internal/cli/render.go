@@ -166,6 +166,9 @@ func renderStats(w io.Writer, s *client.Stats) {
 			s.Segments.Active.File, s.Segments.Active.ID, s.Segments.Active.RecordCount)
 	}
 	writef(w, "index      segments=%d\n", s.SparseIndex.Segments)
+	writef(w, "ingest     logs_queue=%d logs_breaker=%v spans_queue=%d spans_breaker=%v\n",
+		s.Ingest.Logs.QueueLen, s.Ingest.Logs.BreakerOpen,
+		s.Ingest.Spans.QueueLen, s.Ingest.Spans.BreakerOpen)
 	writef(w, "memory     heap_alloc=%dMB heap_inuse=%dMB objects=%d\n",
 		s.Memory.HeapAllocMB, s.Memory.HeapInuseMB, s.Memory.HeapObjects)
 }

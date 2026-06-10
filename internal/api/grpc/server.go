@@ -16,6 +16,8 @@ type sender interface {
 	SendLog(model.LogEntry) error
 	SendSpan(model.SpanEntry) error
 	IsBreakerOpen() bool
+	IsLogBreakerOpen() bool
+	IsSpanBreakerOpen() bool
 }
 
 func NewServer(batcher sender, maxRecvBytes int, log *slog.Logger) *grpc.Server {

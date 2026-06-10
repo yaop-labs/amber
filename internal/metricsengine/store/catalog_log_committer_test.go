@@ -10,23 +10,8 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-// TestCatalogLogLostRegisterRecoveredFromBlocks proves the load-bearing
-// crash-safety coupling for catalog-log group commit: a REGISTER lost in
-// the un-fsync'd window is recovered on restart because the series'
-// samples have already reached the blocks (via the engine's WAL group
-// commit, which is an independent persistence path). Without this
-// coupling, batching catalog fsyncs would be unsafe — every lost REGISTER
-// would be a lost series.
-//
-// Setup:
-//  1. Build a real block file with series id=42, labels {job=api}.
-//  2. Write a manifest that points at it. No catalog.log entries — the
-//     series' REGISTER never fsync'd.
-//  3. Open the Store. Recovery loads the manifest, finds the block, the
-//     catalog log has no entry for id=42.
-//  4. Assert: registry knows the labels {job=api} after recovery.
-//  5. Assert: subsequent ingest with the same labels uses a registered
-//     series (no panic, no error, eventually queryable).
+// TestCatalogLogLostRegisterRecoveredFromBlocks verifies that startup
+// reconciliation can recover a series whose REGISTER was not synced.
 func TestCatalogLogLostRegisterRecoveredFromBlocks(t *testing.T) {
 	dir := t.TempDir()
 

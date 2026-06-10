@@ -3,6 +3,7 @@
 package query
 
 import (
+	"slices"
 	"bytes"
 	"container/heap"
 	"context"
@@ -28,7 +29,7 @@ type logMinHeap []model.LogEntry
 
 func (h logMinHeap) Len() int { return len(h) }
 func (h logMinHeap) Less(i, j int) bool {
-	return h[i].Timestamp.Before(h[j].Timestamp)
+	return logEntryOlder(h[i], h[j])
 }
 func (h logMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *logMinHeap) Push(x any)   { *h = append(*h, x.(model.LogEntry)) }
@@ -44,7 +45,7 @@ type spanMinHeap []model.SpanEntry
 
 func (h spanMinHeap) Len() int { return len(h) }
 func (h spanMinHeap) Less(i, j int) bool {
-	return h[i].StartTime.Before(h[j].StartTime)
+	return spanEntryOlder(h[i], h[j])
 }
 func (h spanMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *spanMinHeap) Push(x any)   { *h = append(*h, x.(model.SpanEntry)) }
@@ -63,17 +64,33 @@ func peekEntryIDUint64(data []byte) (uint64, bool) {
 	return binary.BigEndian.Uint64(data[2:10]), true
 }
 
-// func blockSkipPredicate(allowed *roaring64.Bitmap) func(minID, maxID uint64) bool {
-// 	return func(minID, maxID uint64) bool {
-// 		var count uint64
-// 		if minID == 0 {
-// 			count = allowed.Rank(maxID)
-// 		} else {
-// 			count = allowed.Rank(maxID) - allowed.Rank(minID-1)
-// 		}
-// 		return count == 0
-// 	}
-// }
+func logEntryOlder(a, b model.LogEntry) bool {
+	if !a.Timestamp.Equal(b.Timestamp) {
+		return a.Timestamp.Before(b.Timestamp)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) < 0
+}
+
+func logEntryNewer(a, b model.LogEntry) bool {
+	if !a.Timestamp.Equal(b.Timestamp) {
+		return a.Timestamp.After(b.Timestamp)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
+
+func spanEntryOlder(a, b model.SpanEntry) bool {
+	if !a.StartTime.Equal(b.StartTime) {
+		return a.StartTime.Before(b.StartTime)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) < 0
+}
+
+func spanEntryNewer(a, b model.SpanEntry) bool {
+	if !a.StartTime.Equal(b.StartTime) {
+		return a.StartTime.After(b.StartTime)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
 
 type Executor struct {
 	logManager  *storage.SegmentManager
@@ -129,15 +146,19 @@ func newQueryCache(maxSize int, ttl time.Duration) *queryCache {
 	}
 }
 
-func (c *queryCache) waitOrStart(key [32]byte) (wait bool, done func()) {
+func (c *queryCache) waitOrStart(ctx context.Context, key [32]byte) (wait bool, done func(), err error) {
 	if c == nil {
-		return false, func() {}
+		return false, func() {}, nil
 	}
 	c.mu.Lock()
 	if ch, ok := c.inflight[key]; ok {
 		c.mu.Unlock()
-		<-ch
-		return true, nil
+		select {
+		case <-ch:
+			return true, nil, nil
+		case <-ctx.Done():
+			return false, nil, ctx.Err()
+		}
 	}
 	ch := make(chan struct{})
 	c.inflight[key] = ch
@@ -147,7 +168,7 @@ func (c *queryCache) waitOrStart(key [32]byte) (wait bool, done func()) {
 		delete(c.inflight, key)
 		c.mu.Unlock()
 		close(ch)
-	}
+	}, nil
 }
 
 func (c *queryCache) getLog(key [32]byte) (*LogResult, bool) {
@@ -180,11 +201,7 @@ func (c *queryCache) putLog(key [32]byte, r *LogResult) {
 	if c == nil || r == nil {
 		return
 	}
-	// Skip empty results: caching "0 entries" pins a stale-empty answer
-	// for the whole TTL, which is visibly wrong for embedders that ingest
-	// then immediately query (a typical forager turn-around). Empty results
-	// are also cheap to recompute — the planner short-circuits when there
-	// is nothing to scan.
+	// Empty results are not cached; ingest may make them stale immediately.
 	if len(r.Entries) == 0 {
 		return
 	}
@@ -377,19 +394,10 @@ func NewExecutorWithCache(
 	}
 }
 
-// ActiveIndex exposes the writer-side bitmap so wire-up code (runtime.New)
-// can hand it to Batcher as the ActiveIndexer. Read-side query paths use it
-// internally via LookupLog/LookupSpan.
+// ActiveIndex returns the writer-side active index.
 func (e *Executor) ActiveIndex() *indexer.ActiveIndex { return e.active }
 
-// SetSegmentStores wires remote-fetch fallbacks on the reader caches. After
-// this call, a query whose target segment is missing locally will fetch it
-// from the matching store before opening. Wire-up code in runtime.New is
-// the only expected caller; pass nil to leave fallbacks disabled.
-//
-// log is used by the fetcher to emit one cold-fetch line per evicted segment
-// pulled from the remote store. Pass nil to suppress those lines (metrics
-// are unaffected).
+// SetSegmentStores configures remote fetches for missing local segments.
 func (e *Executor) SetSegmentStores(logStore, spanStore storage.SegmentStore, log *slog.Logger) {
 	if logStore != nil && e.logReaders != nil {
 		e.logReaders.setFetcher(makeStoreFetcher(logStore, e.logDir, "logs", log))
@@ -412,10 +420,7 @@ func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 	e.resultCache.clear()
 }
 
-// ClearResultCache drops every cached LogResult/SpanResult. Used by
-// benchmarks and loadbench that need to measure cold execution, and by
-// future admin endpoints that flush cache after schema-affecting changes.
-// Same underlying call as the side-effect in InvalidateLogSegment.
+// ClearResultCache drops cached query results.
 func (e *Executor) ClearResultCache() {
 	e.resultCache.clear()
 }
@@ -664,6 +669,19 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 	}
 }
 
+func filterQueryableSegments(segs []index.SegmentTimeRange, manager *storage.SegmentManager) []index.SegmentTimeRange {
+	if len(segs) == 0 || manager == nil {
+		return segs
+	}
+	out := segs[:0]
+	for _, seg := range segs {
+		if manager.IsQueryableSegment(seg.FileName) {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
+
 func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err error) {
 	start := time.Now()
 	defer func() {
@@ -682,6 +700,9 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	cacheKey := hashLogQuery(q)
 
@@ -691,7 +712,10 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 			cp.CacheHit = true
 			return &cp, nil
 		}
-		wait, done := e.resultCache.waitOrStart(cacheKey)
+		wait, done, err := e.resultCache.waitOrStart(ctx, cacheKey)
+		if err != nil {
+			return nil, err
+		}
 		if wait {
 			continue
 		}
@@ -709,6 +733,7 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 
 	segs := make([]index.SegmentTimeRange, len(plan.Segments))
 	copy(segs, plan.Segments)
+	segs = filterQueryableSegments(segs, e.logManager)
 	sort.Slice(segs, func(i, j int) bool { return segs[i].MaxTS > segs[j].MaxTS })
 
 	cursor, _ := DecodeCursor(q.Cursor) // pre-validated in q.Validate
@@ -732,9 +757,9 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 	totalHits := 0
 	scanned := 0
 	for _, seg := range segs {
-		// Cursor segment skip: every record in this segment is strictly newer
-		// than the cursor TS, so the previous page already included them.
-		// Saves a full segment scan per page for the common newest-first walk.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !cursor.IsZero() && seg.MinTS > cursor.Timestamp {
 			continue
 		}
@@ -757,11 +782,6 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 		entries[i] = heap.Pop(hp).(model.LogEntry)
 	}
 
-	// entries are newest-first. NextCursor is set whenever we filled the heap
-	// to capacity — there MAY be more older records to page through. The
-	// alternative (totalHits > Limit) is wrong: totalHits only counts records
-	// that survived the thresholdID short-circuit, which kicks in after the
-	// heap fills, so it always undercounts.
 	truncated := len(entries) == q.Limit
 	var nextCursor string
 	if truncated {
@@ -811,23 +831,12 @@ func (e *Executor) execLogSegment(
 		}
 	}
 
-	// needScanFTS triggers a per-record body match during the scan. It is set
-	// when a full-text query targets a segment that has no FTS index yet —
-	// notably the active, unsealed segment, whose index is only built at seal
-	// time. Without this fallback, `q` would be silently ignored for the most
-	// recent data.
 	needScanFTS := false
 	if plan.HasStep(StepFTSSearch) {
 
 		if len(ftsTokens) > 0 {
 			if ribbon, ok := e.logFTSRibbon(seg.FileName); ok {
-				anyHit := false
-				for _, tok := range ftsTokens {
-					if ribbon.Contains(tok) {
-						anyHit = true
-						break
-					}
-				}
+				anyHit := slices.ContainsFunc(ftsTokens, ribbon.Contains)
 				if !anyHit {
 					return 0, nil
 				}
@@ -859,15 +868,11 @@ func (e *Executor) execLogSegment(
 	}
 
 	if !model.IsZeroTraceID(q.TraceID) {
-		// Segment pruning: ribbon filter tells us fast if this segment
-		// definitely has no records with this trace_id.
 		if ribbon, ok := e.logRibbon(seg.FileName); ok {
 			if !ribbon.Contains(q.TraceID[:]) {
 				return 0, nil
 			}
 		}
-		// Exact lookup: posting list gives us the record IDs for this
-		// trace_id, enabling intersection with other bitmap constraints.
 		if pl, ok := e.logPosting(seg.FileName); ok {
 			ids := pl.Lookup(q.TraceID[:])
 			if len(ids) == 0 {
@@ -910,12 +915,6 @@ func (e *Executor) execLogSegment(
 
 	matched := 0
 
-	// Scan-time full-text setup. The query tokens are converted to strings
-	// once per segment (not per record), and a per-scan memo collapses the
-	// repeated work of tokenizing identical bodies — log messages are highly
-	// templated, so the same body recurs thousands of times. The memo is
-	// capped so a pathologically high-cardinality segment can't blow memory;
-	// past the cap we simply recompute.
 	var ftsTokenStrs []string
 	var ftsMemo map[string]bool
 	if needScanFTS {
@@ -926,17 +925,13 @@ func (e *Executor) execLogSegment(
 		ftsMemo = make(map[string]bool)
 	}
 
-	thresholdID := func() (uint64, bool) {
-		if hp.Len() < k {
-			return 0, false
-		}
-		return model.EntryIDToUint64((*hp)[0].ID), true
-	}
-
 	if allowedIDs != nil && allowedSlice == nil {
 		allowedSlice = allowedIDs.ToArray()
 	}
 	skip := func(minID, maxID uint64) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		if allowedSlice != nil {
 			i := sort.Search(len(allowedSlice), func(i int) bool {
 				return allowedSlice[i] >= minID
@@ -945,19 +940,15 @@ func (e *Executor) execLogSegment(
 				return true
 			}
 		}
-		if thresh, ok := thresholdID(); ok && maxID < thresh {
-			return true
-		}
 		return false
 	}
 
 	scanFn := func(data []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		id, idOK := peekEntryIDUint64(data)
 		if allowedIDs != nil && idOK && !allowedIDs.Contains(id) {
-			return nil
-		}
-
-		if thresh, ok := thresholdID(); ok && idOK && id < thresh {
 			return nil
 		}
 
@@ -996,8 +987,6 @@ func (e *Executor) execLogSegment(
 			return nil
 		}
 
-		// Cursor pagination: skip records that are NOT strictly older than the
-		// cursor (we paginate newest-first). The cursor itself is excluded.
 		if !cursor.IsZero() && !cursor.After(entry.Timestamp.UnixNano(), entry.ID) {
 			return nil
 		}
@@ -1005,7 +994,7 @@ func (e *Executor) execLogSegment(
 		matched++
 		if hp.Len() < k {
 			heap.Push(hp, entry)
-		} else if entry.Timestamp.After((*hp)[0].Timestamp) {
+		} else if logEntryNewer(entry, (*hp)[0]) {
 			(*hp)[0] = entry
 			heap.Fix(hp, 0)
 		}
@@ -1044,6 +1033,9 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	cacheKey := hashSpanQuery(q)
 
@@ -1052,7 +1044,10 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 			cacheHit = true
 			return cached, nil
 		}
-		wait, done := e.resultCache.waitOrStart(cacheKey)
+		wait, done, err := e.resultCache.waitOrStart(ctx, cacheKey)
+		if err != nil {
+			return nil, err
+		}
 		if wait {
 			continue
 		}
@@ -1071,6 +1066,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 
 	segs := make([]index.SegmentTimeRange, len(plan.Segments))
 	copy(segs, plan.Segments)
+	segs = filterQueryableSegments(segs, e.spanManager)
 	sort.Slice(segs, func(i, j int) bool { return segs[i].MaxTS > segs[j].MaxTS })
 
 	cursor, _ := DecodeCursor(q.Cursor) // pre-validated in q.Validate
@@ -1084,6 +1080,9 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	heap.Init(hp)
 	totalHits := 0
 	for _, seg := range segs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !cursor.IsZero() && seg.MinTS > cursor.Timestamp {
 			continue
 		}
@@ -1126,7 +1125,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 }
 
 func (e *Executor) execSpanSegment(
-	_ context.Context,
+	ctx context.Context,
 	q *SpanQuery,
 	seg index.SegmentTimeRange,
 	cursor Cursor,
@@ -1175,21 +1174,12 @@ func (e *Executor) execSpanSegment(
 
 	matched := 0
 
-	thresholdID := func() (uint64, bool) {
-		if hp.Len() < k {
-			return 0, false
-		}
-		return model.EntryIDToUint64((*hp)[0].ID), true
-	}
-
 	scanFn := func(data []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if allowedIDs != nil {
 			if id, ok := peekEntryIDUint64(data); ok && !allowedIDs.Contains(id) {
-				return nil
-			}
-		}
-		if thresh, ok := thresholdID(); ok {
-			if id, idOK := peekEntryIDUint64(data); idOK && id < thresh {
 				return nil
 			}
 		}
@@ -1231,7 +1221,7 @@ func (e *Executor) execSpanSegment(
 		matched++
 		if hp.Len() < k {
 			heap.Push(hp, span)
-		} else if span.StartTime.After((*hp)[0].StartTime) {
+		} else if spanEntryNewer(span, (*hp)[0]) {
 			(*hp)[0] = span
 			heap.Fix(hp, 0)
 		}
@@ -1254,6 +1244,9 @@ func (e *Executor) execSpanSegment(
 		allowedSlice = allowedIDs.ToArray()
 	}
 	skip := func(minID, maxID uint64) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		if allowedSlice != nil {
 			i := sort.Search(len(allowedSlice), func(i int) bool {
 				return allowedSlice[i] >= minID
@@ -1261,9 +1254,6 @@ func (e *Executor) execSpanSegment(
 			if i == len(allowedSlice) || allowedSlice[i] > maxID {
 				return true
 			}
-		}
-		if thresh, ok := thresholdID(); ok && maxID < thresh {
-			return true
 		}
 		return false
 	}
@@ -1330,15 +1320,10 @@ func containsStr(slice []string, s string) bool {
 	return false
 }
 
-// ftsMemoCap bounds the per-scan body-match memo so a high-cardinality segment
-// (mostly unique bodies) cannot grow it without limit; past the cap we recompute.
+// ftsMemoCap bounds the per-scan body-match memo.
 const ftsMemoCap = 8192
 
-// bodyMatchesTokens reports whether body contains every query token, using the
-// same FTS tokenizer (lowercasing, stemming, stopword removal) as the sealed
-// index path so the active-segment fallback yields identical matches. queryToks
-// is the already-tokenized query. A linear scan over the (few) body tokens beats
-// building a set per call: query terms number one or two in practice.
+// bodyMatchesTokens reports whether body contains every query token.
 func bodyMatchesTokens(body string, queryToks []string) bool {
 	bodyToks := index.TokenizeFTS(body)
 	for _, q := range queryToks {

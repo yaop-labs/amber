@@ -9,17 +9,14 @@ import (
 
 const metaFileName = "meta.json"
 
-// UploadState tracks the S3 upload lifecycle of a sealed segment. Zero value
-// is UploadStateLocal so segments without the field (older meta.json) are
-// treated as not-yet-uploaded, which is the safe default when S3 is enabled.
+// UploadState is the remote upload state of a sealed segment.
 type UploadState uint8
 
 const (
-	// UploadStateLocal: segment exists on local disk only. For nodes without
-	// a remote store this is the terminal state.
+	// UploadStateLocal means the segment has not been uploaded.
 	UploadStateLocal UploadState = 0
-	// UploadStateUploaded: segment and all sidecars are durable in the remote
-	// store. Retention may delete the local copy.
+
+	// UploadStateUploaded means the segment and sidecars are in remote storage.
 	UploadStateUploaded UploadState = 1
 )
 
@@ -32,47 +29,30 @@ type SegmentMeta struct {
 	SizeBytes   int64  `json:"size_bytes"`
 	Sealed      bool   `json:"sealed"`
 
-	// LastSyncedSize is the segment file offset that has been fsync'd to disk
-	// at the most recent checkpoint. On reopen the file is truncated to this
-	// length to discard any bytes that drifted past it without a Sync. Only
-	// meaningful while !Sealed; sealed segments are durable in their entirety.
+	// LastSyncedSize is the fsynced active-segment file size.
 	LastSyncedSize int64 `json:"last_synced_size,omitempty"`
 
-	// LastSyncedSeq is the WAL seq of the highest-seq record contained in a
-	// block that has been fsync'd. WAL records with seq <= LastSyncedSeq are
-	// already durable in the segment and must be skipped on replay; otherwise
-	// a crash between saveMeta and wal.Truncate would re-apply them and create
-	// duplicates. Only meaningful while !Sealed.
+	// LastSyncedSeq is the highest WAL sequence fsynced into the active segment.
 	LastSyncedSeq uint64 `json:"last_synced_seq,omitempty"`
 
-	// UploadState tracks remote-store upload progress for sealed segments.
-	// Only meaningful when Sealed=true and a remote SegmentStore is configured.
+	// UploadState is meaningful only for sealed segments.
 	UploadState UploadState `json:"upload_state,omitempty"`
 
 	// UploadAttempts counts failed upload attempts since the last success.
-	// Reset to zero on UploadStateUploaded. Used to drive backoff in the
-	// background uploader.
 	UploadAttempts uint32 `json:"upload_attempts,omitempty"`
 
-	// LastUploadErr is the most recent upload error message (truncated). Empty
-	// on success. Diagnostic only — never read for control flow.
+	// LastUploadErr is the most recent upload error message.
 	LastUploadErr string `json:"last_upload_err,omitempty"`
 
-	// LocalPresent records whether the segment's data file currently exists on
-	// local disk. Decoupled from UploadState so the four combinations are
-	// expressible: fresh-sealed (Local+true), dual-resident (Uploaded+true),
-	// cold-evicted (Uploaded+false). Local+false is invalid and rejected by
-	// MarkLocalEvicted.
-	//
-	// Pointer so the zero JSON value (field absent) is distinguishable from an
-	// explicit false. Older meta.json predates the field; loadMeta calls
-	// migrateLocalPresent to set it based on file existence.
+	// LocalPresent records whether the data file exists on local disk.
+	// Nil means the value must be inferred for legacy metadata.
 	LocalPresent *bool `json:"local_present,omitempty"`
+
+	// DeletePending marks a sealed segment selected for terminal deletion.
+	DeletePending bool `json:"delete_pending,omitempty"`
 }
 
-// HasLocalCopy reports whether the segment's data file is expected to be on
-// local disk. Treats a nil LocalPresent (legacy meta before migration) as
-// true so pre-tiering segments are not mistaken for evicted ones.
+// HasLocalCopy reports whether the segment data file is expected locally.
 func (s SegmentMeta) HasLocalCopy() bool {
 	if s.LocalPresent == nil {
 		return true
@@ -105,22 +85,12 @@ func loadMeta(dir string) (*StoreMeta, error) {
 	return &m, nil
 }
 
-// migrateLocalPresent fills in SegmentMeta.LocalPresent for entries that lack
-// the field (older meta.json). The decision is purely file-existence based:
-// if the .alog is on disk, mark present; otherwise mark absent. This is a
-// one-time, idempotent backfill — the caller (loadMeta) doesn't persist the
-// migrated state, so on every restart the same backfill runs cheaply.
-// Persisting only happens when a real mutation (MarkLocalEvicted, MarkUploaded,
-// etc.) writes meta back.
+// migrateLocalPresent infers LocalPresent for legacy metadata.
 func migrateLocalPresent(dir string, m *StoreMeta) {
 	for i := range m.Segments {
 		if m.Segments[i].LocalPresent != nil {
 			continue
 		}
-		// Validate that the recorded file name matches the segment-naming
-		// pattern before touching the filesystem. A meta.json with a crafted
-		// FileName (e.g. "../etc/passwd") would otherwise let Stat escape
-		// the data dir. ParseSegmentID accepts only seg_NNNNNNNN.alog.
 		fileName := m.Segments[i].FileName
 		if _, ok := ParseSegmentID(fileName); !ok {
 			absent := false
@@ -164,9 +134,7 @@ func saveMeta(dir string, m *StoreMeta) error {
 		return fmt.Errorf("meta: rename: %w", err)
 	}
 
-	// fsync the directory so the rename is durable across power loss; without
-	// this the directory entry update may be lost while the file content
-	// survives, leaving stale meta on disk.
+	// Sync the directory so the rename is durable.
 	if d, err := os.Open(dir); err == nil { //nolint:gosec
 		_ = d.Sync()
 		_ = d.Close()
@@ -179,10 +147,7 @@ func segmentFileName(id uint32) string {
 	return fmt.Sprintf("seg_%08d.alog", id)
 }
 
-// ParseSegmentID extracts the numeric ID from a segment file name produced
-// by segmentFileName. Returns (0, false) if the name doesn't match the
-// expected pattern. Used by reconcile paths that learn about segments via
-// remote-store listings rather than the local meta.
+// ParseSegmentID extracts the numeric ID from a segment file name.
 func ParseSegmentID(fileName string) (uint32, bool) {
 	var id uint32
 	n, err := fmt.Sscanf(fileName, "seg_%08d.alog", &id)

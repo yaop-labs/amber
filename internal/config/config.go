@@ -20,10 +20,8 @@ type Config struct {
 	Debug     DebugConfig     `yaml:"debug"`
 }
 
-// MetricsConfig governs the embedded metricsengine store. When Enabled the
-// store opens at <storage.data_dir>/metrics by default; override with Dir.
-// Limits and intervals map 1-to-1 onto metricsengine/store.Options; zero
-// in any field defers to metricsengine's own default.
+// MetricsConfig configures the embedded metrics store.
+// Zero limits use the metricsengine defaults.
 type MetricsConfig struct {
 	Enabled             bool          `yaml:"enabled"`
 	Dir                 string        `yaml:"dir"`
@@ -33,10 +31,8 @@ type MetricsConfig struct {
 	MaxLabelsPerSeries  int           `yaml:"max_labels_per_series"`
 	Retention           time.Duration `yaml:"retention"`
 	CompactionMinBlocks int           `yaml:"compaction_min_blocks"`
-	// DogfoodInterval, when >0, enables the in-process self-scrape: every
-	// interval the selfobs registry is snapshotted and appended to the
-	// embedded metric store. 30s is a reasonable starting point. Zero
-	// disables.
+	// DogfoodInterval enables the in-process selfobs scraper.
+	// Zero disables it.
 	DogfoodInterval time.Duration `yaml:"dogfood_interval"`
 }
 
@@ -45,31 +41,15 @@ type DebugConfig struct {
 	PprofAddr string `yaml:"pprof_addr"`
 }
 
-// RetentionConfig groups two independently-tunable policies (logs, spans) plus
-// a shared scheduler interval. Per-stream split lets traces age out faster
-// than logs without yaml gymnastics. BREAKING CHANGE from earlier flat shape
-// (MaxAge/MaxBytes/MaxSegments at top level) — no migration: rename keys in
-// existing config files.
+// RetentionConfig groups the per-stream retention policies.
 type RetentionConfig struct {
 	Logs     StreamRetentionConfig `yaml:"logs"`
 	Spans    StreamRetentionConfig `yaml:"spans"`
 	Interval time.Duration         `yaml:"interval"`
 }
 
-// StreamRetentionConfig governs one stream's retention. Two tiers:
-//
-//   - Local tier (LocalMaxAge / LocalMaxBytes): evict the data file from
-//     local disk while keeping the S3 object. Only applies when S3 is
-//     configured and the segment has been uploaded. Zero = disabled.
-//
-//   - Global tier (MaxAge / MaxBytes / MaxSegments): delete the segment
-//     everywhere, including S3. Zero = disabled. RequireUploaded (set by
-//     runtime when S3 is enabled) still gates against deleting the only
-//     durable copy if the uploader has fallen behind.
-//
-// Local thresholds should be < global thresholds; cleaner does not enforce
-// this — it just runs the local pass first, so a misconfig where local > global
-// effectively makes local a no-op.
+// StreamRetentionConfig configures local and global retention for one stream.
+// Local limits remove only the local copy. Global limits remove the segment.
 type StreamRetentionConfig struct {
 	LocalMaxAge   time.Duration `yaml:"local_max_age"`
 	LocalMaxBytes int64         `yaml:"local_max_bytes"`
@@ -101,10 +81,7 @@ type S3Config struct {
 	Region   string `yaml:"region"`
 	Endpoint string `yaml:"endpoint"` // custom endpoint for MinIO/R2/etc.
 
-	// ReconcileOnStart triggers a remote List at startup and adopts any sealed
-	// segments not present in local meta. Default false: reconcile runs only
-	// when local meta is empty (typical fresh-node case). Enable for paranoid
-	// fleets where local state can diverge from S3 (e.g. partial restores).
+	// ReconcileOnStart adopts sealed remote segments at startup.
 	ReconcileOnStart bool `yaml:"reconcile_on_start"`
 }
 
@@ -117,20 +94,26 @@ type StorageConfig struct {
 }
 
 type IngestConfig struct {
-	BatchSize             int           `yaml:"batch_size"`
-	BatchTimeout          time.Duration `yaml:"batch_timeout"`
-	QueueSize             int           `yaml:"queue_size"`
-	ShutdownTimeout       time.Duration `yaml:"shutdown_timeout"`
-	BreakerThreshold      int           `yaml:"breaker_threshold"`
-	MaxAttrsPerEntry      int           `yaml:"max_attrs_per_entry"`
-	MaxAttrValueBytes     int           `yaml:"max_attr_value_bytes"`
-	MaxAttrKeysPerService int           `yaml:"max_attr_keys_per_service"`
+	BatchSize             int              `yaml:"batch_size"`
+	BatchTimeout          time.Duration    `yaml:"batch_timeout"`
+	QueueSize             int              `yaml:"queue_size"`
+	ShutdownTimeout       time.Duration    `yaml:"shutdown_timeout"`
+	BreakerThreshold      int              `yaml:"breaker_threshold"`
+	Logs                  IngestLaneConfig `yaml:"logs"`
+	Spans                 IngestLaneConfig `yaml:"spans"`
+	MaxAttrsPerEntry      int              `yaml:"max_attrs_per_entry"`
+	MaxAttrValueBytes     int              `yaml:"max_attr_value_bytes"`
+	MaxAttrKeysPerService int              `yaml:"max_attr_keys_per_service"`
 }
 
-// NamedAPIKey is a single (name, key) pair. The name appears in access logs
-// and request context, the key is the bearer token. Multiple entries enable
-// zero-downtime rotation: deploy with both old and new keys present, switch
-// clients, then remove the old entry.
+type IngestLaneConfig struct {
+	BatchSize        int           `yaml:"batch_size"`
+	BatchTimeout     time.Duration `yaml:"batch_timeout"`
+	QueueSize        int           `yaml:"queue_size"`
+	BreakerThreshold int           `yaml:"breaker_threshold"`
+}
+
+// NamedAPIKey is a named bearer token.
 type NamedAPIKey struct {
 	Name string `yaml:"name"`
 	Key  string `yaml:"key"`
@@ -153,9 +136,7 @@ type APIConfig struct {
 	GRPCAddr string `yaml:"grpc_addr"`
 }
 
-// ResolvedAPIKeys returns the effective list of named keys after merging
-// the legacy api_key field with api_keys. If neither is set, returns nil
-// — middleware uses nil/empty as "auth disabled".
+// ResolvedAPIKeys returns api_keys, or api_key as a single default key.
 func (c APIConfig) ResolvedAPIKeys() []NamedAPIKey {
 	if len(c.APIKeys) > 0 {
 		return c.APIKeys
@@ -171,60 +152,31 @@ type LogConfig struct {
 	Format string `yaml:"format"`
 }
 
-// Default config tuned for a single mid-tier node and modest log volume.
-// Each value is a starting point — every comment below records WHY this
-// number, not just what it is.
+// Default returns the default configuration.
 func Default() *Config {
 	return &Config{
 		Storage: StorageConfig{
-			DataDir: "./data",
-			// 100k records ≈ 1 MiB compressed; heap-threshold pruning then
-			// skips all but 1-2 segments per query → p50 stays 50-100ms.
+			DataDir:           "./data",
 			SegmentMaxRecords: 100_000,
-			// 128 MiB safety cap; normal workloads hit the record limit first.
-			SegmentMaxBytes: 128 << 20,
+			SegmentMaxBytes:   128 << 20,
 		},
 		Ingest: IngestConfig{
-			// 1000 amortizes WAL/segment syscalls and zstd framing without
-			// stalling ingest on a single batch flush.
-			BatchSize: 1000,
-			// 100 ms is the tail-latency ceiling at low ingestion rates
-			// where BatchSize is never reached before timeout.
-			BatchTimeout: 100 * time.Millisecond,
-			// 100k items ≈ 100 batches of 1000 — absorbs short bursts;
-			// past this we surface backpressure via ErrQueueFull metric.
-			QueueSize: 100_000,
-			// 30 s drain budget on shutdown; longer hangs are FS pathology
-			// and we'd rather lose tail items than block kubectl rollout.
-			ShutdownTimeout: 30 * time.Second,
-			// 10 consecutive WriteBatch failures opens the breaker. Low
-			// enough to react before queue fills, high enough to ride out
-			// transient blips (single fsync stall, brief disk full).
-			BreakerThreshold: 10,
-			// 64 attrs/entry — covers normal OTLP resource+log attrs with
-			// headroom; anything over is a label-bomb.
-			MaxAttrsPerEntry: 64,
-			// 4 KiB per value — typical log line, plenty for stack frames,
-			// stops megabyte payloads from bloating bitmap indexes.
-			MaxAttrValueBytes: 4096,
-			// 1024 unique attr keys per service is generous enough that no
-			// healthy app trips it; request_id-style key bombs pass it fast.
+			BatchSize:             1000,
+			BatchTimeout:          100 * time.Millisecond,
+			QueueSize:             100_000,
+			ShutdownTimeout:       30 * time.Second,
+			BreakerThreshold:      10,
+			MaxAttrsPerEntry:      64,
+			MaxAttrValueBytes:     4096,
 			MaxAttrKeysPerService: 1024,
 		},
 		API: APIConfig{
-			HTTPAddr: ":8080",
-			// 30 s for body upload — OTLP batches can be MB-scale on
-			// slow links.
-			ReadTimeout: 30 * time.Second,
-			// 5 s for headers — tight enough to kill slow-loris,
-			// loose enough for intercontinental TLS handshakes.
+			HTTPAddr:          ":8080",
+			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 5 * time.Second,
-			// 30 s for response — query results can be large.
-			WriteTimeout: 30 * time.Second,
-			// 120 s keeps pooled connections from wedging idle workers
-			// while still letting browsers / scrapers reuse sockets.
-			IdleTimeout:     120 * time.Second,
-			MaxRequestBytes: 32 << 20,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxRequestBytes:   32 << 20,
 		},
 		Debug: DebugConfig{
 			PprofAddr: "localhost:6060",
@@ -237,14 +189,7 @@ func Default() *Config {
 			Interval: time.Hour,
 		},
 		Metrics: MetricsConfig{
-			// Enabled by default: amber's promise is one binary that holds
-			// logs, traces, and metrics. Operators who don't want the metrics
-			// store can flip this off; nothing else changes.
-			Enabled: true,
-			// Empty Dir resolves to <storage.data_dir>/metrics at runtime.
-			// 24h retention covers the common rolling-window dashboard case
-			// without locking us into longer storage commitments before the
-			// cold tier lands.
+			Enabled:   true,
 			Retention: 24 * time.Hour,
 		},
 	}
@@ -276,11 +221,7 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// detectLegacyRetention surfaces a loud error when a config file still uses
-// the old flat retention shape (max_age/max_bytes/max_segments at the
-// retention top level). yaml.Unmarshal silently drops unknown keys; without
-// this check a stale config would parse to RetentionConfig.Enabled() == false
-// and retention would just stop running, which is worse than failing fast.
+// detectLegacyRetention rejects the old flat retention keys.
 func detectLegacyRetention(data []byte) error {
 	var probe struct {
 		Retention map[string]any `yaml:"retention"`
@@ -311,8 +252,30 @@ func (c *Config) Validate() error {
 	if c.Ingest.QueueSize <= 0 {
 		return fmt.Errorf("ingest.queue_size must be positive")
 	}
+	if err := validateIngestLane("ingest.logs", c.Ingest.Logs); err != nil {
+		return err
+	}
+	if err := validateIngestLane("ingest.spans", c.Ingest.Spans); err != nil {
+		return err
+	}
 	if c.API.HTTPAddr == "" {
 		return fmt.Errorf("api.http_addr is required")
+	}
+	return nil
+}
+
+func validateIngestLane(name string, lane IngestLaneConfig) error {
+	if lane.BatchSize < 0 {
+		return fmt.Errorf("%s.batch_size must be positive when set", name)
+	}
+	if lane.BatchTimeout < 0 {
+		return fmt.Errorf("%s.batch_timeout must be positive when set", name)
+	}
+	if lane.QueueSize < 0 {
+		return fmt.Errorf("%s.queue_size must be positive when set", name)
+	}
+	if lane.BreakerThreshold < 0 {
+		return fmt.Errorf("%s.breaker_threshold must be positive when set", name)
 	}
 	return nil
 }

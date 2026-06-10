@@ -3,6 +3,7 @@ package ingest
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -113,6 +114,10 @@ func AnyValueToString(v *commonpb.AnyValue) string {
 		return val.StringValue
 	case *commonpb.AnyValue_IntValue:
 		return fmt.Sprintf("%d", val.IntValue)
+	case *commonpb.AnyValue_DoubleValue:
+		return strconv.FormatFloat(val.DoubleValue, 'g', -1, 64)
+	case *commonpb.AnyValue_BoolValue:
+		return strconv.FormatBool(val.BoolValue)
 	default:
 		b, _ := json.Marshal(v)
 		return string(b)

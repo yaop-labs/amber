@@ -20,7 +20,7 @@ type logsServer struct {
 }
 
 func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsServiceRequest) (*collectorlogs.ExportLogsServiceResponse, error) {
-	if s.batcher.IsBreakerOpen() {
+	if s.batcher.IsLogBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
 	}
 	var rejected int64
@@ -58,7 +58,7 @@ type tracesServer struct {
 }
 
 func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
-	if s.batcher.IsBreakerOpen() {
+	if s.batcher.IsSpanBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
 	}
 	var rejected int64

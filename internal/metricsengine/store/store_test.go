@@ -1423,6 +1423,61 @@ func TestStoreRecoversPreparedFlushWithoutManifest(t *testing.T) {
 	}
 }
 
+func TestStoreRecoversCommittedPendingFlushWithoutManifest(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(model.LabelSet{{Name: "job", Value: "api"}}, model.MetricTypeGauge, 1000, 1); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "block-committed.meb")
+	if err := st.engine.PrepareFlushBlock(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFlushPendingMarker(path, "prepared"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.engine.CommitFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFlushPendingMarker(path, "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if st.catalogLog != nil {
+		if err := st.catalogLog.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recovered, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	blocks, err := recovered.Blocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || filepath.Base(blocks[0]) != filepath.Base(path) {
+		t.Fatalf("blocks = %v, want recovered committed block %s", blocks, filepath.Base(path))
+	}
+	series, err := recovered.Select(index.NewSelector(index.LabelEqual("job", "api")), query.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || len(series[0].Values) != 1 || series[0].Values[0] != 1 {
+		t.Fatalf("series = %+v, want one recovered block sample", series)
+	}
+	if recovered.engine.BufferedSamples() != 0 {
+		t.Fatalf("BufferedSamples = %d, want 0 after committed WAL truncate", recovered.engine.BufferedSamples())
+	}
+}
+
 func TestStoreSelectPrunesBlocksByManifestTime(t *testing.T) {
 	st, err := Open(t.TempDir())
 	if err != nil {

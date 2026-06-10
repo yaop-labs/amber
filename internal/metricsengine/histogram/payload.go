@@ -5,14 +5,9 @@ import (
 	"sort"
 )
 
-// Per-series payload encoding for the sketch_section.
-//
-// Temporal layout (kept deliberately simple — validation showed temporal-delta
-// only saves ~1.2x over storing full sketches; most savings come from sketch
-// compactness + bucket sparsity): the first tick is stored as a FULL sketch,
-// then each subsequent tick stores only the buckets whose count CHANGED, as
-// signed integer deltas, plus the (small) scalar synopsis fields. If the scale
-// or zero-threshold changes between ticks, that tick falls back to a full sketch.
+// Per-series payload encoding for the sketch section.
+// The first tick stores a full sketch. Later ticks store bucket deltas and
+// scalar fields unless scale or zero threshold changes.
 
 const (
 	tickFull  = 0x01
@@ -34,7 +29,7 @@ func encodeExpPayload(s ExpSeries) []byte {
 			dst = AppendSketch(dst, sk)
 		} else {
 			dst = append(dst, tickDelta)
-			dst = appendVarint(dst, int64(sk.Scale)) // redundant but cheap; keeps decode uniform
+			dst = appendVarint(dst, int64(sk.Scale))
 			dst = appendExpScalars(dst, sk)
 			dst = appendBucketDeltas(dst, prev.Positive, sk.Positive)
 			dst = appendBucketDeltas(dst, prev.Negative, sk.Negative)

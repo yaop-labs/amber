@@ -48,9 +48,8 @@ func MaxBytesMiddleware(limit int64, next http.Handler) http.Handler {
 // downstream handlers and the access log can attribute the call. An empty
 // keys list disables auth entirely (single-node / dev mode).
 //
-// Comparison is constant-time per candidate key. Iteration order is
-// fixed (config-declared order) — match-time leakage is per-key, not
-// per-key-name, so renaming a key does not expose a side channel.
+// Comparison is constant-time per candidate key and does not short-circuit on
+// the first match.
 func APIKeyMiddleware(keys []config.NamedAPIKey, next http.Handler) http.Handler {
 	if len(keys) == 0 {
 		return next
@@ -68,10 +67,7 @@ func APIKeyMiddleware(keys []config.NamedAPIKey, next http.Handler) http.Handler
 		}
 		got := []byte(auth[len("Bearer "):])
 
-		// Match against every key (no short-circuit) so total work is
-		// independent of key position. A single match wins; ties are
-		// resolved to the first config entry, which is fine because
-		// duplicate keys are an operator misconfiguration.
+		// Match against every key so total work is independent of key position.
 		matchedName := ""
 		for i, exp := range expected {
 			if subtle.ConstantTimeCompare(got, exp) == 1 && matchedName == "" {

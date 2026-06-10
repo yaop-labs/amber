@@ -15,12 +15,7 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-// segmentFetcher pulls a segment data file and all its sidecars from a
-// remote SegmentStore into the local cache directory. fileName is the
-// data-file base name (e.g. "seg_00000001.alog"); sidecars are derived
-// from storage.SegmentSidecarExts. Returning nil means every required
-// file is now present at filepath.Join(localDir, fileName + ext) for
-// the data ext; missing optional sidecars are tolerated.
+// segmentFetcher materializes a segment and its required sidecars locally.
 type segmentFetcher func(fileName string) error
 
 type readerCache struct {
@@ -29,14 +24,10 @@ type readerCache struct {
 	items    map[string]*list.Element
 	order    *list.List
 
-	// fetcher, if non-nil, is called when OpenSegmentReader fails with
-	// os.ErrNotExist. It pulls the segment from remote storage and the
-	// open is retried. Nil disables remote fetch (default for local-only
-	// deployments).
+	// fetcher pulls missing segments from remote storage. Nil disables remote
+	// fetches.
 	fetcher segmentFetcher
 	// flight deduplicates concurrent remote fetches of the same segment.
-	// Without it N concurrent queries against an evicted segment would
-	// each pay N S3 GETs.
 	flight singleflight.Group
 }
 
@@ -62,26 +53,15 @@ func newReaderCache(capacity int) *readerCache {
 	}
 }
 
-// setFetcher wires a remote-fetch fallback. Pass nil to disable. The cache
-// itself stays unaware of S3 specifics; the fetcher closure encapsulates
-// store + local dir.
+// setFetcher wires a remote-fetch fallback.
 func (c *readerCache) setFetcher(f segmentFetcher) {
 	c.fetcher = f
 }
 
-// makeStoreFetcher builds a segmentFetcher that pulls every sidecar for
-// fileName from store, materializing them under localDir. Missing remote
-// sidecars (except the data file itself) are tolerated — bootstrap or
-// on-demand build rebuilds them. Atomic write is delegated to store.Get,
-// which writes through a temp file and renames.
-//
-// kind is the storage stream tag ("logs"|"spans") used for cold-read metrics
-// and the single observability log emitted per fetch. log may be nil.
+// makeStoreFetcher builds a fetcher backed by a SegmentStore.
+// Missing optional sidecars are tolerated; the data file is required.
 func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *slog.Logger) segmentFetcher {
 	return func(fileName string) error {
-		// Treat the absence of the data file as the cold-read trigger:
-		// sidecar-only refetches (rare, only when bidx/fidx/etc. went missing
-		// but .alog stayed) shouldn't inflate the cold-fetch counter.
 		dataMissing := false
 		if _, err := os.Stat(filepath.Join(localDir, fileName)); err != nil && os.IsNotExist(err) {
 			dataMissing = true
@@ -90,8 +70,6 @@ func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *sl
 		start := time.Now()
 		for _, ext := range storage.SegmentSidecarExts {
 			name := fileName + ext
-			// Skip if already present locally — store.Get does this check
-			// too, but avoiding the call saves a lock acquire in singleflight.
 			if _, err := os.Stat(filepath.Join(localDir, name)); err == nil {
 				continue
 			}
@@ -106,7 +84,6 @@ func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *sl
 				if ext == "" {
 					return err
 				}
-				// Non-fatal sidecar fetch failure; carry on.
 				continue
 			}
 			_ = rc.Close()
@@ -115,9 +92,6 @@ func makeStoreFetcher(store storage.SegmentStore, localDir, kind string, log *sl
 			elapsed := time.Since(start)
 			selfobs.QueryColdSegmentReads.WithLabelValues(kind).Inc()
 			selfobs.QueryColdSegmentFetchDur.WithLabelValues(kind).Observe(elapsed.Seconds())
-			// One log per cold fetch is bounded by segment size (sealed
-			// segments are tens of MB), so this stays quiet even when the
-			// query plan scans many segments.
 			if log != nil {
 				log.Info("cold segment fetch",
 					"kind", kind,

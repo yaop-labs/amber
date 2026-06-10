@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
@@ -19,23 +20,47 @@ import (
 // by merging sketches across blocks and label groupings in the compressed
 // domain. It never decodes exp-histograms to raw points.
 type Store struct {
-	dir string
-	mu  sync.Mutex
-	seq int
+	dir   string
+	opts  Options
+	clock func() time.Time
+	mu    sync.Mutex
+	seq   int
 }
 
-// OpenStore opens (creating if needed) a histogram store rooted at dir.
+// Options configures histogram retention and cardinality limits.
+type Options struct {
+	Retention          time.Duration
+	MaxActiveSeries    int
+	MaxLabelsPerSeries int
+	Clock              func() time.Time
+}
+
+// OpenStore opens a histogram store rooted at dir.
 func OpenStore(dir string) (*Store, error) {
+	return OpenStoreWithOptions(dir, Options{})
+}
+
+// OpenStoreWithOptions opens a histogram store with options.
+func OpenStoreWithOptions(dir string, opts Options) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("histogram: dir is required")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir}
-	// Resume the block sequence past any existing blocks.
-	paths, _ := s.blockPaths()
-	s.seq = len(paths)
+	clock := opts.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	s := &Store{dir: dir, opts: opts, clock: clock}
+	paths, err := s.blockPaths()
+	if err != nil {
+		return nil, err
+	}
+	s.seq = nextBlockSeq(paths)
+	if err := s.enforceRetentionLocked(paths); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -55,11 +80,17 @@ func (tr TimeRange) overlaps(mn, mx int64) bool { return mn <= tr.End && mx >= t
 func (s *Store) WriteBlock(exp []ExpSeries, explicit []ExplicitSeries) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.validateWriteLocked(exp, explicit); err != nil {
+		return "", err
+	}
 	path := filepath.Join(s.dir, fmt.Sprintf("hblock-%06d.mhb", s.seq))
 	if err := WriteBlock(path, exp, explicit); err != nil {
 		return "", err
 	}
 	s.seq++
+	if err := s.enforceRetentionLocked(nil); err != nil {
+		return "", err
+	}
 	return path, nil
 }
 
@@ -72,9 +103,119 @@ func (s *Store) blockPaths() ([]string, error) {
 	return paths, nil
 }
 
-// MetricNames returns the sorted, deduplicated set of __name__ label values
-// across every histogram series in every block. Read-only: scans directories
-// without decoding payloads.
+func nextBlockSeq(paths []string) int {
+	maxSeq := -1
+	for _, path := range paths {
+		base := filepath.Base(path)
+		if !strings.HasPrefix(base, "hblock-") || !strings.HasSuffix(base, ".mhb") {
+			continue
+		}
+		raw := strings.TrimSuffix(strings.TrimPrefix(base, "hblock-"), ".mhb")
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		if n > maxSeq {
+			maxSeq = n
+		}
+	}
+	return maxSeq + 1
+}
+
+func (s *Store) validateWriteLocked(exp []ExpSeries, explicit []ExplicitSeries) error {
+	incoming := make(map[string]model.LabelSet)
+	for _, series := range exp {
+		if err := validateLabels(series.Labels, s.opts); err != nil {
+			return err
+		}
+		labels := series.Labels.Canonical()
+		incoming[labels.Key()] = labels
+	}
+	for _, series := range explicit {
+		if err := validateLabels(series.Labels, s.opts); err != nil {
+			return err
+		}
+		labels := series.Labels.Canonical()
+		incoming[labels.Key()] = labels
+	}
+	if s.opts.MaxActiveSeries <= 0 || len(incoming) == 0 {
+		return nil
+	}
+
+	existing, err := s.seriesKeysLocked()
+	if err != nil {
+		return err
+	}
+	newCount := 0
+	for key := range incoming {
+		if _, ok := existing[key]; !ok {
+			newCount++
+		}
+	}
+	if len(existing)+newCount > s.opts.MaxActiveSeries {
+		return fmt.Errorf("histogram: active series limit exceeded: have %d new %d max %d", len(existing), newCount, s.opts.MaxActiveSeries)
+	}
+	return nil
+}
+
+func validateLabels(labels model.LabelSet, opts Options) error {
+	if opts.MaxLabelsPerSeries > 0 && len(labels) > opts.MaxLabelsPerSeries {
+		return fmt.Errorf("histogram: label limit exceeded: labels %d max %d", len(labels), opts.MaxLabelsPerSeries)
+	}
+	for _, label := range labels.Canonical() {
+		if label.Name == "" {
+			return errors.New("histogram: invalid labels: empty label name")
+		}
+	}
+	return nil
+}
+
+func (s *Store) seriesKeysLocked() (map[string]struct{}, error) {
+	paths, err := s.blockPaths()
+	if err != nil {
+		return nil, err
+	}
+	keys := make(map[string]struct{})
+	for _, path := range paths {
+		dir, err := ReadDirectory(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range dir.Series {
+			keys[entry.Labels.Canonical().Key()] = struct{}{}
+		}
+	}
+	return keys, nil
+}
+
+func (s *Store) enforceRetentionLocked(paths []string) error {
+	if s.opts.Retention <= 0 {
+		return nil
+	}
+	if paths == nil {
+		var err error
+		paths, err = s.blockPaths()
+		if err != nil {
+			return err
+		}
+	}
+	cutoff := s.clock().Add(-s.opts.Retention).UnixMilli()
+	for _, path := range paths {
+		dir, err := ReadDirectory(path)
+		if err != nil {
+			return err
+		}
+		_, maxTS, ok := dir.TimeRange()
+		if ok && maxTS < cutoff {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("histogram: remove expired block %s: %w", filepath.Base(path), err)
+			}
+		}
+	}
+	return nil
+}
+
+// MetricNames returns the sorted metric names in histogram blocks.
 func (s *Store) MetricNames() ([]string, error) {
 	paths, err := s.blockPaths()
 	if err != nil {
@@ -100,9 +241,7 @@ func (s *Store) MetricNames() ([]string, error) {
 	return out, nil
 }
 
-// Stats summarizes histogram-store contents: block count, total series across
-// blocks (NOT unique-by-labels — that would be a fingerprint join), total
-// bytes on disk, and the [min,max] timestamp envelope.
+// Stats summarizes the histogram store.
 type Stats struct {
 	Blocks  int
 	Series  int
@@ -263,9 +402,7 @@ func (s *Store) MergeExp(selector index.Selector, tr TimeRange) (*ExponentialHis
 	return MergeAll(all), nil
 }
 
-// Summary answers sum/count/min/max over matching histograms. When the window is
-// unbounded it is answered purely from the directory synopsis (zone-map) without
-// decoding any sketch; otherwise it decodes only the ticks inside the window.
+// Summary returns sum, count, min, and max for matching histograms.
 func (s *Store) Summary(selector index.Selector, tr TimeRange) (Synopsis, error) {
 	if err := selector.Validate(); err != nil {
 		return Synopsis{}, err

@@ -12,10 +12,8 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-// Policy is one stream's two-tier retention. Local thresholds evict the disk
-// copy but leave the remote (S3) object; global thresholds delete the segment
-// everywhere. Zero values mean disabled for that threshold. The cleaner runs
-// the local pass first, then the global pass.
+// Policy is the retention policy for one stream.
+// Local limits remove local files. Global limits remove the segment.
 type Policy struct {
 	LocalMaxAge   time.Duration
 	LocalMaxBytes int64
@@ -32,15 +30,13 @@ type Cleaner struct {
 	sparse          *index.SparseIndex
 	policy          Policy
 	dataDir         string
-	stream          string // "logs" | "spans", labels local-evict metrics
+	stream          string // "logs" or "spans"
 	log             *slog.Logger
 	onDelete        func(storage.SegmentMeta)
 	requireUploaded bool
 }
 
-// NewCleaner builds a Cleaner. stream labels per-stream metrics; pass "logs"
-// or "spans". An empty stream is allowed for legacy/test callers; the local
-// eviction counter will then carry an empty kind label, which is harmless.
+// NewCleaner returns a Cleaner for one stream.
 func NewCleaner(
 	manager *storage.SegmentManager,
 	sparse *index.SparseIndex,
@@ -63,33 +59,25 @@ func (c *Cleaner) SetOnDelete(fn func(storage.SegmentMeta)) {
 	c.onDelete = fn
 }
 
-// RequireUploaded gates retention on the segment having reached
-// UploadStateUploaded. Enable on nodes using a remote SegmentStore so a
-// transient S3 outage doesn't delete the only copy of a segment that
-// hasn't been uploaded yet. Default (off) preserves local-only behavior.
+// RequireUploaded requires UploadStateUploaded before global deletion.
 func (c *Cleaner) RequireUploaded(v bool) {
 	c.requireUploaded = v
 }
 
-// Run executes both retention stages. Returns total segments touched (local
-// evictions + global deletions). Errors during a single segment are logged
-// and counted as "not touched"; the loop continues to the next.
+// Run applies local and global retention and returns the number of segments
+// touched. Per-segment errors are logged and do not stop the run.
 func (c *Cleaner) Run() (int, error) {
-	segments := c.manager.Segments()
+	segments := c.manager.SegmentsForRetention()
 	if len(segments) == 0 {
 		return 0, nil
 	}
 
 	touched := 0
 
-	// Stage 1: local-tier eviction. Only segments that are durably uploaded
-	// AND still have a local copy are candidates. No RequireUploaded check
-	// needed here — the Uploaded gate is intrinsic to local eviction's
-	// safety story: you cannot drop the local file if no remote copy exists.
 	if c.policy.hasLocalTier() {
 		var localCandidates []storage.SegmentMeta
 		for _, s := range segments {
-			if s.UploadState == storage.UploadStateUploaded && s.HasLocalCopy() {
+			if !s.DeletePending && s.UploadState == storage.UploadStateUploaded && s.HasLocalCopy() {
 				localCandidates = append(localCandidates, s)
 			}
 		}
@@ -97,14 +85,11 @@ func (c *Cleaner) Run() (int, error) {
 		touched += evicted
 	}
 
-	// Stage 2: global retention. Re-read segments since stage 1 only mutated
-	// LocalPresent; the slice itself is stable, but reusing the snapshot
-	// keeps stage 2's view consistent within this Run.
 	globalCandidates := segments
 	if c.requireUploaded {
 		eligible := globalCandidates[:0:0]
 		for _, s := range globalCandidates {
-			if s.UploadState == storage.UploadStateUploaded {
+			if s.DeletePending || s.UploadState == storage.UploadStateUploaded {
 				eligible = append(eligible, s)
 			}
 		}
@@ -134,10 +119,7 @@ func (c *Cleaner) Run() (int, error) {
 	return touched, nil
 }
 
-// runLocalEviction evicts local copies according to LocalMaxAge and
-// LocalMaxBytes. Selection mirrors the global pass: age first, then oldest-
-// first for the byte budget. Errors are logged per segment and don't abort
-// the pass.
+// runLocalEviction removes local copies selected by the local limits.
 func (c *Cleaner) runLocalEviction(candidates []storage.SegmentMeta) int {
 	if len(candidates) == 0 {
 		return 0
@@ -203,13 +185,9 @@ func (c *Cleaner) runLocalEviction(candidates []storage.SegmentMeta) int {
 	return evicted
 }
 
-// evictLocal removes one segment's local files (data + sidecars) and marks
-// the manifest. The remote copy is untouched; subsequent queries will refetch.
-// Order matters: mark meta first so a crash between file delete and meta
-// update doesn't leave a phantom-present record pointing at a missing file.
-// With mark-first, a crash leaves the file on disk but meta saying absent;
-// next-tick scan will see HasLocalCopy()==false and skip it — the file is
-// orphaned until manual cleanup, but data is intact.
+// evictLocal removes one segment's local files.
+// It marks metadata before deleting files so a crash cannot leave metadata
+// claiming a local copy that is gone.
 func (c *Cleaner) evictLocal(seg storage.SegmentMeta) error {
 	if err := c.manager.MarkLocalEvicted(seg.ID); err != nil {
 		return err
@@ -226,8 +204,6 @@ func (c *Cleaner) evictLocal(seg storage.SegmentMeta) error {
 	return nil
 }
 
-// evictionCandidate carries the segment and the policy that selected it,
-// so the metric label is accurate even when multiple policies overlap.
 type evictionCandidate struct {
 	seg    storage.SegmentMeta
 	reason string
@@ -236,6 +212,13 @@ type evictionCandidate struct {
 func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []evictionCandidate {
 	var toDelete []evictionCandidate
 	now := time.Now().UnixNano()
+
+	for _, seg := range segments {
+		if seg.DeletePending {
+			toDelete = append(toDelete, evictionCandidate{seg: seg, reason: "delete_pending"})
+		}
+	}
+	segments = filterOutCandidates(segments, toDelete)
 
 	if c.policy.MaxAge > 0 {
 		cutoff := now - c.policy.MaxAge.Nanoseconds()
@@ -248,10 +231,6 @@ func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []evictionCa
 
 	remaining := filterOutCandidates(segments, toDelete)
 
-	// MaxSegments and MaxTotalBytes both evict from the oldest end. Sort by
-	// MaxTS ascending so segments[0] is the oldest. Without this we relied on
-	// the manager returning segments in insertion order — true today, fragile
-	// to assume forever.
 	sort.SliceStable(remaining, func(i, j int) bool {
 		return remaining[i].MaxTS < remaining[j].MaxTS
 	})
@@ -278,8 +257,6 @@ func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []evictionCa
 	return toDelete
 }
 
-// filterOutCandidates returns segments not present in exclude. Mirrors
-// filterOut but takes the new candidate shape.
 func filterOutCandidates(all []storage.SegmentMeta, exclude []evictionCandidate) []storage.SegmentMeta {
 	if len(exclude) == 0 {
 		return all
@@ -298,17 +275,21 @@ func filterOutCandidates(all []storage.SegmentMeta, exclude []evictionCandidate)
 }
 
 func (c *Cleaner) deleteSegment(seg storage.SegmentMeta) error {
-	if err := c.manager.RemoveSegment(seg.ID); err != nil {
-		return err
-	}
-
-	if err := c.manager.DeleteSegmentFiles(seg); err != nil {
+	if err := c.manager.BeginDeleteSegment(seg.ID); err != nil {
 		return err
 	}
 
 	c.sparse.Remove(seg.ID)
 	if err := c.sparse.Save(c.dataDir); err != nil {
 		c.log.Warn("sparse index save failed", "err", err)
+	}
+
+	if err := c.manager.DeleteSegmentFiles(seg); err != nil {
+		return err
+	}
+
+	if err := c.manager.RemoveSegment(seg.ID); err != nil {
+		return err
 	}
 
 	if c.onDelete != nil {

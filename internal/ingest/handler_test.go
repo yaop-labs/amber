@@ -149,3 +149,151 @@ func TestBatcher_SendAndDrain(t *testing.T) {
 		t.Errorf("expected 200 records after drain, got %d", logManager.ActiveRecordCount())
 	}
 }
+
+func TestBatcher_RotationTouchesWrittenSegmentSparseIndex(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	logManager, err := storage.OpenSegmentManager(dir+"/logs", storage.RotationPolicy{MaxRecords: 1, MaxBytes: 128 << 20})
+	if err != nil {
+		t.Fatalf("open log manager: %v", err)
+	}
+	spanManager, err := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open span manager: %v", err)
+	}
+	defer logManager.Close()
+	defer spanManager.Close()
+
+	logSparse := index.NewSparseIndex()
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: logSparse, SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 1, BatchTimeout: time.Hour, QueueSize: 16},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	batcher.Start(ctx)
+	defer func() {
+		cancel()
+		batcher.Wait()
+	}()
+
+	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "rotate"}
+	if err := batcher.SendLog(entry); err != nil {
+		t.Fatalf("SendLog: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if len(logManager.Segments()) == 1 && len(logSparse.All()) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for rotation; sealed=%d sparse=%d", len(logManager.Segments()), len(logSparse.All()))
+		case <-tick.C:
+		}
+	}
+
+	sealed := logManager.Segments()[0]
+	ranges := logSparse.All()
+	if ranges[0].SegmentID != sealed.ID || ranges[0].FileName != sealed.FileName {
+		t.Fatalf("sparse range = %+v, want sealed segment id=%d file=%s", ranges[0], sealed.ID, sealed.FileName)
+	}
+}
+
+func TestBatcher_LogQueueFullDoesNotBlockSpan(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	logManager, _ := storage.OpenSegmentManager(dir+"/logs", storage.DefaultRotationPolicy)
+	spanManager, _ := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	defer logManager.Close()
+	defer spanManager.Close()
+
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 10, BatchTimeout: time.Second, QueueSize: 1},
+	)
+
+	entry1 := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "one"}
+	entry2 := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "two"}
+	if err := batcher.SendLog(entry1); err != nil {
+		t.Fatalf("first SendLog: %v", err)
+	}
+	if err := batcher.SendLog(entry2); err != ErrQueueFull {
+		t.Fatalf("second SendLog error = %v, want ErrQueueFull", err)
+	}
+
+	span := model.SpanEntry{
+		ID:        model.MustNewEntryID(),
+		Service:   "traces",
+		Operation: "GET /ok",
+		StartTime: time.Now(),
+		EndTime:   time.Now().Add(time.Millisecond),
+		Status:    model.SpanStatusOK,
+	}
+	if err := batcher.SendSpan(span); err != nil {
+		t.Fatalf("SendSpan after log queue full: %v", err)
+	}
+	if batcher.LogQueueLen() != 1 {
+		t.Fatalf("LogQueueLen = %d, want 1", batcher.LogQueueLen())
+	}
+	if batcher.SpanQueueLen() != 1 {
+		t.Fatalf("SpanQueueLen = %d, want 1", batcher.SpanQueueLen())
+	}
+}
+
+func TestBatcher_LogBreakerDoesNotBlockSpan(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	logManager, _ := storage.OpenSegmentManager(dir+"/logs", storage.DefaultRotationPolicy)
+	spanManager, _ := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	defer spanManager.Close()
+
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 1, BatchTimeout: time.Hour, QueueSize: 16, BreakerThreshold: 1},
+	)
+
+	_ = logManager.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	batcher.Start(ctx)
+	defer func() {
+		cancel()
+		batcher.Wait()
+	}()
+
+	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "trip"}
+	if err := batcher.SendLog(entry); err != nil {
+		t.Fatalf("SendLog: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for !batcher.IsLogBreakerOpen() {
+		select {
+		case <-deadline:
+			t.Fatal("log breaker did not open")
+		case <-tick.C:
+		}
+	}
+	if batcher.IsSpanBreakerOpen() {
+		t.Fatal("span breaker opened from log failure")
+	}
+
+	span := model.SpanEntry{
+		ID:        model.MustNewEntryID(),
+		Service:   "traces",
+		Operation: "GET /ok",
+		StartTime: time.Now(),
+		EndTime:   time.Now().Add(time.Millisecond),
+		Status:    model.SpanStatusOK,
+	}
+	if err := batcher.SendSpan(span); err != nil {
+		t.Fatalf("SendSpan after log breaker open: %v", err)
+	}
+}

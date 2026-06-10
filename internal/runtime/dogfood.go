@@ -9,18 +9,7 @@ import (
 	"github.com/yaop-labs/amber/internal/selfobs"
 )
 
-// runDogfoodScraper periodically snapshots the in-process selfobs registry
-// and writes the result into amber's own embedded metric store. This is the
-// "amber observes itself" loop: scrape-equivalent telemetry without an
-// external Prometheus, so single-node deployments still get rate() over their
-// own counters via the same /api/v1/metrics/rate endpoint that external
-// callers use.
-//
-// Scope choices: we bypass the OTLP path and call AppendBatch directly. The
-// HTTP loopback alternative would exercise the real ingest pipeline, but at
-// the cost of a parser dependency and an extra goroutine per scrape; for a
-// purely internal feedback loop, the direct call is cheaper and equally
-// observable downstream.
+// runDogfoodScraper appends self-observation samples to the metric store.
 func runDogfoodScraper(interval time.Duration, store *mestore.Store, log *slog.Logger, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(interval)
@@ -41,10 +30,7 @@ func runDogfoodScraper(interval time.Duration, store *mestore.Store, log *slog.L
 	}
 }
 
-// snapshotToSamples converts a selfobs.Snapshot result into metricsengine
-// samples. The "type" field in selfobs ("counter"|"gauge") maps directly onto
-// MetricTypeCounter/MetricTypeGauge; everything else (including histogram
-// _count/_sum derived series) rides through this translation unchanged.
+// snapshotToSamples converts a selfobs snapshot to metricsengine samples.
 func snapshotToSamples(snap []selfobs.Sample, tsMillis int64) []model.Sample {
 	if len(snap) == 0 {
 		return nil

@@ -1,6 +1,8 @@
 package query
 
 import (
+	"slices"
+
 	"github.com/yaop-labs/amber/internal/index"
 )
 
@@ -89,10 +91,5 @@ func (p *Planner) Plan(q *LogQuery) *ExecutionPlan {
 }
 
 func (plan *ExecutionPlan) HasStep(step PlanStep) bool {
-	for _, s := range plan.Steps {
-		if s == step {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(plan.Steps, step)
 }

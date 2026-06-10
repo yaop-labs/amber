@@ -8,31 +8,8 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-// TestStoreEvictionBoundaryEqualsBlockRetention pins the load-bearing
-// invariant called out in INDEX_EVICTION_SPEC_v0 §1 and the comment in
-// OpenWithOptions: the index-eviction threshold MUST equal the block-
-// retention threshold. Both must derive from opts.Retention; a series
-// whose lastTouch crosses the threshold must become evictable from the
-// in-memory index AT THE SAME instant the block it belongs to would be
-// dropped by retention. If these two ever drift, queries can either
-// hit a block whose series the index has forgotten (correctness bug:
-// active-series gauge undercount, query-by-label still works via
-// matchLabels-on-block-directory but the index lies) or, worse, evict
-// the series before the block is gone, surfacing as a query that finds
-// the block but cannot route through the registry.
-//
-// The test calibrates clock + lastTouch + cutoff and asserts that:
-//
-//	(1) index.Sweep evicts a series whose age strictly exceeds Retention,
-//	(2) index.Sweep does NOT evict a series whose age equals or is below
-//	    Retention,
-//	(3) the block-retention cutoff computed by maintenance() lands at
-//	    exactly the same Unix-ms boundary the index sweep uses.
-//
-// If a future refactor introduces a separate EvictionInterval option,
-// it must either be wired to be equal to Retention OR this test must
-// be updated alongside an explicit audit of the failure-mode comment
-// in OpenWithOptions.
+// TestStoreEvictionBoundaryEqualsBlockRetention verifies that index eviction
+// and block retention use the same cutoff derived from opts.Retention.
 func TestStoreEvictionBoundaryEqualsBlockRetention(t *testing.T) {
 	const retentionMs = int64(60_000) // 60s
 	retention := time.Duration(retentionMs) * time.Millisecond

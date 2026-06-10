@@ -10,30 +10,22 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-// Catalog-log binary record format. INDEX_EVICTION_SPEC_v0.md §2; see
-// catalog_log.go for lifecycle. Self-contained codec — no file or sync
-// concerns live here, so the framing can be unit-tested without disk.
+// Catalog-log binary record format.
+// File lifecycle is handled in catalog_log.go; this file only defines framing
+// and record encoding.
 //
 //	record   = total_len[4] | crc32[4] | type[1] | body[total_len-9]
 //	type=0x01 REGISTER:  series_id[8] | labels_len[4] | labels_blob[labels_len]
 //	type=0x03 EVICT:     series_id[8] | ts_unix_ms[8]
 //
-// CRC covers total_len|type|body (everything except the crc field). The
-// length prefix MUST be CRC-protected: a bit flip in total_len shifts the
-// next-record boundary and either cascades CRC failures or silently
-// validates garbage at the wrong offset. Verify CRC BEFORE trusting the
-// length for the next seek.
+// CRC covers total_len|type|body, excluding the crc field. The length prefix is
+// included so recovery never trusts an unverified next-record boundary.
 //
-// All integers little-endian, fixed-width. No varint. Labels are encoded
-// as a length-prefixed sequence of (name_len[2]|name|value_len[2]|value)
-// pairs — simple, deterministic, no JSON/proto runtime dependency on the
-// recovery path.
+// All integers are fixed-width little-endian. Labels are encoded as
+// (name_len[2]|name|value_len[2]|value) pairs.
 //
-// TOUCH (type=0x02) is reserved but NOT written by v0: §2 of the spec
-// chose to not log per-ingest touches (avoids steady-state write
-// amplification). Recovery instead reconstructs lastTouch from block
-// data (see store.go reconcileLastTouchFromBlocks). The slot is held so
-// a future coalesced-touch option can be added without a format break.
+// TOUCH is reserved for a future coalesced-touch record. v0 rebuilds
+// last-touch state from blocks during startup reconciliation.
 
 const (
 	catalogRecordRegister byte = 0x01
@@ -56,16 +48,10 @@ const (
 
 var catalogCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
-// ErrCatalogLogCorrupt is returned by the reader when a record's CRC does
-// not match its contents. Recovery refuses to proceed past a corrupt
-// record — same posture as the WAL — because silently skipping past
-// corruption is exactly how data losses go undetected.
+// ErrCatalogLogCorrupt is returned when a record fails integrity checks.
 var ErrCatalogLogCorrupt = errors.New("catalog log: record CRC mismatch")
 
-// ErrCatalogLogTorn is returned when the reader encounters a partial
-// record at EOF. Recovery treats this as the normal end-of-life shape
-// (last fsync didn't cover the last append) — truncate the file to the
-// last good record boundary and continue.
+// ErrCatalogLogTorn is returned for a partial record at EOF.
 var ErrCatalogLogTorn = errors.New("catalog log: torn record at EOF")
 
 type catalogRecord struct {
@@ -92,9 +78,8 @@ func encodeRegister(seriesID uint64, labels model.LabelSet) []byte {
 	return out
 }
 
-// encodeEvict returns the on-disk bytes for an EVICT record. ts is the
-// wall-clock at the moment the sweep decided to evict — preserved so an
-// operator inspecting the log can reconstruct an eviction timeline.
+// encodeEvict returns the on-disk bytes for an EVICT record.
+// ts is the wall-clock time at which the sweep evicted the series.
 func encodeEvict(seriesID uint64, ts int64) []byte {
 	total := catalogHeaderLen + 1 + 8 + 8
 	out := make([]byte, total)
@@ -108,10 +93,7 @@ func encodeEvict(seriesID uint64, ts int64) []byte {
 	return out
 }
 
-// encodeLabels serialises a LabelSet as a sequence of
-// (name_len[2]|name|value_len[2]|value) pairs. Caller-supplied LabelSet
-// is assumed canonical (sorted, no empty names); we don't re-canonicalise
-// in the codec — that's a hot-path concern handled at registration.
+// encodeLabels serializes a canonical LabelSet.
 func encodeLabels(labels model.LabelSet) []byte {
 	size := 0
 	for _, l := range labels {
@@ -168,7 +150,6 @@ func readRecord(r io.Reader) (catalogRecord, error) {
 		return catalogRecord{}, io.EOF
 	}
 	if err == io.ErrUnexpectedEOF {
-		// Less than catalogHeaderLen bytes available — partial header.
 		return catalogRecord{}, ErrCatalogLogTorn
 	}
 	if err != nil {
@@ -177,20 +158,11 @@ func readRecord(r io.Reader) (catalogRecord, error) {
 	total := int(binary.LittleEndian.Uint32(header[0:4]))
 	wantCRC := binary.LittleEndian.Uint32(header[4:8])
 	if total < catalogMinRecordLen || total > catalogMaxRecordLen {
-		// Length is structurally impossible. Could be corruption mid-prefix
-		// OR a torn-write that landed garbage in the length field. Either
-		// way, we cannot safely advance the read cursor — surface as
-		// corruption (same posture as a CRC mismatch).
 		return catalogRecord{}, fmt.Errorf("%w: invalid record length %d", ErrCatalogLogCorrupt, total)
 	}
 	body := make([]byte, total-catalogHeaderLen)
 	_, err = io.ReadFull(r, body)
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		// Header parsed but body short = torn write. The header bytes
-		// are NOT trusted yet (CRC unverified) so we cannot definitively
-		// say the prefix was good — but the caller's recovery posture
-		// for both cases is the same: truncate at the start of THIS
-		// record and continue.
 		return catalogRecord{}, ErrCatalogLogTorn
 	}
 	if err != nil {
@@ -219,11 +191,6 @@ func decodeBody(body []byte) (catalogRecord, error) {
 		}
 		seriesID := binary.LittleEndian.Uint64(body[1:9])
 		labelsLen := int(binary.LittleEndian.Uint32(body[9:13]))
-		// labels_len MUST exactly span the remaining bytes: a smaller value
-		// means there are unaccounted-for bytes between the labels blob and
-		// the next record boundary (would silently corrupt the labels read
-		// on the next call); a larger value means the framing claims more
-		// labels-data than was written.
 		if catalogRegisterHeader+labelsLen != len(body) {
 			return catalogRecord{}, fmt.Errorf("register labels_len %d mismatches body size %d", labelsLen, len(body)-catalogRegisterHeader)
 		}

@@ -34,20 +34,38 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if h.batcher.IsBreakerOpen() {
-		writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
-		return
-	}
 	switch r.URL.Path {
 	case "/v1/logs":
+		if h.logIngestUnavailable(w) {
+			return
+		}
 		h.handleLogs(w, r)
 	case "/v1/traces":
+		if h.spanIngestUnavailable(w) {
+			return
+		}
 		h.handleTraces(w, r)
 	case "/v1/metrics":
 		h.handleMetrics(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *OTLPHandler) logIngestUnavailable(w http.ResponseWriter) bool {
+	if h.batcher == nil || !h.batcher.IsLogBreakerOpen() {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
+	return true
+}
+
+func (h *OTLPHandler) spanIngestUnavailable(w http.ResponseWriter) bool {
+	if h.batcher == nil || !h.batcher.IsSpanBreakerOpen() {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
+	return true
 }
 
 func (h *OTLPHandler) handleLogs(w http.ResponseWriter, r *http.Request) {

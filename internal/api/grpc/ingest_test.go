@@ -18,14 +18,17 @@ import (
 )
 
 type fakeSender struct {
-	logErr    error
-	spanErr   error
-	breakerOn bool
+	logErr        error
+	spanErr       error
+	logBreakerOn  bool
+	spanBreakerOn bool
 }
 
 func (f fakeSender) SendLog(model.LogEntry) error   { return f.logErr }
 func (f fakeSender) SendSpan(model.SpanEntry) error { return f.spanErr }
-func (f fakeSender) IsBreakerOpen() bool            { return f.breakerOn }
+func (f fakeSender) IsBreakerOpen() bool            { return f.logBreakerOn || f.spanBreakerOn }
+func (f fakeSender) IsLogBreakerOpen() bool         { return f.logBreakerOn }
+func (f fakeSender) IsSpanBreakerOpen() bool        { return f.spanBreakerOn }
 
 func TestLogsExportReturnsPartialSuccessOnRejectedRecords(t *testing.T) {
 	s := &logsServer{

@@ -1,7 +1,5 @@
-// Package runtime is the shared core stack used by both the standalone binary
-// (cmd/amber) and the embedded amber.Open API. It owns storage, indexes,
-// query executor, and the ingest batcher — but NOT HTTP/gRPC servers,
-// retention, pprof, or signal handling, which live in main.
+// Package runtime owns the storage, index, query, and ingest stack shared by
+// the standalone binary and the embedded API.
 package runtime
 
 import (
@@ -11,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +23,17 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
+func joinS3Prefix(parts ...string) string {
+	joined := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.Trim(part, "/")
+		if part != "" {
+			joined = append(joined, part)
+		}
+	}
+	return strings.Join(joined, "/")
+}
+
 type Options struct {
 	DataDir        string
 	Logger         *slog.Logger
@@ -34,11 +44,8 @@ type Options struct {
 	IndexCacheSize int
 }
 
-// MetricsOptions controls the embedded metricsengine store. Disabled is the
-// kill switch — when true the store is not opened and Stack.MetricStore stays
-// nil. Dir defaults to <DataDir>/metrics. The remaining fields map directly
-// onto metricsengine/store.Options; zero in any field defers to the engine's
-// own default.
+// MetricsOptions configures the embedded metrics store.
+// Zero limits use the metricsengine defaults.
 type MetricsOptions struct {
 	Disabled            bool
 	Dir                 string
@@ -48,29 +55,33 @@ type MetricsOptions struct {
 	MaxLabelsPerSeries  int
 	Retention           time.Duration
 	CompactionMinBlocks int
-	// DogfoodInterval enables the in-process selfobs → metric-store scraper.
-	// Zero (default) disables it. Recommended starting point: 30s — matches a
-	// typical Prometheus scrape, gives enough samples for rate() over a 5m
-	// window, and keeps overhead negligible.
+	// DogfoodInterval enables the in-process selfobs scraper.
+	// Zero disables it.
 	DogfoodInterval time.Duration
 }
 
 type StorageOptions struct {
 	SegmentMaxRecords uint64
 	SegmentMaxBytes   int64
-	// S3Bucket enables S3-compatible object storage. When non-empty, sealed
-	// segments and their index sidecars are uploaded to S3 after each seal.
-	// Reads fall back to S3 on a local cache miss.
+	// S3Bucket enables S3-compatible storage for sealed segments.
 	S3Bucket   string
 	S3Prefix   string
 	S3Region   string
 	S3Endpoint string // empty = AWS, non-empty = MinIO/R2/etc.
-	// S3ReconcileOnStart forces a remote List at startup. Without it, reconcile
-	// still runs but only when the local meta has no sealed segments.
+	// S3ReconcileOnStart adopts sealed remote segments at startup.
 	S3ReconcileOnStart bool
 }
 
 type IngestOptions struct {
+	BatchSize        int
+	BatchTimeout     time.Duration
+	QueueSize        int
+	BreakerThreshold int
+	Logs             IngestLaneOptions
+	Spans            IngestLaneOptions
+}
+
+type IngestLaneOptions struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
 	QueueSize        int
@@ -83,34 +94,13 @@ type CardinalityOptions struct {
 	MaxAttrKeysPerService int
 }
 
-// Defaults are sized for a single mid-tier node ingesting modest log volume.
-// Operators with very different workloads should override explicitly; the
-// numbers are starting points, not optima.
 const (
-	// 100k records ≈ ~1 MiB compressed per segment (~100s at 1k/s).
-	// Heap-threshold pruning skips all but 1-2 segments per query, keeping
-	// R p50 in the 50-100ms range. At 1M/seg every query scans the full
-	// segment and p50 balloons to 500ms regardless of index quality.
 	defaultSegmentMaxRecords uint64 = 100_000
+	defaultSegmentMaxBytes   int64  = 128 << 20
 
-	// 128 MiB: above S3 multipart minimum (5 MiB), safely below the 5 GiB
-	// cliff, and sized so a single segment at ~1 MiB compressed hits the
-	// record limit long before the byte limit under normal workloads.
-	defaultSegmentMaxBytes int64 = 128 << 20
-
-	// Batch of 1000 amortizes WAL/segment write syscalls and zstd block
-	// framing without making any single batch large enough to stall ingest
-	// while it flushes.
-	defaultBatchSize = 1000
-
-	// 100 ms is the batch ceiling: bound on tail latency from queue entry to
-	// disk for low-rate workloads where BatchSize is never reached.
+	defaultBatchSize    = 1000
 	defaultBatchTimeout = 100 * time.Millisecond
-
-	// 10k queue items ≈ 10 batches of 1000. Anything past this is a sign of
-	// disk backpressure or a runaway producer; SendLog/SendSpan return
-	// ErrQueueFull and the metric counter ticks.
-	defaultQueueSize = 10_000
+	defaultQueueSize    = 10_000
 )
 
 func (o Options) withDefaults() Options {
@@ -146,20 +136,12 @@ type Stack struct {
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
 
-	// MetricStore is the embedded metricsengine store for scalar metrics
-	// (counters, gauges). Nil when metrics are disabled via
-	// MetricsOptions.Disabled.
+	// MetricStore is nil when metrics are disabled.
 	MetricStore *mestore.Store
 
-	// HistogramStore is the embedded metricsengine histogram store
-	// (exponential + explicit-bucket sketches). Opens/closes alongside
-	// MetricStore — the same Disabled kill switch covers both, so the
-	// metric subsystem is atomic from the operator's point of view.
+	// HistogramStore is nil when metrics are disabled.
 	HistogramStore *histogram.Store
 
-	// dogfoodStop, when non-nil, signals the self-scrape goroutine to exit.
-	// Close(dogfoodStop) then <-dogfoodDone is the shutdown handshake; both
-	// are nil when DogfoodInterval == 0.
 	dogfoodStop chan struct{}
 	dogfoodDone chan struct{}
 
@@ -168,15 +150,11 @@ type Stack struct {
 
 	ready *atomic.Bool
 
-	// bootstrapWG gates Close on the LoadSealedIndexes goroutine. Without
-	// this Close can race the goroutine's open file handles against
-	// LogManager.Close, leaving fds dangling — observable as TempDir
-	// cleanup failures in short-lived embedders and tests.
+	// bootstrapWG waits for the sealed-index bootstrap goroutine.
 	bootstrapWG sync.WaitGroup
 }
 
 // IsReady reports whether bootstrap finished loading sealed indexes.
-// Exposed as a method so callers can't flip the flag externally.
 func (s *Stack) IsReady() bool { return s.ready.Load() }
 
 func New(ctx context.Context, opts Options) (*Stack, error) {
@@ -242,7 +220,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			return nil, fmt.Errorf("runtime: open log s3 store: %w", err)
 		}
 		spanS3, err := storage.NewS3Store(ctx, storage.S3StoreConfig{
-			Bucket: s3cfg.Bucket, Prefix: s3cfg.Prefix + "/spans",
+			Bucket: s3cfg.Bucket, Prefix: joinS3Prefix(s3cfg.Prefix, "spans"),
 			Region: s3cfg.Region, Endpoint: s3cfg.Endpoint,
 			LocalDir: spanDir,
 		})
@@ -254,10 +232,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		logManager.SetStore(logS3)
 		spanManager.SetStore(spanS3)
 
-		// Wire remote fetch fallbacks on the reader caches: queries against
-		// segments that were evicted locally (or never on this node, see
-		// reconcile) will pull from S3 transparently. Singleflight inside the
-		// cache dedupes concurrent fetches of the same segment.
 		exec.SetSegmentStores(logS3, spanS3, cfg.Logger)
 
 		logUp = newUploader(logManager, logS3, logDir, cfg.Logger)
@@ -265,16 +239,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		logUp.Start(ctx)
 		spanUp.Start(ctx)
 
-		// Seal callback now just kicks the worker; upload happens off the seal
-		// goroutine so an S3 outage cannot stall rotation. The worker re-reads
-		// PendingUploads on every wake, so missed signals are harmless.
 		logManager.SetOnSealComplete(func(storage.SegmentMeta) { logUp.Enqueue() })
 		spanManager.SetOnSealComplete(func(storage.SegmentMeta) { spanUp.Enqueue() })
 
-		// Reconcile: pull sealed segments that exist in S3 but not in local
-		// meta. Always runs when local meta is empty (typical fresh node);
-		// also runs on every start if the operator opts in. Runs before
-		// LoadSealedIndexes so the loader sees adopted segments.
 		runLogReconcile := cfg.Storage.S3ReconcileOnStart || len(logManager.Segments()) == 0
 		runSpanReconcile := cfg.Storage.S3ReconcileOnStart || len(spanManager.Segments()) == 0
 		if runLogReconcile {
@@ -297,13 +264,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	ready := &atomic.Bool{}
 	s := &Stack{ready: ready}
-	s.bootstrapWG.Go(func() {
-		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
-		if ctx.Err() == nil {
-			ready.Store(true)
-			cfg.Logger.Info("sealed indexes loaded")
-		}
-	})
 
 	var guard *ingest.CardinalityGuard
 	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 {
@@ -321,15 +281,26 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		SpanSparse:  spanSparse,
 		Indexer:     exec.ActiveIndex(),
 		Guard:       guard,
+		Invalidator: exec,
 		Logger:      cfg.Logger,
 	}, ingest.Config{
 		BatchSize:        cfg.Ingest.BatchSize,
 		BatchTimeout:     cfg.Ingest.BatchTimeout,
 		QueueSize:        cfg.Ingest.QueueSize,
 		BreakerThreshold: cfg.Ingest.BreakerThreshold,
+		Logs: ingest.LaneConfig{
+			BatchSize:        cfg.Ingest.Logs.BatchSize,
+			BatchTimeout:     cfg.Ingest.Logs.BatchTimeout,
+			QueueSize:        cfg.Ingest.Logs.QueueSize,
+			BreakerThreshold: cfg.Ingest.Logs.BreakerThreshold,
+		},
+		Spans: ingest.LaneConfig{
+			BatchSize:        cfg.Ingest.Spans.BatchSize,
+			BatchTimeout:     cfg.Ingest.Spans.BatchTimeout,
+			QueueSize:        cfg.Ingest.Spans.QueueSize,
+			BreakerThreshold: cfg.Ingest.Spans.BreakerThreshold,
+		},
 	})
-
-	batcher.Start(ctx)
 
 	var metricStore *mestore.Store
 	var histStore *histogram.Store
@@ -347,7 +318,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
 		})
 		if err != nil {
-			batcher.Wait()
 			if logUp != nil {
 				logUp.Stop()
 			}
@@ -360,9 +330,12 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		metricStore = ms
 
-		hs, err := histogram.OpenStore(filepath.Join(metricsDir, "histograms"))
+		hs, err := histogram.OpenStoreWithOptions(filepath.Join(metricsDir, "histograms"), histogram.Options{
+			Retention:          cfg.Metrics.Retention,
+			MaxActiveSeries:    cfg.Metrics.MaxActiveSeries,
+			MaxLabelsPerSeries: cfg.Metrics.MaxLabelsPerSeries,
+		})
 		if err != nil {
-			batcher.Wait()
 			if logUp != nil {
 				logUp.Stop()
 			}
@@ -390,6 +363,16 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.logUploader = logUp
 	s.spanUploader = spanUp
 
+	s.bootstrapWG.Go(func() {
+		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
+		if ctx.Err() == nil {
+			ready.Store(true)
+			cfg.Logger.Info("sealed indexes loaded")
+		}
+	})
+
+	batcher.Start(ctx)
+
 	if metricStore != nil && cfg.Metrics.DogfoodInterval > 0 {
 		s.dogfoodStop = make(chan struct{})
 		s.dogfoodDone = make(chan struct{})
@@ -400,11 +383,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 }
 
 // Close drains the batcher and shuts down storage under ctx's deadline.
-// Callers MUST cancel the parent context that fed New() before calling
-// Close, so the batcher's run goroutine is already winding down. If ctx
-// expires before drain or filesystem ops complete, Close returns ctx.Err();
-// background goroutines may still be running against frozen disks, but the
-// process can exit. Aggregates all encountered errors via errors.Join.
+// The parent context passed to New must be canceled before Close.
 func (s *Stack) Close(ctx context.Context) error {
 	waitDone := make(chan struct{})
 	go func() {
@@ -417,17 +396,13 @@ func (s *Stack) Close(ctx context.Context) error {
 		return fmt.Errorf("runtime: batcher drain: %w", ctx.Err())
 	}
 
-	// Stop the dogfood scraper before MetricStore.Close — otherwise a tick
-	// fired mid-shutdown would AppendBatch into an already-closed store.
+	// Stop the dogfood scraper before closing the metric store.
 	if s.dogfoodStop != nil {
 		close(s.dogfoodStop)
 		<-s.dogfoodDone
 	}
 
-	// Stop uploaders before closing managers: the worker holds a reference to
-	// the manager and would race with Close otherwise. We do NOT block on
-	// pending uploads here — segments that haven't reached S3 remain in
-	// UploadStateLocal and will be retried on next start.
+	// Stop uploaders before closing segment managers.
 	if s.logUploader != nil {
 		s.logUploader.Stop()
 	}
@@ -435,13 +410,7 @@ func (s *Stack) Close(ctx context.Context) error {
 		s.spanUploader.Stop()
 	}
 
-	// Wait for the bootstrap goroutine to release its segment file handles
-	// before we close the managers. ctx was cancelled by the caller (DB.Close
-	// or test cleanup) so the bootstrap workers' inner ctx.Err() checks will
-	// terminate them quickly. Without this wait, LogManager.Close races
-	// against OpenSegmentReader fds and leaves files unlinkable on POSIX too
-	// (we observed this as t.TempDir cleanup failures during short-lived
-	// embedder lifecycles).
+	// Wait for bootstrap readers before closing segment managers.
 	bsDone := make(chan struct{})
 	go func() {
 		s.bootstrapWG.Wait()
@@ -456,14 +425,13 @@ func (s *Stack) Close(ctx context.Context) error {
 	closeDone := make(chan error, 1)
 	go func() {
 		var errs []error
-		// MetricStore.Close flushes the head into a final block and closes
-		// the WAL. It is independent of the log/span managers, but we close
-		// it here (not later) so a flush hang is bounded by ctx alongside
-		// the segment closes — the timeout budget is shared.
 		if s.MetricStore != nil {
 			if err := s.MetricStore.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("runtime: close metric store: %w", err))
 			}
+		}
+		if s.Executor != nil {
+			s.Executor.Close()
 		}
 		if err := s.LogSparse.Save(s.LogDir); err != nil {
 			errs = append(errs, fmt.Errorf("runtime: save log sparse: %w", err))

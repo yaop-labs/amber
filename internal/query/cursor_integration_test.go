@@ -15,12 +15,7 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-// makeMonotonicID builds an EntryID whose first 6 bytes encode `ms` and
-// whose suffix is a deterministic function of `seq`. Used by cursor tests
-// to keep entry-id ordering aligned with synthetic timestamps — the
-// production MustNewEntryID() uses wall-clock + randomness, so 50 IDs
-// generated in <1ms share the ms-prefix and randomize their ordering,
-// which breaks heap.thresholdID-based top-K guarantees in fixture data.
+// makeMonotonicID returns a deterministic EntryID for cursor tests.
 func makeMonotonicID(ms uint64, seq uint64) model.EntryID {
 	var id model.EntryID
 	id[0] = byte(ms >> 40)
@@ -34,9 +29,13 @@ func makeMonotonicID(ms uint64, seq uint64) model.EntryID {
 	return id
 }
 
-// buildCursorDataset writes n records spread across one hour into a single
-// sealed segment, registers its bitmap index, and returns a ready executor.
-// Records use 5 services round-robin'd so a service filter cuts the volume.
+func makeTinyID(v byte) model.EntryID {
+	var id model.EntryID
+	id[2] = v
+	id[15] = v
+	return id
+}
+
 func buildCursorDataset(t *testing.T, n int) (*Executor, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -104,10 +103,6 @@ func buildCursorDataset(t *testing.T, n int) (*Executor, func()) {
 	return exec, cleanup
 }
 
-// TestExecutor_CursorPagination_NoOverlapNoGap walks the dataset page by
-// page and asserts: (1) consecutive pages don't repeat any entry ID, (2)
-// the union of all pages equals the full dataset, (3) each page (except
-// possibly the last) is exactly Limit big and yields a NextCursor.
 func TestExecutor_CursorPagination_NoOverlapNoGap(t *testing.T) {
 	const total = 50
 	const limit = 7
@@ -143,7 +138,6 @@ func TestExecutor_CursorPagination_NoOverlapNoGap(t *testing.T) {
 			seen[e.ID] = struct{}{}
 		}
 
-		// Pages strictly newest-first within and across pages.
 		for i := 1; i < len(result.Entries); i++ {
 			if result.Entries[i].Timestamp.After(result.Entries[i-1].Timestamp) {
 				t.Errorf("page %d not sorted newest-first at %d", pageCount, i)
@@ -261,5 +255,136 @@ func TestExecutor_CursorPagination_AcrossSegments(t *testing.T) {
 
 	if len(seen) != total {
 		t.Errorf("multi-segment pagination: got %d, want %d", len(seen), total)
+	}
+}
+
+func TestExecutor_LogTopKUsesEventTimestampNotEntryID(t *testing.T) {
+	dir := t.TempDir()
+	logDir := dir + "/logs"
+	spanDir := dir + "/spans"
+
+	mgr, err := storage.OpenSegmentManager(logDir, storage.RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("open mgr: %v", err)
+	}
+	spanMgr, err := storage.OpenSegmentManager(spanDir, storage.RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("open span mgr: %v", err)
+	}
+	defer mgr.Close()
+	defer spanMgr.Close()
+
+	sparse := index.NewSparseIndex()
+	base := time.Now().Add(-time.Hour)
+	entries := []model.LogEntry{
+		{
+			ID:        makeTinyID(9),
+			Timestamp: base,
+			Level:     model.LevelInfo,
+			Service:   "svc",
+			Body:      "older-high-id",
+		},
+		{
+			ID:        makeTinyID(1),
+			Timestamp: base.Add(time.Minute),
+			Level:     model.LevelInfo,
+			Service:   "svc",
+			Body:      "newer-low-id",
+		},
+	}
+	batch := make([]storage.BatchItem, 0, len(entries))
+	for _, entry := range entries {
+		buf := &bytes.Buffer{}
+		entry.WriteTo(buf)
+		data := append([]byte(nil), buf.Bytes()...)
+		batch = append(batch, storage.BatchItem{Data: data, TS: entry.Timestamp.UnixNano()})
+	}
+	if err := mgr.WriteBatch(batch); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if active, ok := mgr.ActiveSegmentMeta(); ok {
+		sparse.TouchRange(active.ID, active.FileName, base.UnixNano(), base.Add(time.Minute).UnixNano())
+	}
+	if err := mgr.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	exec := NewExecutor(mgr, spanMgr, sparse, index.NewSparseIndex())
+	result, err := exec.ExecLog(context.Background(), &LogQuery{Limit: 1})
+	if err != nil {
+		t.Fatalf("ExecLog: %v", err)
+	}
+	if len(result.Entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(result.Entries))
+	}
+	if got := result.Entries[0].Body; got != "newer-low-id" {
+		t.Fatalf("top-K chose %q, want newer-low-id", got)
+	}
+}
+
+func TestExecutor_LogCursorTimestampTieUsesEntryID(t *testing.T) {
+	dir := t.TempDir()
+	logDir := dir + "/logs"
+	spanDir := dir + "/spans"
+
+	mgr, err := storage.OpenSegmentManager(logDir, storage.RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("open mgr: %v", err)
+	}
+	spanMgr, err := storage.OpenSegmentManager(spanDir, storage.RotationPolicy{MaxRecords: 1_000_000, MaxBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("open span mgr: %v", err)
+	}
+	defer mgr.Close()
+	defer spanMgr.Close()
+
+	sparse := index.NewSparseIndex()
+	ts := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	entries := []model.LogEntry{
+		{ID: makeTinyID(1), Timestamp: ts, Level: model.LevelInfo, Service: "svc", Body: "one"},
+		{ID: makeTinyID(2), Timestamp: ts, Level: model.LevelInfo, Service: "svc", Body: "two"},
+		{ID: makeTinyID(3), Timestamp: ts, Level: model.LevelInfo, Service: "svc", Body: "three"},
+	}
+	batch := make([]storage.BatchItem, 0, len(entries))
+	for _, entry := range entries {
+		buf := &bytes.Buffer{}
+		entry.WriteTo(buf)
+		data := append([]byte(nil), buf.Bytes()...)
+		batch = append(batch, storage.BatchItem{Data: data, TS: entry.Timestamp.UnixNano()})
+	}
+	if err := mgr.WriteBatch(batch); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if active, ok := mgr.ActiveSegmentMeta(); ok {
+		sparse.TouchRange(active.ID, active.FileName, ts.UnixNano(), ts.UnixNano())
+	}
+	if err := mgr.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	exec := NewExecutor(mgr, spanMgr, sparse, index.NewSparseIndex())
+	first, err := exec.ExecLog(context.Background(), &LogQuery{Limit: 2})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first.Entries) != 2 {
+		t.Fatalf("first page got %d entries, want 2", len(first.Entries))
+	}
+	if first.Entries[0].Body != "three" || first.Entries[1].Body != "two" {
+		t.Fatalf("first page bodies = %q, %q; want three, two", first.Entries[0].Body, first.Entries[1].Body)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("first page missing next cursor")
+	}
+
+	second, err := exec.ExecLog(context.Background(), &LogQuery{Limit: 2, Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second.Entries) != 1 {
+		t.Fatalf("second page got %d entries, want 1", len(second.Entries))
+	}
+	if second.Entries[0].Body != "one" {
+		t.Fatalf("second page body = %q, want one", second.Entries[0].Body)
 	}
 }

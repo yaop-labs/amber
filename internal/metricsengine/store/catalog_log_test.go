@@ -108,11 +108,8 @@ func TestCatalogLogTornAtEOF(t *testing.T) {
 	}
 }
 
-// TestCatalogLogTornTailIsIdempotentAcrossReboots covers the invariant
-// the load-bearing replay path relies on: after a torn-tail recovery
-// truncates and syncs, a SECOND immediate load yields the same state
-// and does no further truncation. Without this property a series of
-// crashes could compound, each chopping a few more records.
+// TestCatalogLogTornTailIsIdempotentAcrossReboots verifies that repeated
+// recovery stops at the same torn-tail boundary.
 func TestCatalogLogTornTailIsIdempotentAcrossReboots(t *testing.T) {
 	dir := t.TempDir()
 	cl, err := openCatalogLog(dir)

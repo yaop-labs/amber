@@ -7,42 +7,10 @@ import (
 	"time"
 )
 
-// catalogCommitter batches catalog log fsyncs across concurrent
-// AppendRegister/AppendEvict callers (Postgres-style group commit).
-// Direct transplant of internal/metricsengine/engine/committer.go —
-// same shape, same invariants, retargeted at *catalogLog instead of
-// *wal.WAL.
-//
-// Why we need it: the cutover (3a.4) replaced the JSON saveCatalog
-// path with append-only log writes. The JSON path batched a whole
-// ensureCatalog's worth of new series into one fsync (one rewrite-
-// and-fsync of the catalog file); the new log writes one fsync per
-// REGISTER. At warmup (~1300 series in ~60s) that's ~22 fsyncs/sec
-// extra, which knocked control_3a throughput from 96 to 75 samples/sec
-// — the same bug class as the original engine.mu fsync-under-lock
-// pre-PR1. This committer fixes the same way PR1 fixed the engine.
-//
-// Durability bound: a successful Append() guarantees the record was
-// fsync'd before return. Worst-case wait = flushInterval; typical wait
-// << flushInterval because the committer wakes immediately on the
-// ticker, not by polling.
-//
-// Why a sequence number + Cond and not channels: every writer needs to
-// know when the fsync that covered ITS bytes completed. A single
-// broadcast after each Sync wakes all waiters; each checks "is my seq
-// <= synced seq". Avoids per-writer channels (allocation + scheduling
-// cost would scale linearly with concurrency at exactly the moment we
-// most want to avoid scaling-with-concurrency).
-//
-// Crash safety w.r.t. group commit: a lost REGISTER from the batched
-// window is safe IF AND ONLY IF the series' samples reached the
-// WAL/blocks. That coupling is the load-bearing invariant — the
-// engine's WAL group-commit fsync'd the samples, and on next boot
-// reconcileLastTouchFromBlocks (catalog.go) re-registers any series it
-// finds in block directories. So a lost REGISTER becomes a recovered
-// REGISTER via the block path. See TestCatalogLogLostRegisterRecovered
-// FromBlocks (catalog_log_committer_test.go).
-
+// catalogCommitter batches fsyncs for catalog log appends.
+// Append returns after the caller's sequence has been synced. If a process
+// exits before a batched REGISTER reaches disk, startup reconciliation can
+// rebuild the series from block directories.
 type catalogCommitter struct {
 	log           *catalogLog
 	flushInterval time.Duration
@@ -75,11 +43,9 @@ func newCatalogCommitter(log *catalogLog, flushInterval time.Duration) *catalogC
 	return c
 }
 
-// Append writes a record to the log (unsynced) and blocks until that
-// record has been fsync'd by the committer goroutine. Returns whatever
-// error the write or fsync produced; on error the caller's record may
-// or may not be on disk — caller treats it as ingest failure and must
-// NOT update in-memory state.
+// Append writes a record and waits until the committer has fsynced it.
+// On error, the caller should treat ingest as failed and leave in-memory state
+// unchanged.
 func (c *catalogCommitter) Append(rec []byte) error {
 	if len(rec) == 0 {
 		return nil
@@ -93,13 +59,9 @@ func (c *catalogCommitter) Append(rec []byte) error {
 	mySeq := c.nextSeq
 	c.mu.Unlock()
 
-	// Write happens outside the committer mutex. writeUnsynced takes the
-	// catalogLog's own mutex briefly to serialize file appends; no fsync
-	// here.
 	if err := c.log.writeUnsynced(rec); err != nil {
-		// Even on error we publish our seq so a later sync can advance
-		// past us. Otherwise one failed write would stall all subsequent
-		// appends waiting on the cond.
+		// Publish the sequence so a later sync can advance waiters past a
+		// failed append.
 		c.mu.Lock()
 		if mySeq > c.lastWrittenSeq {
 			c.lastWrittenSeq = mySeq
@@ -132,16 +94,14 @@ func (c *catalogCommitter) run() {
 		case <-ticker.C:
 			_ = c.tick()
 		case <-c.stop:
-			// Final drain so any Append() that returned successfully
-			// has definitely been fsync'd before we exit.
+			// Drain once before exit.
 			_ = c.tick()
 			return
 		}
 	}
 }
 
-// flushAndStop drains pending writes one final time and stops the
-// goroutine. Called from Store.Close (via catalogLog.Close). Idempotent.
+// flushAndStop drains pending writes and stops the goroutine.
 func (c *catalogCommitter) flushAndStop() {
 	c.closeOnce.Do(func() {
 		close(c.stop)
@@ -162,9 +122,6 @@ func (c *catalogCommitter) tick() error {
 		return nil
 	}
 	if err := c.log.sync(); err != nil {
-		// Don't advance syncedSeq on error — waiters must see "their
-		// bytes were NOT durable". They'll be unblocked by Close or by
-		// a subsequent successful tick.
 		return err
 	}
 	c.syncedSeq.Store(target)

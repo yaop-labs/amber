@@ -6,11 +6,7 @@ import (
 	"path/filepath"
 )
 
-// atomicWriteFile writes data to path atomically (tmp + fsync + rename +
-// dir-fsync). On crash before the rename, the destination is either absent
-// or holds the previous version. Without this, a process killed mid-write
-// would leave a zero-length or torn index file that the next start would
-// happily load and serve corrupted query results from.
+// atomicWriteFile writes data to path through a fsynced temp file and rename.
 func atomicWriteFile(path string, data []byte) error {
 	return atomicWrite(path, func(f *os.File) error {
 		_, err := f.Write(data)

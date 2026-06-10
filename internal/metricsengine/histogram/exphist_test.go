@@ -34,12 +34,8 @@ func relErr(est, truth float64) float64 {
 	return math.Abs(est-truth) / math.Abs(truth)
 }
 
-// TestCrossScaleMergeGuarantee is THE GATE (load-bearing correctness): merging
-// two exp-histograms built at DIFFERENT scales must down-scale the finer to the
-// coarser before adding, preserving the relative-error guarantee at the coarser
-// scale. Every quantile estimate of the merged sketch must stay within the
-// coarser scale's gamma (with a modest 1.5x slack for the half-bucket geometric
-// midpoint error). If this fails, the storage format is wrong.
+// TestCrossScaleMergeGuarantee verifies that mixed-scale merge preserves the
+// coarser scale's relative-error guarantee.
 func TestCrossScaleMergeGuarantee(t *testing.T) {
 	cases := []struct {
 		fine, coarse int32

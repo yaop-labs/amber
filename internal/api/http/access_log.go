@@ -45,9 +45,7 @@ func AccessLogMiddleware(log *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-// clientIP returns the first IP in X-Forwarded-For if set, else the host
-// portion of RemoteAddr. Best-effort — operators behind untrusted proxies
-// should still validate XFF upstream; we just surface what we see.
+// clientIP returns the first X-Forwarded-For IP, or the RemoteAddr host.
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		if i := strings.IndexByte(xff, ','); i >= 0 {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -15,36 +16,34 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// S3StoreConfig configures an S3-compatible object storage backend.
-// Works with AWS S3, MinIO, Cloudflare R2, DigitalOcean Spaces, and any
-// other S3-compatible store via Endpoint.
+// S3StoreConfig configures an S3-compatible segment store.
 type S3StoreConfig struct {
-	Bucket   string // required
-	Prefix   string // key prefix, no trailing slash (e.g. "amber")
-	Region   string // AWS region; defaults to AWS_DEFAULT_REGION env var
-	Endpoint string // custom endpoint for MinIO/R2/etc., empty = AWS
-	LocalDir string // local cache dir; downloaded segments land here
+	Bucket           string        // required
+	Prefix           string        // key prefix, no leading/trailing slash (e.g. "amber")
+	Region           string        // AWS region; defaults to AWS_DEFAULT_REGION env var
+	Endpoint         string        // custom endpoint for MinIO/R2/etc., empty = AWS
+	LocalDir         string        // local cache dir; downloaded segments land here
+	OperationTimeout time.Duration // per S3 operation timeout; defaults to 5 minutes
 }
 
-// S3Store implements SegmentStore backed by S3-compatible object storage.
-// Sealed segments are uploaded on Put and served from local cache on Get.
-// The local cache directory is the same as the data directory, so reads
-// that already exist locally are zero-cost. When a file is missing locally
-// (e.g. after a node restart), Get downloads it from S3 before returning.
+// S3Store stores sealed segments in S3 and caches reads locally.
 type S3Store struct {
 	client   *s3.Client
 	cfg      S3StoreConfig
 	localDir string
 }
 
-// NewS3Store creates an S3Store using the default AWS credential chain
-// (env vars → ~/.aws/credentials → IAM instance role).
+// NewS3Store creates an S3Store.
 func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3store: bucket is required")
 	}
 	if cfg.LocalDir == "" {
 		return nil, errors.New("s3store: local cache dir is required")
+	}
+	cfg.Prefix = strings.Trim(cfg.Prefix, "/")
+	if cfg.OperationTimeout <= 0 {
+		cfg.OperationTimeout = 5 * time.Minute
 	}
 
 	awsOpts := []func(*config.LoadOptions) error{}
@@ -61,7 +60,6 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 	if cfg.Endpoint != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
-			// Path-style addressing required for MinIO and most S3-compatible stores.
 			o.UsePathStyle = true
 		})
 	}
@@ -76,17 +74,22 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 }
 
 func (s *S3Store) key(name string) string {
-	if s.cfg.Prefix == "" {
+	prefix := strings.Trim(s.cfg.Prefix, "/")
+	if prefix == "" {
 		return name
 	}
-	return s.cfg.Prefix + "/" + name
+	return prefix + "/" + name
 }
 
-// Put uploads the named file to S3. For LocalStore the file already exists
-// on disk; for S3Store we read from r and upload. The caller (seal callback)
-// passes an open reader over the already-written local file.
+func (s *S3Store) operationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s.cfg.OperationTimeout)
+}
+
+// Put uploads name to S3.
 func (s *S3Store) Put(name string, r io.Reader) error {
-	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(s.key(name)),
 		Body:   r,
@@ -97,9 +100,7 @@ func (s *S3Store) Put(name string, r io.Reader) error {
 	return nil
 }
 
-// Get returns a reader for name. If the file exists in the local cache it is
-// returned directly (zero S3 cost). Otherwise it is downloaded from S3 and
-// saved to the local cache before returning.
+// Get returns name, downloading it to the local cache on miss.
 func (s *S3Store) Get(name string) (io.ReadCloser, error) {
 	localPath := filepath.Join(s.localDir, name)
 
@@ -107,7 +108,9 @@ func (s *S3Store) Get(name string) (io.ReadCloser, error) {
 		return f, nil
 	}
 
-	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(s.key(name)),
 	})
@@ -120,7 +123,6 @@ func (s *S3Store) Get(name string) (io.ReadCloser, error) {
 	}
 	defer out.Body.Close()
 
-	// Write to local cache so subsequent reads are free.
 	if err := os.MkdirAll(s.localDir, 0750); err != nil {
 		return nil, fmt.Errorf("s3store: mkdir cache: %w", err)
 	}
@@ -145,11 +147,11 @@ func (s *S3Store) Get(name string) (io.ReadCloser, error) {
 	return os.Open(localPath)
 }
 
-// Delete removes the file from S3 and the local cache. Used for terminal
-// retention where the segment is gone for good. For local-only eviction
-// (keeping the S3 copy intact), use DeleteLocal.
+// Delete removes name from S3 and the local cache.
 func (s *S3Store) Delete(name string) error {
-	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+	ctx, cancel := s.operationContext()
+	defer cancel()
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(s.key(name)),
 	})
@@ -163,9 +165,7 @@ func (s *S3Store) Delete(name string) error {
 	return nil
 }
 
-// DeleteLocal removes the file from the local cache only, leaving the S3
-// object intact. A subsequent Get will re-fetch from S3 on demand. Used by
-// local-tier retention to free disk while keeping the durable copy.
+// DeleteLocal removes name from the local cache only.
 func (s *S3Store) DeleteLocal(name string) error {
 	localPath := filepath.Join(s.localDir, name)
 	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
@@ -182,12 +182,14 @@ func (s *S3Store) List() ([]string, error) {
 	}
 
 	var names []string
+	ctx, cancel := s.operationContext()
+	defer cancel()
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.cfg.Bucket),
 		Prefix: aws.String(prefix),
 	})
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(context.Background())
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("s3store: list: %w", err)
 		}

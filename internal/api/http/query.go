@@ -86,9 +86,8 @@ type QueryHandler struct {
 
 func NewQueryHandler(exec *query.Executor, log *slog.Logger) *QueryHandler {
 	return &QueryHandler{
-		exec:  exec,
-		log:   log,
-		cache: newHTTPCache(256, 5*time.Second),
+		exec: exec,
+		log:  log,
 	}
 }
 
@@ -104,15 +103,17 @@ func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheKey = "ndjson:" + cacheKey
 	}
 
-	if body, ok := h.cache.get(cacheKey); ok {
-		if ndjson {
-			w.Header().Set("Content-Type", "application/x-ndjson")
-		} else {
-			w.Header().Set("Content-Type", "application/json")
+	if h.cache != nil {
+		if body, ok := h.cache.get(cacheKey); ok {
+			if ndjson {
+				w.Header().Set("Content-Type", "application/x-ndjson")
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write(body)
+			return
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(body)
-		return
 	}
 
 	q, err := parseLogQuery(r)
@@ -169,7 +170,9 @@ func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body = buf.Bytes()
 	}
 
-	h.cache.put(cacheKey, body)
+	if h.cache != nil {
+		h.cache.put(cacheKey, body)
+	}
 
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)

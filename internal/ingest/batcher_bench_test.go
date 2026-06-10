@@ -1,7 +1,7 @@
 package ingest
 
 // Batcher hot-path benchmarks. White-box so we can poke `breakerThreshold`
-// and `consecFailures` directly to drive the breaker into "open" without
+// and `logFailures` directly to drive the log breaker into "open" without
 // staging real WriteBatch failures.
 //
 // The pending question (cleanup-2 deferred #5) is: how much do
@@ -52,7 +52,7 @@ func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*
 		BatchSize:    1024,
 		BatchTimeout: time.Second,
 		QueueSize:    4096,
-		// Threshold=1 makes breaker controllable via consecFailures.
+		// Threshold=1 makes breaker controllable via logFailures.
 		BreakerThreshold: 1,
 	}
 	bt := NewBatcher(Deps{
@@ -60,17 +60,17 @@ func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*
 		Logger: discardLogger(),
 	}, cfg)
 	if breakerOpen {
-		bt.consecFailures.Store(1)
+		bt.logFailures.Store(1)
 	}
 	// Tight-loop drain: `for range` is faster than select{<-done, <-queue}
 	// because there's no extra case-comparison per recv. Stop by closing
 	// the queue — drain exits when channel closed and drained. Caller must
 	// not SendLog after stop().
 	go func() {
-		for range bt.queue {
+		for range bt.logQueue {
 		}
 	}()
-	stop := func() { close(bt.queue) }
+	stop := func() { close(bt.logQueue) }
 	return bt, stop
 }
 

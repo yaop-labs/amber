@@ -14,41 +14,21 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-// uploader drains pending segments to a remote SegmentStore in the background.
-//
-// Why background, not synchronous-in-rotate(): a synchronous upload would
-// stall the seal goroutine (and thus the next rotation) for the duration of
-// a network round-trip. On S3 outages that means ingest stops once the
-// active segment fills. Background uploads let writes continue against the
-// local store; the segment is marked UploadStateLocal until the network
-// recovers.
-//
-// Durability: every retry decision is persisted via RecordUploadFailure /
-// MarkUploaded so attempt counters and the final Uploaded transition
-// survive process restart. A crash mid-upload simply re-enqueues on the
-// next start (we re-read PendingUploads from meta.json).
-//
-// Concurrency: one goroutine per manager. Multi-upload parallelism would
-// reorder retries and complicate backoff; segment uploads are not on the
-// hot path for ingest latency, so serial is fine.
+// uploader uploads sealed segments in the background.
+// Upload state is stored in segment metadata and retried after restart.
 type uploader struct {
 	manager *storage.SegmentManager
 	store   storage.SegmentStore
 	dir     string
 	log     *slog.Logger
 
-	// notify is buffered with capacity 1 — additional notifications coalesce
-	// (the worker re-reads PendingUploads on every wake regardless).
+	// notify coalesces upload wakeups.
 	notify chan struct{}
 
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
 }
 
-// Backoff: 1s → 2s → 4s → … capped at 5min. The cap is high enough that a
-// transient S3 outage doesn't drown the log with retries, low enough that
-// recovery happens within minutes of S3 coming back. Jitter ±25% to avoid
-// thundering herds when a fleet of nodes retries after a shared outage.
 const (
 	uploadBackoffInitial = 1 * time.Second
 	uploadBackoffMax     = 5 * time.Minute
@@ -64,8 +44,7 @@ func newUploader(manager *storage.SegmentManager, store storage.SegmentStore, di
 	}
 }
 
-// Start launches the worker goroutine. Returns immediately. The worker stops
-// when ctx is cancelled or Stop is called.
+// Start starts the upload worker.
 func (u *uploader) Start(ctx context.Context) {
 	ctx, u.cancel = context.WithCancel(ctx)
 	u.wg.Add(1)
@@ -80,9 +59,7 @@ func (u *uploader) Stop() {
 	u.wg.Wait()
 }
 
-// Enqueue signals the worker to recheck PendingUploads. Non-blocking: a
-// pending notification coalesces with new ones, since the worker rescans
-// the full list on each wake.
+// Enqueue wakes the upload worker.
 func (u *uploader) Enqueue() {
 	select {
 	case u.notify <- struct{}{}:
@@ -93,7 +70,6 @@ func (u *uploader) Enqueue() {
 func (u *uploader) run(ctx context.Context) {
 	defer u.wg.Done()
 
-	// Start by draining anything left over from previous runs (crash recovery).
 	u.Enqueue()
 
 	for {
@@ -107,9 +83,6 @@ func (u *uploader) run(ctx context.Context) {
 			}
 		}
 
-		// Per-cycle attempt of every pending segment. Failures push them to the
-		// next wake; we don't retry tightly here. Worst case: one segment is
-		// the bottleneck and others wait — acceptable, ordering is FIFO by ID.
 		nextWake := uploadBackoffMax
 		for _, seg := range pending {
 			if ctx.Err() != nil {
@@ -129,8 +102,6 @@ func (u *uploader) run(ctx context.Context) {
 			}
 		}
 
-		// If everything succeeded, nextWake stays at max; we'll block on notify
-		// instead of waking up for nothing.
 		if u.manager.PendingUploads() == nil {
 			select {
 			case <-ctx.Done():
@@ -149,10 +120,8 @@ func (u *uploader) run(ctx context.Context) {
 	}
 }
 
-// uploadOne uploads all sidecars for a single segment. Returns the first
-// error encountered. Missing local files are not errors — they were never
-// built (e.g. a segment with no spans has no posting list); the remote
-// store simply has fewer keys.
+// uploadOne uploads one segment and its sidecars.
+// Missing sidecars are ignored.
 func (u *uploader) uploadOne(seg storage.SegmentMeta) error {
 	for _, ext := range storage.SegmentSidecarExts {
 		name := seg.FileName + ext
@@ -173,27 +142,14 @@ func (u *uploader) uploadOne(seg storage.SegmentMeta) error {
 	return nil
 }
 
-// backoffDelay returns the delay before the next retry given the current
-// attempt count (1-based). Exponential with ±25% jitter, capped at
-// uploadBackoffMax (cap applies AFTER jitter so the final value never
-// exceeds the documented bound).
+// backoffDelay returns the retry delay for a 1-based attempt count.
 func backoffDelay(attempts uint32) time.Duration {
-	// Cap the exponent so the shift can't overflow: at attempts=30 the raw
-	// value already exceeds uploadBackoffMax by orders of magnitude.
-	exp := attempts - 1
-	if exp > 20 {
-		exp = 20
-	}
+	exp := min(attempts - 1, 20)
 	d := uploadBackoffInitial << exp
 	if d <= 0 || d > uploadBackoffMax {
 		d = uploadBackoffMax
 	}
-	// Jitter ±25% of d. math/rand is fine here: this is retry-spread to
-	// avoid thundering herds across nodes, not security-sensitive entropy.
 	jitter := time.Duration(rand.Int64N(int64(d) / 2)) //nolint:gosec
-	out := d - d/4 + jitter
-	if out > uploadBackoffMax {
-		out = uploadBackoffMax
-	}
+	out := min(d - d/4 + jitter, uploadBackoffMax)
 	return out
 }

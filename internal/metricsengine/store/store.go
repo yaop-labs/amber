@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,16 +41,10 @@ type Store struct {
 	backgroundErrMu   sync.RWMutex
 	backgroundErr     error
 
-	// Catalog log — the append-only persistence path that replaces (or in
-	// 3a.2 lives alongside) the JSON saveCatalog write path. Nil until
-	// the boot path opens it. Writes happen under s.mu inside
-	// ensureCatalog; reads only happen at boot (loadCatalogLogState).
+	// catalogLog persists REGISTER and EVICT records after recovery.
 	catalogLog *catalogLog
 
-	// Eviction sweep — background goroutine, lifecycle owned here.
-	// stopSweep signals the goroutine to exit; sweepDone closes when it
-	// has. Sweep interval and retention come from opts.Retention; if
-	// retention <= 0 the sweep is disabled entirely.
+	// stopSweep and sweepDone own the eviction sweep lifecycle.
 	stopSweep chan struct{}
 	sweepDone chan struct{}
 }
@@ -85,19 +80,14 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	// Catalog source-of-truth: the append-only log
-	// (INDEX_EVICTION_SPEC_v0 §2). If the log + snapshot reconstruct
-	// non-empty state, that wins. Otherwise fall back to the legacy
-	// JSON catalog (rolled-out store before 3a, or pre-existing
-	// production data). On a brand new store both yield empty and the
-	// block-rebuild branch below populates from blocks.
+	// Prefer the append-only catalog log. Fall back to the legacy JSON catalog
+	// when opening an older store or an empty log.
 	logLive, logHighest, err := loadCatalogLogState(dir)
 	if err != nil {
 		return nil, fmt.Errorf("catalog log recovery: %w", err)
 	}
 	var catalog Catalog
 	if len(logLive) > 0 {
-		// Build catalog from the log's live set, deterministic by id.
 		ids := make([]uint64, 0, len(logLive))
 		for id := range logLive {
 			ids = append(ids, id)
@@ -111,7 +101,6 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			catalog.NextID = 1
 		}
 	} else {
-		// Fall back to the legacy JSON catalog.
 		catalog, err = loadCatalog(dir)
 		if err != nil {
 			return nil, err
@@ -123,6 +112,9 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	}
 	manifest, err := loadManifest(dir)
 	if err != nil {
+		return nil, err
+	}
+	if err := recoverPendingFlushes(dir, &manifest, filepath.Join(dir, "head.wal")); err != nil {
 		return nil, err
 	}
 	allowGlobFallback := true
@@ -161,31 +153,15 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		}
 		rebuiltFromBlocks = true
 	}
-	// Reconcile last-touch from on-disk blocks. INDEX_EVICTION_SPEC_v0
-	// §1: Import seeds lastTouch=0 (= "unknown"), which means the sweep
-	// will not evict the series. Without this reconcile, any series
-	// known only from blocks would pin at lastTouch=0 forever — leaking
-	// dead ephemerals across restarts, re-creating exactly the bug the
-	// eviction work is closing. The reconcile is best-effort (per-block
-	// errors are surfaced; unreadable blocks just leave their series at
-	// the safe sentinel).
+	// Reconcile last-touch from blocks before enabling eviction.
 	if err := reconcileLastTouchFromBlocks(dir, manifest, e.Registry()); err != nil {
 		return nil, err
 	}
-	// Open the append-only catalog log. This is the source of truth for
-	// REGISTER/EVICT events from 3a onward; loadCatalog (JSON) is kept
-	// as a recovery fallback for stores opened by pre-3a binaries
-	// (INDEX_EVICTION_SPEC_v0 §F).
 	catLog, err := openCatalogLog(dir)
 	if err != nil {
 		return nil, err
 	}
-	// If the catalog came from a block-rebuild (= no log yet, no JSON
-	// catalog, but blocks exist), seed the log with one REGISTER per
-	// recovered series so subsequent boots use the log as source of
-	// truth instead of falling back to JSON again. Seeding runs BEFORE
-	// startCommitter so each REGISTER fsyncs synchronously — the seed
-	// must be durable before normal ingest is allowed to start.
+	// Seed the catalog log when the catalog was rebuilt from blocks.
 	if rebuiltFromBlocks {
 		for _, entry := range catalog.Series {
 			if err := catLog.AppendRegister(entry.ID, entry.Labels); err != nil {
@@ -194,34 +170,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			}
 		}
 	}
-	// Start group-commit on the catalog log. From here on, AppendRegister
-	// and AppendEvict batch fsyncs through the committer goroutine —
-	// fixes the per-REGISTER fsync regression caught by control_3a
-	// (75 vs 96 samples/sec). 5ms flush interval = same default as the
-	// engine's WAL committer. Crash safety relies on
-	// reconcileLastTouchFromBlocks recovering any series whose REGISTER
-	// was lost in the last fsync window — see catalog_log_committer.go
-	// header comment.
 	catLog.startCommitter(5 * time.Millisecond)
-	// Bucketing for the sweep. Granularity = retention / 12 with floor
-	// of 1s — small enough to give bounded held-lock duration per
-	// sweep tick (only one expired bucket at a time), large enough to
-	// keep the bucket-of-id map small.
-	//
-	// LOAD-BEARING INVARIANT (INDEX_EVICTION_SPEC_v0 §1 + hard rule):
-	// the index eviction threshold MUST equal the block retention
-	// threshold. Both derive from the SAME opts.Retention here — that
-	// is the single source of truth. If they ever drift:
-	//   - eviction > retention => block exists, series evicted from
-	//     index => query for that block's labels returns empty
-	//     (data loss surface).
-	//   - eviction < retention => series evicted from index, block
-	//     dropped by retention but the index still holds an entry =>
-	//     impossible by construction (eviction precedes block drop).
-	// The first case is the dangerous one. Don't introduce a separate
-	// EvictionInterval option without enforcing equality with Retention
-	// or auditing the failure mode above; pinned by
-	// TestStoreEvictionBoundaryEqualsBlockRetention.
+	// Use the block retention window as the index eviction window.
 	if opts.Retention > 0 {
 		retentionMs := opts.Retention.Milliseconds()
 		gran := retentionMs / 12
@@ -381,21 +331,119 @@ func (s *Store) Flush() (string, error) {
 		return "", err
 	}
 	minTime, maxTime, _ := dir.TimeRange()
-	s.manifest.Blocks = append(s.manifest.Blocks, BlockMeta{
+	meta := BlockMeta{
 		Path:        filepath.Base(path),
 		MinTime:     minTime,
 		MaxTime:     maxTime,
 		SeriesCount: len(dir.Series),
 		LabelValues: labelValues(dir),
-	})
-	if err := saveManifest(s.dir, s.manifest); err != nil {
+	}
+	if err := writeFlushPendingMarker(path, "prepared"); err != nil {
 		return "", err
 	}
 	if err := s.engine.CommitFlush(); err != nil {
 		return "", err
 	}
+	if err := writeFlushPendingMarker(path, "committed"); err != nil {
+		return "", err
+	}
+	s.manifest.Blocks = append(s.manifest.Blocks, meta)
+	if err := saveManifest(s.dir, s.manifest); err != nil {
+		return "", err
+	}
+	if err := clearFlushPendingMarker(path); err != nil {
+		return "", err
+	}
 	s.directoryCache[path] = dir
 	return path, nil
+}
+
+const flushPendingSuffix = ".flush-pending"
+
+func writeFlushPendingMarker(blockPath, state string) error {
+	marker := blockPath + flushPendingSuffix
+	file, err := os.OpenFile(marker, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte(state)); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(blockPath))
+}
+
+func clearFlushPendingMarker(blockPath string) error {
+	marker := blockPath + flushPendingSuffix
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDir(filepath.Dir(blockPath))
+}
+
+func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error {
+	markers, err := filepath.Glob(filepath.Join(dir, "*"+flushPendingSuffix))
+	if err != nil {
+		return err
+	}
+	if len(markers) == 0 {
+		return nil
+	}
+
+	known := make(map[string]struct{}, len(manifest.Blocks))
+	for _, meta := range manifest.Blocks {
+		known[meta.Path] = struct{}{}
+	}
+	hasWALRecords, err := wal.HasRecords(walPath)
+	if err != nil {
+		return err
+	}
+
+	changed := false
+	for _, marker := range markers {
+		base := strings.TrimSuffix(filepath.Base(marker), flushPendingSuffix)
+		blockPath := filepath.Join(dir, base)
+		if _, ok := known[base]; ok {
+			_ = os.Remove(marker)
+			continue
+		}
+		stateBytes, _ := os.ReadFile(marker)
+		state := strings.TrimSpace(string(stateBytes))
+		committed := state == "committed" || !hasWALRecords
+		if !committed {
+			_ = os.Remove(blockPath)
+			_ = os.Remove(marker)
+			continue
+		}
+		dirInfo, err := block.ReadDirectory(blockPath)
+		if err != nil {
+			return err
+		}
+		minTime, maxTime, _ := dirInfo.TimeRange()
+		manifest.Blocks = append(manifest.Blocks, BlockMeta{
+			Path:        base,
+			MinTime:     minTime,
+			MaxTime:     maxTime,
+			SeriesCount: len(dirInfo.Series),
+			LabelValues: labelValues(dirInfo),
+		})
+		known[base] = struct{}{}
+		changed = true
+		_ = os.Remove(marker)
+	}
+	if changed {
+		if err := saveManifest(dir, *manifest); err != nil {
+			return err
+		}
+	}
+	return syncDir(dir)
 }
 
 func (s *Store) FlushIfNeeded(maxBufferedSeries int) (string, bool, error) {
@@ -551,12 +599,10 @@ func (s *Store) BlockCount() int {
 	return len(s.manifest.Blocks)
 }
 
-// BufferedSeries returns the number of distinct series held in the in-memory
-// head, not yet flushed to a block. Cheap.
+// BufferedSeries returns the number of distinct series in the in-memory head.
 func (s *Store) BufferedSeries() int { return s.engine.BufferedSeries() }
 
-// BufferedSamples returns the number of samples held in the in-memory head,
-// not yet flushed. Cheap.
+// BufferedSamples returns the number of samples in the in-memory head.
 func (s *Store) BufferedSamples() int { return s.engine.BufferedSamples() }
 
 // MetricNames returns the sorted unique metric names visible in the head index.
@@ -566,10 +612,7 @@ func (s *Store) MetricNames() []string {
 	return s.engine.Registry().LabelValues(model.MetricNameLabel)
 }
 
-// ActiveSeries returns the total number of distinct series tracked by the
-// index registry. Cheap (single RLock). This is the load-harness churn
-// signal: bounded under churn → time-sharded eviction works; grows
-// unbounded → series accumulate (VM failure mode).
+// ActiveSeries returns the number of distinct series tracked by the registry.
 func (s *Store) ActiveSeries() int {
 	return s.engine.Registry().SeriesCount()
 }

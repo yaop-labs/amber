@@ -60,16 +60,8 @@ func (w *WAL) AppendBatch(records []Record) error {
 	return w.file.Sync()
 }
 
-// AppendBatchUnsynced writes the records to the WAL file but does NOT call
-// fsync. Caller is responsible for ordering a Sync() before treating any
-// returned write as durable. This split is what enables group commit at the
-// engine level: many concurrent writers can each call AppendBatchUnsynced
-// without serialising on disk fsync, then a single committer goroutine
-// folds all pending bytes into one Sync() call.
-//
-// Threadsafe: still takes the WAL mutex so the file's append cursor stays
-// linear. Without this lock concurrent Write() calls on the same fd would
-// interleave bytes.
+// AppendBatchUnsynced writes records without fsync.
+// The caller must call Sync before treating the records as durable.
 func (w *WAL) AppendBatchUnsynced(records []Record) error {
 	if len(records) == 0 {
 		return nil

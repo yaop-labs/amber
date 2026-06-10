@@ -6,15 +6,9 @@ import (
 	"strings"
 )
 
-// Sample is a single observation extracted from the in-process selfobs
-// registry, in the shape the embedded metricsengine consumes.
-//
-// Type is "counter" for monotonic counters (including func counters) and
-// "gauge" for func gauges. Histograms are flattened to two synthetic series:
-// "<name>_count" (counter) and "<name>_sum" (gauge). Per-bucket _bucket series
-// are intentionally dropped — metricsengine v0 has no histogram query path,
-// so writing 13 extra series per histogram per scrape would just bloat the
-// WAL.
+// Sample is one observation exported from the in-process self-observation
+// registry.
+// Histograms are flattened to count and sum series; bucket series are omitted.
 type Sample struct {
 	Name   string
 	Type   string // "counter" | "gauge"
@@ -26,11 +20,8 @@ type SampleLabel struct {
 	Name, Value string
 }
 
-// Snapshot walks every registered metric and returns a flat list of samples.
-// Used by the in-process dogfood scraper to feed amber's own observability
-// into its embedded metric store. Safe to call concurrently with metric
-// updates — counter/gauge reads are atomic, vec children iteration is under
-// RLock.
+// Snapshot returns all registered self-observation samples.
+// It is safe to call concurrently with metric updates.
 func Snapshot() []Sample {
 	regMu.RLock()
 	cvs := append([]*CounterVec(nil), counterVecs...)

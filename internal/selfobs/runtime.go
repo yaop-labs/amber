@@ -6,24 +6,16 @@ import (
 	"time"
 )
 
-// Go-runtime gauges. Exposed through the /metrics handler so an external load
-// harness (or any operator) can see GC pause distribution, heap-in-use,
-// goroutine count, etc. without needing pprof enabled.
-//
-// We snapshot MemStats lazily and cache it for a brief TTL so a scrape that
-// hits multiple gauges doesn't trigger one stop-the-world per gauge — a
-// single ReadMemStats covers all of them.
+// Go runtime gauges exposed through the /metrics handler.
+// MemStats is cached briefly so one scrape does not call ReadMemStats for every
+// runtime gauge.
 
 var (
 	cachedMemStats   atomic.Pointer[runtime.MemStats]
 	cachedMemStatsAt atomic.Int64 // unix nano
 )
 
-// memStatsTTL bounds how stale a cached MemStats can be before we re-read.
-// 250 ms is conservative: a typical scrape pulls all gauges within
-// microseconds, so the cache hits across one scrape; consecutive scrapes
-// (default 15-30s in Prometheus, 1s in our load harness) always force a
-// fresh read.
+// memStatsTTL bounds how stale cached MemStats can be.
 const memStatsTTL = 250 * time.Millisecond
 
 func readMemStats() *runtime.MemStats {

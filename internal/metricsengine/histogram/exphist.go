@@ -1,11 +1,6 @@
-// Package histogram implements storage and query for the three OTLP histogram
-// types backed by mergeable, relative-error sketches.
-//
-// The differentiator is ExponentialHistogram: it is stored as an OTLP-native
-// mergeable sketch (the same scale/offset/counts layout as the OTLP data point)
-// so that histogram_quantile is answered by MERGING sketches in the compressed
-// domain and reading a single quantile off the merged sketch — never by
-// expanding into per-bucket counter series (the Prometheus way).
+// Package histogram implements OTLP histogram storage and query.
+// Exponential histograms are stored as mergeable sketches in their native
+// scale, offset, and count layout.
 package histogram
 
 import "math"
@@ -141,20 +136,9 @@ func (b Buckets) total() uint64 {
 	return n
 }
 
-// downscale collapses buckets to a coarser scale by shifting each absolute index
-// right by `by` bits (new_index = old_index >> by). This is exact: coarser-scale
-// bucket boundaries are a strict subset of finer-scale boundaries, so the result
-// is identical to binning directly at the coarser scale. Preserves the
-// relative-error guarantee at the coarser scale.
-//
-// Why this works: the OTLP exp-histogram scale s defines bucket
-// boundaries at base^k where base = 2^(2^-s). Going from scale s to
-// scale s-1 doubles the bucket width by collapsing pairs {2k, 2k+1}
-// at scale s into bucket k at scale s-1 — index >> 1. Iterating by
-// `by` scale-steps is `by` shifts: index >> by. The new gamma is
-// gamma(s-by), uniformly larger than gamma(s) — accuracy degrades
-// in a known, bounded way, never silently. Pinned by
-// TestDownscaleExactNesting.
+// downscale collapses buckets to a coarser scale.
+// OTLP exponential bucket boundaries nest by powers of two, so each absolute
+// bucket index maps to index>>by at the coarser scale.
 func (b Buckets) downscale(by int32) Buckets {
 	if by <= 0 || len(b.Counts) == 0 {
 		return b.clone()
@@ -210,45 +194,14 @@ func (h *ExponentialHistogram) Clone() *ExponentialHistogram {
 	return &out
 }
 
-// Merge combines two histograms, down-scaling the finer one to the coarser scale
-// before adding (target_scale = min(a.Scale, b.Scale)). Returns a new histogram.
-//
-// Load-bearing invariants (do not weaken without re-deriving the
-// relative-error guarantee — pinned by TestCrossScaleMergeGuarantee
-// and TestDownscaleExactNesting):
-//
-//  1. target_scale = min(scales). The merged sketch is at the coarsest
-//     scale present. Choosing a finer target would require upscaling
-//     (impossible: a coarse bucket cannot be split exactly without
-//     re-binning the raw data, which we no longer have).
-//
-//  2. downscale(by = scale_diff) maps bucket index i -> i >> by.
-//     This is the exact-nesting property: coarse-scale bucket
-//     boundaries (base^k where base = 2^(2^-coarse)) are a STRICT
-//     SUBSET of fine-scale bucket boundaries. The result is
-//     bit-for-bit identical to binning the same raw data directly at
-//     the coarser scale — verified by TestDownscaleExactNesting.
-//
-//  3. The relative-error guarantee γ = (base-1)/(base+1) is preserved
-//     at the coarser scale: gamma(coarse) >= gamma(fine), and the
-//     merged quantile lies within ±1.5·gamma(coarse) of truth on
-//     realistic lognormal-shape data — pinned by
-//     TestCrossScaleMergeGuarantee.
-//
-// This is the read-path differentiator: histogram_quantile() merges in
-// the compressed domain across heterogeneously-scaled producers,
-// never decodes to raw points, and answers within the OTLP
-// exp-histogram contract's relative-error bound at the coarsest input
-// scale.
+// Merge combines two histograms at the coarsest input scale.
+// The finer histogram is downscaled before bucket counts are added.
 func Merge(a, b *ExponentialHistogram) *ExponentialHistogram {
 	return MergeAll([]*ExponentialHistogram{a, b})
 }
 
-// MergeAll merges any number of histograms into one at the minimum (coarsest)
-// scale. nil and empty inputs are skipped. Returns nil if there is nothing to
-// merge. This is the core of histogram_quantile: merge in the compressed domain,
-// then read one quantile off the result. See Merge for the load-bearing
-// invariants.
+// MergeAll merges histograms into one sketch at the coarsest input scale.
+// Nil inputs are skipped.
 func MergeAll(hists []*ExponentialHistogram) *ExponentialHistogram {
 	target := int32(math.MaxInt32)
 	any := false

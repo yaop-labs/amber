@@ -25,9 +25,7 @@ var DefaultRotationPolicy = RotationPolicy{
 	MaxBytes:   128 << 20,
 }
 
-// SegmentSidecarExts lists every file extension that belongs to a sealed
-// segment, including the data file itself (""). Single source of truth for
-// upload, delete, and fetch paths — keep in sync with index/seal_builder.go.
+// SegmentSidecarExts lists the files belonging to a sealed segment.
 var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".pidx"}
 
 type SegmentManager struct {
@@ -43,18 +41,14 @@ type SegmentManager struct {
 	store          SegmentStore
 }
 
-// SetStore replaces the SegmentStore used for sealed segment persistence.
-// The default is LocalStore (files remain in the data directory). Call before
-// any segments are sealed if using a remote store.
+// SetStore replaces the store used for sealed segments.
 func (sm *SegmentManager) SetStore(s SegmentStore) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.store = s
 }
 
-// SetOnSealComplete registers a callback fired after onSeal (and all index
-// builds it triggers) finishes. Use this to upload sealed files to a remote
-// store: by the time it is called, all sidecars are on local disk.
+// SetOnSealComplete registers a callback fired after seal callbacks finish.
 func (sm *SegmentManager) SetOnSealComplete(fn func(meta SegmentMeta)) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -137,10 +131,8 @@ func (sm *SegmentManager) replayWAL() error {
 		return sm.wal.Truncate()
 	}
 
-	// Truncate the segment file back to the last fsync'd offset. Any bytes
-	// past that point came from a bw.Flush + OS page-cache write that never
-	// reached fsync, so they may be partial or torn; drop them and let WAL
-	// replay rebuild the missing tail.
+	// Truncate the segment file back to the last fsynced offset. WAL replay
+	// rebuilds any missing tail.
 	if activeMeta.LastSyncedSize > 0 {
 		if info, err := os.Stat(segPath); err == nil && info.Size() > activeMeta.LastSyncedSize {
 			if err := os.Truncate(segPath, activeMeta.LastSyncedSize); err != nil {
@@ -252,9 +244,7 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	}
 	sm.activeSize += int64(len(data))
 
-	// If WriteRecord just flushed a block, sync the segment and drop the WAL
-	// records that are now durable. Otherwise the records stay in the WAL
-	// (the only durable copy) and ride along to the next block flush.
+	// Sync when WriteRecord flushes a block.
 	if sm.active.BlockCount() > blocksBefore {
 		if err := sm.checkpoint(seq); err != nil {
 			return fmt.Errorf("segmgr: checkpoint: %w", err)
@@ -317,23 +307,9 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	return nil
 }
 
-// checkpoint syncs the active segment so that all blocks flushed up to and
-// including the record with seq=lastSyncedSeq are durably on disk, and persists
-// the new sync watermark in meta.
-//
-// It deliberately does NOT truncate the WAL. The watermark covers only records
-// already in a flushed, fsync'd block; records written after lastSyncedSeq
-// (a partial block still buffered in memory) are durable solely in the WAL.
-// Truncating here would drop them — the data-loss window that bit WriteBatch,
-// whose trailing items land in blockBuf after the last mid-batch flush. The WAL
-// is instead truncated only at rotate/Close, where the active segment is sealed
-// and fsync'd in its entirety, so every record that fed it is durable.
-//
-// The WAL therefore retains every record written since the last rotate (bounded
-// by the segment rotation policy). On restart, replayWAL truncates the file
-// back to LastSyncedSize and re-applies WAL records with seq > LastSyncedSeq;
-// records with seq <= LastSyncedSeq are already in durable blocks and skipped,
-// so there is neither loss nor duplication.
+// checkpoint persists the active segment sync watermark.
+// It does not truncate the WAL; records after lastSyncedSeq may still be only
+// in memory and the WAL.
 func (sm *SegmentManager) checkpoint(lastSyncedSeq uint64) error {
 	if sm.active == nil {
 		return nil
@@ -379,8 +355,6 @@ func (sm *SegmentManager) shouldRotate() bool {
 }
 
 func (sm *SegmentManager) rotate() error {
-	// Take metadata snapshots from the live writer before Close so we don't
-	// have to reopen the file as a SegmentReader under the write lock.
 	recordCount := sm.active.RecordCount()
 	minTS, maxTS := sm.active.TimeRange()
 
@@ -415,12 +389,6 @@ func (sm *SegmentManager) rotate() error {
 		onSeal := sm.onSeal
 		onSealComplete := sm.onSealComplete
 		go func() {
-			// SealDuration covers the index-build path that gates query
-			// readiness for this segment. onSealComplete (S3 upload kick)
-			// is excluded because it's fire-and-forget with its own
-			// background retry loop. The label uses dir basename (logs/
-			// spans) so dashboards can split log vs span without storage
-			// growing a domain-aware API.
 			sealStart := time.Now()
 			if onSeal != nil {
 				onSeal(sealedMeta)
@@ -458,6 +426,20 @@ func (sm *SegmentManager) Segments() []SegmentMeta {
 
 	result := make([]SegmentMeta, 0, len(sm.meta.Segments))
 	for _, s := range sm.meta.Segments {
+		if s.Sealed && !s.DeletePending {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// SegmentsForRetention returns sealed segments, including delete-pending ones.
+func (sm *SegmentManager) SegmentsForRetention() []SegmentMeta {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	result := make([]SegmentMeta, 0, len(sm.meta.Segments))
+	for _, s := range sm.meta.Segments {
 		if s.Sealed {
 			result = append(result, s)
 		}
@@ -465,26 +447,34 @@ func (sm *SegmentManager) Segments() []SegmentMeta {
 	return result
 }
 
-// PendingUploads returns sealed segments whose UploadState is not Uploaded.
-// Used by the background uploader to find work after seal and after restart.
-// Returned slice is a snapshot; callers may mutate it freely.
+// IsQueryableSegment reports whether fileName is not pending deletion.
+func (sm *SegmentManager) IsQueryableSegment(fileName string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, s := range sm.meta.Segments {
+		if s.FileName == fileName {
+			return !s.DeletePending
+		}
+	}
+	return false
+}
+
+// PendingUploads returns sealed segments not yet uploaded.
 func (sm *SegmentManager) PendingUploads() []SegmentMeta {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
 	var pending []SegmentMeta
 	for _, s := range sm.meta.Segments {
-		if s.Sealed && s.UploadState != UploadStateUploaded {
+		if s.Sealed && !s.DeletePending && s.UploadState != UploadStateUploaded {
 			pending = append(pending, s)
 		}
 	}
 	return pending
 }
 
-// MarkUploaded transitions a sealed segment to UploadStateUploaded and
-// persists the meta. Idempotent: calling on an already-uploaded segment is
-// a no-op. Returns an error only if the segment ID is unknown or meta
-// persistence fails.
+// MarkUploaded marks a sealed segment as uploaded.
 func (sm *SegmentManager) MarkUploaded(id uint32) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -504,11 +494,7 @@ func (sm *SegmentManager) MarkUploaded(id uint32) error {
 	return fmt.Errorf("segmgr: mark uploaded: unknown segment id %d", id)
 }
 
-// MarkLocalEvicted records that the segment's local file has been removed
-// while the remote copy remains. Rejects segments that aren't UploadStateUploaded
-// (evicting the only durable copy would lose data) and segments already marked
-// absent (idempotent no-op). Caller must remove the file from disk before
-// calling — this method only mutates meta.
+// MarkLocalEvicted records that a segment no longer has a local copy.
 func (sm *SegmentManager) MarkLocalEvicted(id uint32) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -531,23 +517,28 @@ func (sm *SegmentManager) MarkLocalEvicted(id uint32) error {
 	return fmt.Errorf("segmgr: mark local evicted: unknown segment id %d", id)
 }
 
-// AdoptUploadedSegment inserts a sealed, already-uploaded segment into the
-// manager's metadata. Used by the bootstrap S3 reconcile path to surface
-// segments that exist in remote storage but not in local meta.json (e.g.
-// after node migration). The caller must ensure the segment's data file
-// and required sidecars are present on local disk before calling — this
-// method only mutates meta.
-//
-// Conflict handling:
-//   - If an entry with the same ID is already Sealed, returns nil (reconcile
-//     is idempotent — we've seen this segment before).
-//   - If an entry with the same ID is Active (not Sealed) AND empty (no
-//     records), the active is discarded: its file is removed, NextSegmentID
-//     advances past the adopted ID, and a fresh active will be created on
-//     the next write. This resolves the bootstrap-creates-seg_00000001-then-
-//     S3-has-seg_00000001 collision on a fresh node.
-//   - If the active is non-empty, returns an error: we won't drop on-disk
-//     writes silently. The caller should flush and seal first.
+// BeginDeleteSegment marks a sealed segment for terminal deletion.
+func (sm *SegmentManager) BeginDeleteSegment(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		if !sm.meta.Segments[i].Sealed {
+			return fmt.Errorf("segmgr: cannot mark active segment %d for delete", id)
+		}
+		if sm.meta.Segments[i].DeletePending {
+			return nil
+		}
+		sm.meta.Segments[i].DeletePending = true
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return nil
+}
+
+// AdoptUploadedSegment records a sealed segment found in remote storage.
 func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -562,7 +553,6 @@ func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 		if sm.active != nil && sm.active.RecordCount() > 0 {
 			return fmt.Errorf("segmgr: adopt %d conflicts with non-empty active segment", meta.ID)
 		}
-		// Discard the empty active and let the adopt below replace it.
 		if sm.active != nil {
 			_ = sm.active.Close()
 			sm.active = nil
@@ -575,9 +565,6 @@ func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 
 	meta.Sealed = true
 	meta.UploadState = UploadStateUploaded
-	// Adopted segments come from the remote store; the local file is fetched
-	// lazily on first query. Mark explicitly absent so retention's local-tier
-	// pass doesn't try to evict a file that isn't there.
 	absent := false
 	meta.LocalPresent = &absent
 	sm.meta.Segments = append(sm.meta.Segments, meta)
@@ -807,10 +794,7 @@ func appendSegmentWriter(path string, seedMinTS, seedMaxTS int64) (*SegmentWrite
 		fileOffset: fileSize,
 	}
 
-	// If the file is empty the header was never flushed before the crash
-	// (OpenSegmentWriter writes it into a bufio.Writer; if the process dies
-	// before bw.Flush the file stays 0 bytes). Write it now so WAL replay
-	// doesn't produce a headerless segment that OpenSegmentReader rejects.
+	// Rewrite the header when the process crashed before the first flush.
 	if fileSize == 0 {
 		if err := sw.writeHeader(); err != nil {
 			_ = f.Close()
@@ -828,9 +812,7 @@ func appendSegmentWriter(path string, seedMinTS, seedMaxTS int64) (*SegmentWrite
 		sw.fileOffset = segHeaderSize
 	}
 
-	// Restore writer state from blocks already on disk. Without this, a rotate
-	// after a crash-and-replay would write a footer pointing only at the
-	// post-replay blocks, orphaning everything written before the crash.
+	// Restore writer state from blocks already on disk.
 	if fileSize > segHeaderSize {
 		sr, err := OpenSegmentReader(path, nil)
 		if err != nil {
@@ -844,8 +826,6 @@ func appendSegmentWriter(path string, seedMinTS, seedMaxTS int64) (*SegmentWrite
 		sw.blockOffsets = append([]int64(nil), footer.BlockOffsets...)
 		sw.blockStats = append([]BlockStat(nil), footer.BlockStats...)
 
-		// Block offsets, record count and per-block ID stats are rebuilt
-		// correctly from the file. The time range is not — seed it from meta.
 		if seedMinTS != 0 || seedMaxTS != 0 {
 			sw.minTS = seedMinTS
 			sw.maxTS = seedMaxTS

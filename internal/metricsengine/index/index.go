@@ -94,16 +94,9 @@ type Registry struct {
 	// INDEX_EVICTION_SPEC_v0.md §1: cold-criterion = last_touch + retention.
 	lastTouch map[SeriesID]int64
 
-	// Bucketed timing-wheel for the eviction sweep
-	// (INDEX_EVICTION_SPEC_v0.md §3). Each series is in exactly one
-	// bucket keyed by (last_touch + retention) / bucketGranularity, so
-	// the sweep can iterate only the expired bucket — O(|bucket|) — vs
-	// O(|live|) for a naive full scan. The lab predicted 82× savings at
-	// our churn profile.
-	//
-	// bucketGranularity == 0 disables bucketing (Sweep falls back to a
-	// full scan). The Store sets it via SetEvictionBucketing(retention,
-	// granularity) at boot.
+	// Bucketed timing wheel for the eviction sweep. Each series is in one
+	// bucket keyed by (last_touch + retention) / bucketGranularity.
+	// bucketGranularity == 0 disables bucketing.
 	bucketGranularity int64
 	bucketRetention   int64
 	buckets           map[int64]map[SeriesID]struct{}
@@ -132,12 +125,9 @@ func NewRegistry() *Registry {
 	}
 }
 
-// SetEvictionBucketing enables the bucketed timing-wheel for the eviction
-// sweep. retention and granularity are both in milliseconds.
-//
-// Idempotent: calling with the same parameters is a no-op. Calling with
-// different parameters re-buckets every existing series; safe but O(N)
-// and intended only as a boot-time configuration step.
+// SetEvictionBucketing enables bucketed eviction.
+// retention and granularity are in milliseconds. Changing either value
+// re-buckets all existing series.
 func (r *Registry) SetEvictionBucketing(retention, granularity int64) {
 	if granularity <= 0 || retention <= 0 {
 		return
@@ -149,8 +139,6 @@ func (r *Registry) SetEvictionBucketing(retention, granularity int64) {
 	}
 	r.bucketRetention = retention
 	r.bucketGranularity = granularity
-	// Re-bucket every known series. Buckets may already exist from
-	// a previous setting — clear and rebuild.
 	r.buckets = make(map[int64]map[SeriesID]struct{})
 	r.bucketOf = make(map[SeriesID]int64)
 	for id, lt := range r.lastTouch {
@@ -158,10 +146,8 @@ func (r *Registry) SetEvictionBucketing(retention, granularity int64) {
 	}
 }
 
-// placeInBucketLocked computes the bucket epoch for a given last-touch and
-// inserts the series there. lastTouch=0 means the sentinel — the series is
-// placed in bucket 0 conventionally (the sweep skips bucket 0 explicitly).
-// Caller must hold r.mu (write).
+// placeInBucketLocked inserts id into the bucket for lastTouch.
+// The caller must hold r.mu for writing.
 func (r *Registry) placeInBucketLocked(id SeriesID, lastTouch int64) {
 	if r.bucketGranularity <= 0 {
 		return
@@ -177,9 +163,7 @@ func (r *Registry) placeInBucketLocked(id SeriesID, lastTouch int64) {
 	r.bucketOf[id] = epoch
 }
 
-// rebucketIfMovedLocked recomputes a series' bucket after lastTouch
-// changed; if the new epoch differs from the current one, moves it. Cheap
-// on the common case (touches within the same bucket window).
+// rebucketIfMovedLocked moves id when its last-touch bucket changes.
 func (r *Registry) rebucketIfMovedLocked(id SeriesID, newLastTouch int64) {
 	if r.bucketGranularity <= 0 {
 		return
@@ -207,30 +191,21 @@ func (r *Registry) rebucketIfMovedLocked(id SeriesID, newLastTouch int64) {
 	r.bucketOf[id] = newEpoch
 }
 
-// GetOrCreate looks up a series by its canonical labels, returning the
-// existing id or assigning a new one. Does NOT update last-touch — callers
-// on the ingest hot path should use GetOrCreateAt with the sample timestamp
-// so the eviction sweep can age the series correctly.
+// GetOrCreate looks up a series by canonical labels or assigns a new id.
+// It does not update last-touch; ingest callers should use GetOrCreateAt.
 func (r *Registry) GetOrCreate(labels model.LabelSet) SeriesID {
 	return r.GetOrCreateAt(labels, 0)
 }
 
-// GetOrCreateAt is GetOrCreate plus a last-touch update. ts is the sample's
-// Unix-ms timestamp; pass 0 from non-ingest call sites (the sweep only treats
-// non-zero last-touch as a real touch — see Sweep semantics). On the ingest
-// path head.Append always passes the sample ts so cold-detection works.
-//
-// Returns (id, created). created==true means this call registered a new
-// series — the caller (Store.ensureCatalog) uses this to decide whether
-// to append a REGISTER record to the catalog log.
+// GetOrCreateAt is GetOrCreate plus a last-touch update.
+// Pass ts=0 from non-ingest call sites. The sweep only treats non-zero
+// last-touch values as observed activity.
 func (r *Registry) GetOrCreateAt(labels model.LabelSet, ts int64) SeriesID {
 	id, _ := r.getOrCreateAtInternal(labels, ts)
 	return id
 }
 
-// GetOrCreateAtReportCreated is GetOrCreateAt that also reports whether
-// a new series was registered. Separate entry point to avoid changing
-// the signature head.Append already calls.
+// GetOrCreateAtReportCreated is GetOrCreateAt plus a created flag.
 func (r *Registry) GetOrCreateAtReportCreated(labels model.LabelSet, ts int64) (SeriesID, bool) {
 	return r.getOrCreateAtInternal(labels, ts)
 }
@@ -268,11 +243,8 @@ func (r *Registry) getOrCreateAtInternal(labels model.LabelSet, ts int64) (Serie
 	return id, true
 }
 
-// Import re-registers a series at a specific ID. Used by catalog recovery on
-// startup. lastTouch is set to 0 (= unknown) — the recovery path will replace
-// this with the actual last touch once the append-only catalog log (step 2
-// of INDEX_EVICTION_SPEC_v0) is in place; until then the sweep must treat
-// lastTouch=0 as "do not evict" (no real touch observed yet).
+// Import re-registers a series at a specific ID during catalog recovery.
+// It sets lastTouch to 0, which Sweep treats as unknown.
 func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	canonical := labels.Canonical()
 	fp := canonical.Fingerprint()
@@ -301,22 +273,15 @@ func (r *Registry) Import(id SeriesID, labels model.LabelSet) {
 	}
 }
 
-// SeriesCount returns the number of distinct series currently tracked in the
-// registry — that is, every series the index has ever seen and not yet
-// evicted. Cheap (single RLock + len). Used by the load harness as the
-// "active series" gauge: under churn, time-sharded eviction should keep
-// this bounded; without eviction it grows unbounded with elapsed time.
+// SeriesCount returns the number of non-evicted series tracked by the registry.
 func (r *Registry) SeriesCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.labels)
 }
 
-// LastTouch returns the most recent ingest timestamp (Unix ms) for the given
-// series, or (0,false) if the series is unknown. A non-zero return means the
-// series has been touched by at least one GetOrCreateAt with a non-zero ts
-// — this is what the eviction sweep keys on (cold = now-lastTouch>retention,
-// with lastTouch=0 treated as "no real touch yet, do not evict").
+// LastTouch returns the most recent ingest timestamp for id.
+// A zero timestamp means the series has not been reconciled with real activity.
 func (r *Registry) LastTouch(id SeriesID) (int64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -324,16 +289,9 @@ func (r *Registry) LastTouch(id SeriesID) (int64, bool) {
 	return ts, ok
 }
 
-// UpdateLastTouch monotonically advances the last-touch timestamp for a
-// known series. Used by the boot path's reconcile-from-blocks: for every
-// sealed block, the max timestamp of each series sets a floor on its
-// last-touch so a series whose only evidence-of-life is on-disk blocks
-// does NOT get the lastTouch=0 sentinel from a bare Import, which would
-// pin it forever. Out-of-order updates do not regress the value (same
-// semantics as GetOrCreateAt).
-//
-// Returns false if the series id is unknown (the caller is expected to
-// Import first).
+// UpdateLastTouch advances the last-touch timestamp for a known series.
+// Out-of-order updates do not regress the value. It returns false for unknown
+// series IDs.
 func (r *Registry) UpdateLastTouch(id SeriesID, ts int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -347,26 +305,10 @@ func (r *Registry) UpdateLastTouch(id SeriesID, ts int64) bool {
 	return true
 }
 
-// Sweep evicts every series whose last-touch is older than now-retention
-// (Unix ms). Series with lastTouch=0 (the Import sentinel) are NEVER
-// evicted by Sweep — the reconcile-from-blocks path is responsible for
-// setting them to a real value, after which the next sweep can evict them
-// if appropriate.
-//
-// When bucketing is enabled (Store.SetEvictionBucketing called at boot),
-// Sweep iterates only the expired buckets — O(|evicted|) — not every
-// series. Bucket granularity sets the worst-case lag between "series is
-// cold" and "sweep evicts it" (a series whose expiry epoch ends partway
-// through a bucket window waits until the bucket's epoch is fully past).
-// This is bounded by `granularity`; the sweep budget is a knob, not a
-// correctness concern.
-//
-// Returns the evicted series IDs. The caller (Store) writes EVICT records
-// to the catalog log AFTER Sweep returns (i.e. after the write lock
-// releases) — log fsync is too slow to hold the registry lock for.
-// Idempotent: a crash between the in-memory eviction and the log write
-// leaves the series gone from in-memory but still alive in the log;
-// recovery re-Imports it, the next sweep re-evicts.
+// Sweep evicts series whose last-touch is older than now-retention.
+// Series with lastTouch=0 are skipped until reconciliation or ingest gives them
+// a real timestamp. The caller persists returned evictions after Sweep releases
+// the registry lock.
 func (r *Registry) Sweep(now int64) []SeriesID {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -379,29 +321,15 @@ func (r *Registry) Sweep(now int64) []SeriesID {
 	if threshold <= 0 {
 		return nil
 	}
-	// A series in bucket `e` becomes evictable when wall-clock crosses
-	// `e * granularity` (the floor of its expiry timestamp). So at time
-	// `now`, every bucket whose epoch <= now/granularity is expired.
 	expiredEpochCeil := now / r.bucketGranularity
 	evicted := make([]SeriesID, 0, len(r.lastTouch))
 	for epoch, bucket := range r.buckets {
 		if epoch == 0 || epoch > expiredEpochCeil {
-			// epoch == 0 = the sentinel bucket for lastTouch=0 series
-			// (Import-without-reconcile, or callers that pass ts=0
-			// explicitly). NEVER evicted by sweep — must be touched
-			// by ingest or reconciled from a block first.
 			continue
 		}
 		for id := range bucket {
 			lt := r.lastTouch[id]
 			if lt == 0 || lt > threshold {
-				// Defensive: the bucket placed the series for an
-				// earlier last_touch, but a touch arrived after the
-				// bucket walk started. With our locking this can't
-				// happen — placement and sweep both hold r.mu — but
-				// the check costs one map lookup and avoids a class
-				// of correctness bugs if the placement logic ever
-				// changes.
 				continue
 			}
 			r.evictLocked(id)

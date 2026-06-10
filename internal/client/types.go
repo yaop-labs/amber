@@ -91,10 +91,8 @@ type Trace struct {
 }
 
 // MetricQuantileResult is the decoded GET /api/v1/metrics/quantile response.
-// Quantiles is label-value → quantile-value. The key is "" when the query had
-// no `by` grouping. WindowMS/EndMillis are zero for an unbounded query (no
-// window= was passed). Quantile echoes the q the server actually applied so
-// the caller can render without re-parsing the request.
+// Quantiles is keyed by the grouping label value, or by "" when no grouping was
+// requested.
 type MetricQuantileResult struct {
 	Metric    string             `json:"metric"`
 	Quantile  float64            `json:"quantile"`
@@ -104,10 +102,9 @@ type MetricQuantileResult struct {
 	Quantiles map[string]float64 `json:"quantiles"`
 }
 
-// MetricRateResult is the decoded GET /api/v1/metrics/rate response. Rates is
-// label-value → samples-per-second; the key is empty when the query had no
-// `by` grouping. EndMillis echoes the evaluation point the server applied so
-// the caller can render a deterministic timestamp.
+// MetricRateResult is the decoded GET /api/v1/metrics/rate response.
+// Rates is keyed by the grouping label value, or by "" when no grouping was
+// requested.
 type MetricRateResult struct {
 	Metric    string             `json:"metric"`
 	WindowMS  int64              `json:"window_ms"`
@@ -124,11 +121,8 @@ type MetricCatalog struct {
 	Histograms []string `json:"histograms"`
 }
 
-// MetricStoreStats is the decoded GET /api/v1/metrics/stats response. Top
-// level reports scalar-store counters; Histogram is the nested counterpart
-// for the histogram store. MinTimeMS/MaxTimeMS are nil when the
-// corresponding store is empty — that lets the CLI distinguish "no data"
-// from "data at epoch 0".
+// MetricStoreStats is the decoded GET /api/v1/metrics/stats response.
+// MinTimeMS and MaxTimeMS are nil when the corresponding store is empty.
 type MetricStoreStats struct {
 	Blocks          int                 `json:"blocks"`
 	Series          int                 `json:"series"`
@@ -169,10 +163,19 @@ type Stats struct {
 	SparseIndex struct {
 		Segments int `json:"segments"`
 	} `json:"sparse_index"`
+	Ingest struct {
+		Logs  IngestLaneStats `json:"logs"`
+		Spans IngestLaneStats `json:"spans"`
+	} `json:"ingest"`
 	Memory struct {
 		HeapAllocMB  int64  `json:"heap_alloc_mb"`
 		HeapInuseMB  int64  `json:"heap_inuse_mb"`
 		HeapObjects  uint64 `json:"heap_objects"`
 		TotalAllocMB int64  `json:"total_alloc_mb"`
 	} `json:"memory"`
+}
+
+type IngestLaneStats struct {
+	QueueLen    int  `json:"queue_len"`
+	BreakerOpen bool `json:"breaker_open"`
 }

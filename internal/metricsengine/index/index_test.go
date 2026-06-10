@@ -200,10 +200,8 @@ func TestRegistrySweepEvictsColdSeries(t *testing.T) {
 }
 
 func TestRegistrySweepIgnoresSentinelZero(t *testing.T) {
-	// lastTouch=0 = the Import sentinel. Sweep must NEVER evict these:
-	// they're series whose only evidence-of-life is the catalog log
-	// recovery that hasn't been reconciled to a real timestamp yet
-	// (the block-derived reconcile path).
+	// Imported series with lastTouch=0 are skipped until reconciliation gives
+	// them a real timestamp.
 	reg := NewRegistry()
 	reg.SetEvictionBucketing(60_000, 5_000)
 

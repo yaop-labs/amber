@@ -180,12 +180,24 @@ func TestRoutes_JSONIngestQueryServicesAndAdmin(t *testing.T) {
 		Segments struct {
 			TotalRecords uint64 `json:"total_records"`
 		} `json:"segments"`
+		Ingest struct {
+			Logs struct {
+				QueueLen int `json:"queue_len"`
+			} `json:"logs"`
+			Spans struct {
+				QueueLen int `json:"queue_len"`
+			} `json:"spans"`
+		} `json:"ingest"`
 	}
 	if err := json.NewDecoder(statsRec.Body).Decode(&statsResp); err != nil {
 		t.Fatalf("decode admin stats: %v", err)
 	}
 	if statsResp.Segments.TotalRecords != 2 {
 		t.Fatalf("admin total_records = %d, want 2", statsResp.Segments.TotalRecords)
+	}
+	if statsResp.Ingest.Logs.QueueLen != 0 || statsResp.Ingest.Spans.QueueLen != 0 {
+		t.Fatalf("admin ingest queues = logs:%d spans:%d, want drained",
+			statsResp.Ingest.Logs.QueueLen, statsResp.Ingest.Spans.QueueLen)
 	}
 }
 

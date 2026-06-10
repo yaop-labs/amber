@@ -1,6 +1,8 @@
 package retention
 
 import (
+	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +12,24 @@ import (
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/storage"
 )
+
+type failingDeleteStore struct {
+	base storage.SegmentStore
+	fail bool
+}
+
+func (s *failingDeleteStore) Put(name string, r io.Reader) error { return s.base.Put(name, r) }
+func (s *failingDeleteStore) Get(name string) (io.ReadCloser, error) {
+	return s.base.Get(name)
+}
+func (s *failingDeleteStore) Delete(name string) error {
+	if s.fail {
+		return errors.New("delete failed")
+	}
+	return s.base.Delete(name)
+}
+func (s *failingDeleteStore) DeleteLocal(name string) error { return s.base.DeleteLocal(name) }
+func (s *failingDeleteStore) List() ([]string, error)       { return s.base.List() }
 
 func setupTestCleaner(t *testing.T, policy Policy, numSegments int) (*Cleaner, *storage.SegmentManager, string) {
 	t.Helper()
@@ -88,6 +108,38 @@ func TestCleaner_MaxSegments(t *testing.T) {
 	}
 }
 
+func TestCleaner_DeletePendingRetriesAfterFileDeleteFailure(t *testing.T) {
+	cleaner, manager, dir := setupTestCleaner(t, Policy{}, 1)
+	defer manager.Close()
+
+	seg := manager.Segments()[0]
+	store := &failingDeleteStore{base: storage.NewLocalStore(dir), fail: true}
+	manager.SetStore(store)
+
+	if err := cleaner.deleteSegment(seg); err == nil {
+		t.Fatal("deleteSegment returned nil, want delete failure")
+	}
+	if got := manager.Segments(); len(got) != 0 {
+		t.Fatalf("queryable segments after pending delete = %d, want 0", len(got))
+	}
+	pending := manager.SegmentsForRetention()
+	if len(pending) != 1 || !pending[0].DeletePending {
+		t.Fatalf("retention segments = %+v, want one DeletePending segment", pending)
+	}
+
+	store.fail = false
+	n, err := cleaner.Run()
+	if err != nil {
+		t.Fatalf("retry Run: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("retry deleted %d segments, want 1", n)
+	}
+	if got := manager.SegmentsForRetention(); len(got) != 0 {
+		t.Fatalf("segments after retry = %d, want 0", len(got))
+	}
+}
+
 func TestCleaner_MaxAge(t *testing.T) {
 	cleaner, manager, _ := setupTestCleaner(t, Policy{MaxAge: 48 * time.Hour}, 5)
 	defer manager.Close()
@@ -138,9 +190,6 @@ func TestSelectForDeletion_MaxTotalBytes(t *testing.T) {
 }
 
 func TestCleaner_RequireUploadedSkipsLocalOnly(t *testing.T) {
-	// MaxSegments=1 with 3 segments would normally evict 2. With
-	// RequireUploaded enabled and none marked Uploaded, nothing should be
-	// deleted — protecting segments still in flight to S3.
 	cleaner, manager, _ := setupTestCleaner(t, Policy{MaxSegments: 1}, 3)
 	defer manager.Close()
 	cleaner.RequireUploaded(true)
@@ -153,7 +202,6 @@ func TestCleaner_RequireUploadedSkipsLocalOnly(t *testing.T) {
 		t.Errorf("expected 0 deletions when no segments are Uploaded, got %d", deleted)
 	}
 
-	// Mark all three as Uploaded; retention should now evict the surplus.
 	for _, seg := range manager.Segments() {
 		if err := manager.MarkUploaded(seg.ID); err != nil {
 			t.Fatalf("MarkUploaded: %v", err)
@@ -169,8 +217,6 @@ func TestCleaner_RequireUploadedSkipsLocalOnly(t *testing.T) {
 }
 
 func TestSelectForDeletion_ReasonLabels(t *testing.T) {
-	// Three segments with progressively newer MaxTS. Policy targets MaxAge so
-	// the two old ones are picked. The third is picked by MaxSegments=1.
 	old := time.Now().Add(-72 * time.Hour).UnixNano()
 	now := time.Now().UnixNano()
 	cleaner, manager, _ := setupTestCleaner(t, Policy{MaxAge: 48 * time.Hour, MaxSegments: 1}, 0)
@@ -218,14 +264,9 @@ func TestFilterOut(t *testing.T) {
 	}
 }
 
-// TestCleaner_LocalEvictionRequiresUploaded confirms that local eviction
-// refuses to act on a segment that hasn't been marked Uploaded, even if its
-// age would otherwise trigger eviction. Without this guard, a misconfigured
-// local-only deploy with LocalMaxAge set could delete the only copy.
 func TestCleaner_LocalEvictionRequiresUploaded(t *testing.T) {
 	cleaner, manager, dir := setupTestCleaner(t, Policy{LocalMaxAge: time.Hour}, 3)
 
-	// No segment is marked Uploaded; local eviction must skip all.
 	n, err := cleaner.Run()
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -242,10 +283,6 @@ func TestCleaner_LocalEvictionRequiresUploaded(t *testing.T) {
 	}
 }
 
-// TestCleaner_LocalEvictionByMaxAge marks segments Uploaded then runs local
-// eviction. Old segments should lose their local file but stay in the
-// manifest with LocalPresent=false; the global retention pass is disabled,
-// so they remain known to the manager.
 func TestCleaner_LocalEvictionByMaxAge(t *testing.T) {
 	cleaner, manager, dir := setupTestCleaner(t, Policy{LocalMaxAge: 36 * time.Hour}, 3)
 
@@ -259,8 +296,6 @@ func TestCleaner_LocalEvictionByMaxAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// Of three segments at -72h, -48h, -24h (relative MaxTS), the first two
-	// are older than 36h and should be evicted; the third (24h old) stays.
 	if n != 2 {
 		t.Fatalf("expected 2 local evictions, got %d", n)
 	}

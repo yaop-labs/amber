@@ -23,11 +23,8 @@ func NewMetricsQueryHandler(store *metricsengine.Store, log *slog.Logger) *Metri
 	return &MetricsQueryHandler{store: store, log: log}
 }
 
-// MetricsListHandler serves GET /api/v1/metrics — returns metric names
-// currently visible in both the scalar head index and the histogram store.
-// Histograms live in a separate store with a different on-disk format, so
-// they get their own array in the response — clients (and the CLI) need to
-// know which read path serves each name (rate vs quantile).
+// MetricsListHandler serves GET /api/v1/metrics.
+// It returns scalar metric names and histogram names as separate arrays.
 type MetricsListHandler struct {
 	scalar *metricsengine.Store
 	hist   *histogram.Store
@@ -71,10 +68,8 @@ func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, metricsListResponse{Metrics: scalar, Histograms: hists})
 }
 
-// MetricsStatsHandler serves GET /api/v1/metrics/stats — returns storage
-// counters for both the embedded scalar and histogram stores. Stats() walks
-// the manifest with a stat syscall per block plus a footer read, so it is
-// admin-grade (not scrape path).
+// MetricsStatsHandler serves GET /api/v1/metrics/stats.
+// It returns storage counters for scalar and histogram stores.
 type MetricsStatsHandler struct {
 	scalar *metricsengine.Store
 	hist   *histogram.Store
@@ -85,10 +80,7 @@ func NewMetricsStatsHandler(scalar *metricsengine.Store, hist *histogram.Store, 
 	return &MetricsStatsHandler{scalar: scalar, hist: hist, log: log}
 }
 
-// metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats. Top
-// level mirrors the original scalar-only response (additive change, existing
-// clients keep working). Histogram counters live under a nested object,
-// always present (zero values when the histogram store is disabled).
+// metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats.
 type metricsStatsResponse struct {
 	Blocks          int                       `json:"blocks"`
 	Series          int                       `json:"series"`
@@ -229,9 +221,7 @@ func (h *MetricsQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	rates, err := h.store.RateByLabelRange(rs, endMillis, by)
 	if err != nil {
-		// ErrNoSamples is not user-facing — the natural representation is an
-		// empty result map, which is also what callers get when nothing
-		// matched the selector.
+		// Treat no samples as an empty result map.
 		if !errors.Is(err, metricsengine.ErrNoSamples) {
 			h.log.Warn("metrics rate query failed", "metric", metric, "err", err)
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -264,11 +254,8 @@ func parseEndParam(raw string) (int64, error) {
 	return t.UnixMilli(), nil
 }
 
-// MetricsQuantileHandler serves GET /api/v1/metrics/quantile — answers a
-// single quantile (q, e.g. 0.95) over exponential histograms matching the
-// selector, optionally grouped by a label. Backed by histogram.Store, which
-// merges in the compressed (sketch) domain so accuracy is preserved even
-// when sketches come from different scales.
+// MetricsQuantileHandler serves GET /api/v1/metrics/quantile.
+// It answers one quantile over matching exponential histograms.
 type MetricsQuantileHandler struct {
 	store *histogram.Store
 	log   *slog.Logger
@@ -278,10 +265,7 @@ func NewMetricsQuantileHandler(store *histogram.Store, log *slog.Logger) *Metric
 	return &MetricsQuantileHandler{store: store, log: log}
 }
 
-// quantileResponse mirrors rateResponse for the quantile op. WindowMS is the
-// effective window (0 when the request was unbounded). Quantiles is a
-// label-value → value map: a single entry under the empty key when no `by`
-// grouping was requested.
+// quantileResponse is the wire shape for GET /api/v1/metrics/quantile.
 type quantileResponse struct {
 	Metric    string             `json:"metric"`
 	Quantile  float64            `json:"quantile"`
@@ -399,8 +383,7 @@ func (h *MetricsQuantileHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			if math.IsNaN(v) {
 				continue
 			}
-			// store returns keys like `"by"="value"` (canonical multi-label
-			// encoding); for the single-label case we only want the value.
+			// Collapse the canonical single-label group key to just the value.
 			result[unquoteSingleGroupKey(k, by)] = v
 		}
 	}
@@ -416,11 +399,8 @@ func (h *MetricsQuantileHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	ok = true
 }
 
-// unquoteSingleGroupKey converts histogram.Store's canonical group key
-// (`"label"="value"`) into just the value, for the single-label /quantile
-// case. If the format doesn't match, the original key is returned untouched —
-// the handler still emits a stable mapping, just one that mirrors the store
-// encoding.
+// unquoteSingleGroupKey converts a canonical single-label group key to its
+// value. Invalid shapes are returned unchanged.
 func unquoteSingleGroupKey(key, label string) string {
 	prefix := strconv.Quote(label) + "="
 	if !strings.HasPrefix(key, prefix) {

@@ -9,19 +9,16 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
-// Cursor encodes the (timestamp, entry_id) pair after which the next page
-// starts. The encoding is intentionally opaque: clients pass NextCursor
-// from a previous response back as Query.Cursor; they should not parse it.
+// Cursor encodes the position after which the next page starts.
+// Clients should treat the encoded value as opaque.
 //
-// On-wire layout (24 bytes raw → URL-safe base64 without padding):
+// On-wire layout before base64 encoding:
 //
 //	[0:8]   int64 timestamp (UnixNano), big-endian
 //	[8:24]  entry ID (16 bytes, ULID-shaped)
 //
-// Big-endian + the ULID layout (millisecond timestamp + monotonic suffix)
-// means lexicographic byte comparison of the raw bytes matches the
-// (timestamp, id) ordering the executor's min-heap uses — useful for
-// debug but not relied upon by the executor.
+// Big-endian timestamp and ULID bytes preserve the executor ordering for
+// debugging, but the executor does not rely on bytewise cursor comparison.
 type Cursor struct {
 	Timestamp int64
 	EntryID   model.EntryID
@@ -35,9 +32,8 @@ var (
 	errCursorPadding = errors.New("cursor: unexpected padding")
 )
 
-// EncodeCursor returns the opaque token for a (timestamp, id) pair, or
-// the empty string if the cursor is the zero value. Empty input → empty
-// output simplifies the "no more pages" case.
+// EncodeCursor returns the opaque token for a cursor.
+// The zero cursor encodes to the empty string.
 func EncodeCursor(c Cursor) string {
 	if c.Timestamp == 0 && c.EntryID == (model.EntryID{}) {
 		return ""
@@ -54,9 +50,6 @@ func DecodeCursor(s string) (Cursor, error) {
 	if s == "" {
 		return Cursor{}, nil
 	}
-	// RawURLEncoding rejects padding outright; a token with '=' is from a
-	// wrong encoder and we want a clear error rather than silent partial
-	// decode.
 	for i := 0; i < len(s); i++ {
 		if s[i] == '=' {
 			return Cursor{}, fmt.Errorf("%w", errCursorPadding)
@@ -75,18 +68,12 @@ func DecodeCursor(s string) (Cursor, error) {
 	return c, nil
 }
 
-// afterCursor reports whether (ts, id) strictly orders after c. The pair
-// (ts, id) > (c.Timestamp, c.EntryID) — same ordering the result min-heap
-// uses (descending timestamp; within a timestamp, descending entry id).
-// Because we paginate from newest to oldest, "after" means OLDER than the
-// cursor.
+// After reports whether (ts, id) belongs after c in newest-first pagination.
 func (c Cursor) After(ts int64, id model.EntryID) bool {
 	if ts != c.Timestamp {
 		return ts < c.Timestamp
 	}
-	// Same timestamp: compare IDs lexicographically. The cursor points to
-	// the last record of the previous page; the next page must skip it.
-	for i := 0; i < len(id); i++ {
+	for i := range len(id) {
 		if id[i] != c.EntryID[i] {
 			return id[i] < c.EntryID[i]
 		}

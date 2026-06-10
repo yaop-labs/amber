@@ -67,6 +67,18 @@ func run() error {
 			BatchTimeout:     cfg.Ingest.BatchTimeout,
 			QueueSize:        cfg.Ingest.QueueSize,
 			BreakerThreshold: cfg.Ingest.BreakerThreshold,
+			Logs: runtime.IngestLaneOptions{
+				BatchSize:        cfg.Ingest.Logs.BatchSize,
+				BatchTimeout:     cfg.Ingest.Logs.BatchTimeout,
+				QueueSize:        cfg.Ingest.Logs.QueueSize,
+				BreakerThreshold: cfg.Ingest.Logs.BreakerThreshold,
+			},
+			Spans: runtime.IngestLaneOptions{
+				BatchSize:        cfg.Ingest.Spans.BatchSize,
+				BatchTimeout:     cfg.Ingest.Spans.BatchTimeout,
+				QueueSize:        cfg.Ingest.Spans.QueueSize,
+				BreakerThreshold: cfg.Ingest.Spans.BreakerThreshold,
+			},
 		},
 		Cardinality: runtime.CardinalityOptions{
 			MaxAttrsPerEntry:      cfg.Ingest.MaxAttrsPerEntry,
@@ -92,8 +104,26 @@ func run() error {
 	selfobs.RegisterGaugeFunc("amber_ingest_queue_length", "Items currently buffered in the ingest queue.", func() float64 {
 		return float64(stack.Batcher.QueueLen())
 	})
+	selfobs.RegisterGaugeFunc("amber_ingest_log_queue_length", "Log items currently buffered in the ingest queue.", func() float64 {
+		return float64(stack.Batcher.LogQueueLen())
+	})
+	selfobs.RegisterGaugeFunc("amber_ingest_span_queue_length", "Span items currently buffered in the ingest queue.", func() float64 {
+		return float64(stack.Batcher.SpanQueueLen())
+	})
 	selfobs.RegisterGaugeFunc("amber_ingest_breaker_open", "1 if the ingest circuit breaker is currently open.", func() float64 {
 		if stack.Batcher.IsBreakerOpen() {
+			return 1
+		}
+		return 0
+	})
+	selfobs.RegisterGaugeFunc("amber_ingest_log_breaker_open", "1 if the log ingest circuit breaker is currently open.", func() float64 {
+		if stack.Batcher.IsLogBreakerOpen() {
+			return 1
+		}
+		return 0
+	})
+	selfobs.RegisterGaugeFunc("amber_ingest_span_breaker_open", "1 if the span ingest circuit breaker is currently open.", func() float64 {
+		if stack.Batcher.IsSpanBreakerOpen() {
 			return 1
 		}
 		return 0
@@ -106,9 +136,6 @@ func run() error {
 	})
 
 	if stack.MetricStore != nil {
-		// Cheap state gauges only — Stats() is per-scrape O(blocks) with stat
-		// syscalls and footer reads, which would hurt scrape latency. Series
-		// count, bytes on disk, and time range stay in amberctl stats.
 		selfobs.RegisterGaugeFunc("amber_metrics_store_blocks", "Sealed metric blocks tracked by the manifest.", func() float64 {
 			return float64(stack.MetricStore.BlockCount())
 		})
@@ -142,9 +169,6 @@ func run() error {
 				return
 			}
 			if scfg.HasLocalTier() && !s3Enabled {
-				// Local-tier eviction without a remote copy would just delete
-				// data. Refuse loudly rather than silently turning the policy
-				// off.
 				log.Error("retention local_max_age / local_max_bytes set but storage.s3 is not configured",
 					"stream", stream)
 				return
@@ -192,13 +216,6 @@ func run() error {
 	}
 
 	if cfg.Debug.Pprof {
-		// Enable mutex + block profiling when pprof is on. Without these,
-		// the /debug/pprof/mutex and /debug/pprof/block endpoints exist
-		// (via pprof.Index) but always return empty samples. Fractions
-		// chosen to keep overhead negligible: 5 means every 5th mutex
-		// contention event is sampled; block rate=10000 means events
-		// blocking ≥10 µs are captured. Both can be lowered to 1 for a
-		// dedicated profiling run if needed.
 		goruntime.SetMutexProfileFraction(5)
 		goruntime.SetBlockProfileRate(10000)
 

@@ -10,6 +10,7 @@ import (
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 
+	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	meotlp "github.com/yaop-labs/amber/internal/metricsengine/otlp"
 	"github.com/yaop-labs/amber/internal/selfobs"
@@ -40,12 +41,7 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var accepted, rejected, unsupported int
-	// Histogram series are accumulated across the whole request and flushed
-	// as a single block at the end. histogram.Store.WriteBlock creates one
-	// file per call, so writing per-metric would explode small-block count
-	// for a typical OTLP request carrying ~10s of metric definitions.
-	// IDs are reassigned to the global sequence below to avoid collisions
-	// across (resource, scope) sub-batches.
+	// Histogram series from one request are written as one block.
 	var expAll []histogram.ExpSeries
 	var explicitAll []histogram.ExplicitSeries
 
@@ -109,9 +105,7 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ingestScalar walks the scalar (Gauge/Sum) path: pointsForMetric → samples
-// → metricStore.AppendBatch. Selfobs counters are bumped inline; the return
-// values feed only the response-body accept/reject totals.
+// ingestScalar writes Gauge and Sum points to the scalar metric store.
 func (h *OTLPHandler) ingestScalar(metric *metricspb.Metric, resourceAttrs, scopeAttrs map[string]string) (int, int) {
 	addPoints, kind := pointsForMetric(metric)
 	if !kind.supported || len(addPoints) == 0 {
@@ -200,9 +194,7 @@ func explicitSeriesFor(metric *metricspb.Metric, hist *metricspb.Histogram, reso
 	return meotlp.ExplicitSeries(batch, points)
 }
 
-// assignSeriesIDs renumbers all series with a contiguous global sequence so
-// the adapter's per-call local IDs (1,2,3,...) don't collide across batches.
-// histogram.WriteBlock relies on unique SeriesID inside a block.
+// assignSeriesIDs assigns block-local series IDs.
 func assignSeriesIDs(exp []histogram.ExpSeries, explicit []histogram.ExplicitSeries) {
 	var next uint64 = 1
 	for i := range exp {
@@ -281,7 +273,7 @@ func kvToMap(kvs []*commonpb.KeyValue) map[string]string {
 	}
 	out := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
-		out[kv.Key] = kv.Value.GetStringValue()
+		out[kv.Key] = ingest.AnyValueToString(kv.Value)
 	}
 	return out
 }
