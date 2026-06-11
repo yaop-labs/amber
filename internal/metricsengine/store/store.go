@@ -2318,7 +2318,7 @@ func (s *Store) nextBlockPath() string {
 }
 
 func (s *Store) nextBlockPathWithPrefix(prefix string) string {
-	base := time.Now().UTC().Format("20060102T150405.000000000Z")
+	base := s.clock().UTC().Format("20060102T150405.000000000Z")
 	path := filepath.Join(s.dir, prefix+"-"+base+".meb")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return path

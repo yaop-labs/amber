@@ -259,6 +259,11 @@ func (sw *SegmentWriter) Close() error {
 	return sw.file.Close()
 }
 
+// writeFooter appends the offsets/stats footer. Deliberately no footer CRC:
+// the payload blocks are integrity-checked by their zstd frames, and a
+// corrupt or truncated footer is survivable — OpenSegmentReader falls back
+// to the footerless block scan (scanBlockOffsets). A CRC would only convert
+// "slow open" into "fail open" for the same corruption.
 func (sw *SegmentWriter) writeFooter() error {
 	blockCount := uint32(len(sw.blockOffsets))
 

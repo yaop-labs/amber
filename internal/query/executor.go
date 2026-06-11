@@ -1074,7 +1074,10 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	for {
 		if cached, ok := e.resultCache.getSpan(cacheKey); ok {
 			cacheHit = true
-			return cached, nil
+			// Copy, mirroring the log path: handing out the cached pointer
+			// would let callers mutate the shared result.
+			cp := *cached
+			return &cp, nil
 		}
 		wait, done, err := e.resultCache.waitOrStart(ctx, cacheKey)
 		if err != nil {
