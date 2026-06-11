@@ -973,6 +973,19 @@ func (e *Executor) execLogSegment(
 		if ctx.Err() != nil {
 			return false
 		}
+		// Once the heap holds k entries, a block whose newest record is
+		// older than the oldest kept entry cannot improve the result — the
+		// intra-segment mirror of the per-segment MaxTS skip. Entry IDs are
+		// ULID-derived (bits 63..32 = low 32 bits of the ms timestamp), so
+		// the comparison runs in that truncated space with a wrap guard;
+		// blocks span minutes, the wrap period is ~49 days.
+		if hp.Len() >= k {
+			thrLow := uint32((*hp)[0].Timestamp.UnixMilli())
+			blockLow := uint32(maxID >> 32)
+			if delta := thrLow - blockLow; delta > 0 && delta < 1<<31 {
+				return true
+			}
+		}
 		if hasFilter {
 			i := sort.Search(len(allowedSlice), func(i int) bool {
 				return allowedSlice[i] >= minID
@@ -1290,6 +1303,16 @@ func (e *Executor) execSpanSegment(
 	skip := func(minID, maxID uint64) bool {
 		if ctx.Err() != nil {
 			return false
+		}
+		// Same intra-segment threshold skip as the log path: a block whose
+		// newest record predates the oldest kept span cannot improve the
+		// heap (truncated ms-timestamp space, wrap-guarded).
+		if hp.Len() >= k {
+			thrLow := uint32((*hp)[0].StartTime.UnixMilli())
+			blockLow := uint32(maxID >> 32)
+			if delta := thrLow - blockLow; delta > 0 && delta < 1<<31 {
+				return true
+			}
 		}
 		if hasFilter {
 			i := sort.Search(len(allowedSlice), func(i int) bool {

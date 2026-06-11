@@ -10,7 +10,6 @@ import (
 	"time"
 
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
-	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/runtime"
 )
 
@@ -64,16 +63,20 @@ func ingestIntoAmber(t *testing.T, protocol string) {
 		t.Fatalf("acked=%d failed=%d errors=%v, want %d/0", res.AckedRecords, res.FailedBatches, res.Errors, n)
 	}
 
-	// Durability barrier, then count through the real query path.
+	// Durability barrier, then count durable records the way the verify
+	// subcommand does (segment metadata, exact). TotalHits is unsuitable: it
+	// is a lower bound by design — heap-threshold skips drop segments and
+	// blocks that cannot reach the top-k result.
 	if err := stack.Batcher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	result, err := stack.Executor.ExecLog(context.Background(), &query.LogQuery{Limit: 1})
-	if err != nil {
-		t.Fatalf("ExecLog: %v", err)
+	var total uint64
+	for _, seg := range stack.LogManager.Segments() {
+		total += seg.RecordCount
 	}
-	if result.TotalHits != n {
-		t.Fatalf("queryable = %d, want %d (silent ingest loss)", result.TotalHits, n)
+	total += stack.LogManager.ActiveRecordCount()
+	if total != n {
+		t.Fatalf("queryable = %d, want %d (silent ingest loss)", total, n)
 	}
 }
 
