@@ -330,11 +330,13 @@ var ftsMagic = [4]byte{'A', 'F', 'T', '2'}
 
 func (f *FTSIndex) Save(path string) error {
 	f.seal()
-	return atomicWrite(path, func(file *os.File) error {
+	written := 0
+	err := atomicWrite(path, func(file *os.File) error {
 		crc := crc32.NewIEEE()
 		w := bufio.NewWriterSize(file, 1<<20)
 		mw := func(b []byte) error {
 			crc.Write(b)
+			written += len(b)
 			_, err := w.Write(b)
 			return err
 		}
@@ -370,6 +372,7 @@ func (f *FTSIndex) Save(path string) error {
 		if err := uv(uint64(len(f.uniqHashes) / 8)); err != nil {
 			return err
 		}
+		uniqOff := written
 		if err := mw(f.uniqHashes); err != nil {
 			return err
 		}
@@ -381,8 +384,20 @@ func (f *FTSIndex) Save(path string) error {
 		if _, err := w.Write(sum[:]); err != nil {
 			return err
 		}
+		f.uniqOff = int64(uniqOff)
 		return w.Flush()
 	})
+	if err != nil {
+		return err
+	}
+	// Demote to file-backed: the unique section now lives on disk, so a
+	// freshly sealed index registered in the executor cache costs the same
+	// few MB as a loaded one instead of pinning ~13 MB of hash arrays.
+	f.path = path
+	f.uniqCount = len(f.uniqHashes) / 8
+	f.uniqHashes = nil
+	f.uniqIDs = nil
+	return nil
 }
 
 func LoadFTSIndex(path string) (*FTSIndex, error) {
