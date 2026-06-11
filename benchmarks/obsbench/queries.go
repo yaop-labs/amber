@@ -41,6 +41,11 @@ type QueryInstance struct {
 	From     time.Time
 	To       time.Time
 	Limit    int
+
+	// windowFrac is q2's window start as 1/1000ths of the ingest window —
+	// the system-independent identity of the sub-window (absolute times
+	// differ per system because each ingested at a different wall-clock).
+	windowFrac int64
 }
 
 // QueryOutcome is the per-instance record written to the results file. Count
@@ -91,10 +96,15 @@ func instance(scenario string, iter int, opts QueryRunOptions) QueryInstance {
 		qi.Level = "ERROR"
 	case ScenarioQ2Range:
 		qi.Service = genServices[rng.IntN(len(genServices))]
-		// Random quarter sub-window of the ingest window.
+		// Random quarter sub-window of the ingest window. The fraction (not
+		// the absolute time) is the cross-system identity of the instance:
+		// every system ingests the same dataset over its own wall-clock
+		// window, so equal fractions select comparable slices.
 		span := opts.To.Sub(opts.From)
 		if span > 0 {
-			off := time.Duration(rng.Int64N(int64(span) * 3 / 4))
+			frac := rng.Int64N(750) // start offset in 0..74.9% of the window
+			qi.windowFrac = frac
+			off := time.Duration(frac * int64(span) / 1000)
 			qi.From = opts.From.Add(off)
 			qi.To = qi.From.Add(span / 4)
 		}
@@ -119,9 +129,12 @@ func hashScenario(s string) uint64 {
 	return h
 }
 
+// paramsKey identifies the logical query across systems: absolute times are
+// deliberately excluded (each system ingests at its own wall-clock), the
+// q2 sub-window is identified by its fraction.
 func (qi QueryInstance) paramsKey() string {
-	return fmt.Sprintf("svc=%s lvl=%s tok=%s from=%d to=%d limit=%d",
-		qi.Service, qi.Level, qi.Token, qi.From.UnixMilli(), qi.To.UnixMilli(), qi.Limit)
+	return fmt.Sprintf("svc=%s lvl=%s tok=%s winfrac=%d limit=%d",
+		qi.Service, qi.Level, qi.Token, qi.windowFrac, qi.Limit)
 }
 
 // queryExecutor turns an instance into a request and extracts the entry
@@ -203,10 +216,10 @@ func (amberQuerier) Execute(ctx context.Context, client *http.Client, target Tar
 		params.Set("q", qi.Token)
 	}
 	if !qi.From.IsZero() {
-		params.Set("from", qi.From.UTC().Format(time.RFC3339))
+		params.Set("from", qi.From.UTC().Format(time.RFC3339Nano))
 	}
 	if !qi.To.IsZero() {
-		params.Set("to", qi.To.UTC().Format(time.RFC3339))
+		params.Set("to", qi.To.UTC().Format(time.RFC3339Nano))
 	}
 	params.Set("limit", strconv.Itoa(qi.Limit))
 
@@ -292,7 +305,7 @@ func (victoriaLogsQuerier) Execute(ctx context.Context, client *http.Client, tar
 	}
 	if !qi.From.IsZero() && !qi.To.IsZero() {
 		q += fmt.Sprintf("_time:[%s, %s] ",
-			qi.From.UTC().Format(time.RFC3339), qi.To.UTC().Format(time.RFC3339))
+			qi.From.UTC().Format(time.RFC3339Nano), qi.To.UTC().Format(time.RFC3339Nano))
 	}
 	if q == "" {
 		q = "*"
