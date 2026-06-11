@@ -186,87 +186,44 @@ func SetupSealCallbacks(
 	logManager.SetOnSeal(func(meta storage.SegmentMeta) {
 		segPath := filepath.Join(logDir, meta.FileName)
 
-		if err := retryBuild(ctx, "log bitmap", log, func() error {
-			_, err := index.BuildLogBitmapIndex(segPath, log)
+		// One pass builds every sidecar: the per-index builders each rescan
+		// and re-decode the segment, and (worse) the FTS tokenize+stem ran
+		// twice. Five scans per seal made builds fall behind sustained
+		// ingest. Posting list (.pidx) lands on disk only; it is loaded
+		// lazily the first time a trace_id query hits this segment.
+		var built *index.LogSealIndexes
+		if err := retryBuild(ctx, "log seal indexes", log, func() error {
+			b, err := index.BuildLogSealIndexes(segPath, log)
+			built = b
 			return err
 		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("log", "bitmap").Inc()
-			log.Error("seal: build log bitmap gave up", "segment", meta.FileName, "err", err)
+			selfobs.SealIndexErrors.WithLabelValues("log", "seal").Inc()
+			log.Error("seal: build log indexes gave up", "segment", meta.FileName, "err", err)
+			return
 		}
-
-		if err := retryBuild(ctx, "log fts", log, func() error {
-			_, err := index.BuildLogFTSIndex(segPath, log)
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("log", "fts").Inc()
-			log.Error("seal: build log fts gave up", "segment", meta.FileName, "err", err)
+		if built.Ribbon != nil {
+			exec.RegisterLogRibbon(meta.FileName, built.Ribbon)
 		}
-
-		var logRibbon *index.RibbonFilter
-		if err := retryBuild(ctx, "log ribbon", log, func() error {
-			r, err := index.BuildLogRibbonFilter(segPath, log)
-			logRibbon = r
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("log", "ribbon").Inc()
-			log.Error("seal: build log ribbon gave up", "segment", meta.FileName, "err", err)
-		} else {
-			exec.RegisterLogRibbon(meta.FileName, logRibbon)
-		}
-
-		var ftsRibbon *index.RibbonFilter
-		if err := retryBuild(ctx, "log fts ribbon", log, func() error {
-			r, err := index.BuildLogFTSRibbon(segPath, log)
-			ftsRibbon = r
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("log", "fts_ribbon").Inc()
-			log.Error("seal: build log fts ribbon gave up", "segment", meta.FileName, "err", err)
-		} else {
-			exec.RegisterLogFTSRibbon(meta.FileName, ftsRibbon)
-		}
-
-		// Posting list (.pidx) is built here so it exists on disk for on-demand
-		// loading, but is NOT registered in the executor's LRU. It will be
-		// loaded lazily the first time a trace_id query hits this segment.
-		if err := retryBuild(ctx, "log posting list", log, func() error {
-			_, err := index.BuildLogPostingList(segPath, log)
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("log", "posting").Inc()
-			log.Error("seal: build log posting list gave up", "segment", meta.FileName, "err", err)
+		if built.FTSRibbon != nil {
+			exec.RegisterLogFTSRibbon(meta.FileName, built.FTSRibbon)
 		}
 	})
 
 	spanManager.SetOnSeal(func(meta storage.SegmentMeta) {
 		segPath := filepath.Join(spanDir, meta.FileName)
 
-		if err := retryBuild(ctx, "span bitmap", log, func() error {
-			_, err := index.BuildSpanBitmapIndex(segPath, log)
+		var built *index.SpanSealIndexes
+		if err := retryBuild(ctx, "span seal indexes", log, func() error {
+			b, err := index.BuildSpanSealIndexes(segPath, log)
+			built = b
 			return err
 		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("span", "bitmap").Inc()
-			log.Error("seal: build span bitmap gave up", "segment", meta.FileName, "err", err)
+			selfobs.SealIndexErrors.WithLabelValues("span", "seal").Inc()
+			log.Error("seal: build span indexes gave up", "segment", meta.FileName, "err", err)
+			return
 		}
-
-		var spanRibbon *index.RibbonFilter
-		if err := retryBuild(ctx, "span ribbon", log, func() error {
-			r, err := index.BuildSpanRibbonFilter(segPath, log)
-			spanRibbon = r
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("span", "ribbon").Inc()
-			log.Error("seal: build span ribbon gave up", "segment", meta.FileName, "err", err)
-		} else {
-			exec.RegisterSpanRibbon(meta.FileName, spanRibbon)
-		}
-
-		if err := retryBuild(ctx, "span posting list", log, func() error {
-			_, err := index.BuildSpanPostingList(segPath, log)
-			return err
-		}); err != nil {
-			selfobs.SealIndexErrors.WithLabelValues("span", "posting").Inc()
-			log.Error("seal: build span posting list gave up", "segment", meta.FileName, "err", err)
+		if built.Ribbon != nil {
+			exec.RegisterSpanRibbon(meta.FileName, built.Ribbon)
 		}
 	})
 }

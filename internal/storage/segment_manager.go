@@ -39,6 +39,20 @@ type SegmentManager struct {
 	onSeal         func(meta SegmentMeta)
 	onSealComplete func(meta SegmentMeta)
 	store          SegmentStore
+
+	// Seal callbacks run on one background worker, strictly in seal order.
+	// A goroutine per seal (the previous design) let slow index builds pile
+	// up without bound under sustained ingest: each in-flight build held its
+	// segment's indexes in memory and burned CPU, starving the ingest path,
+	// which made builds even slower — a feedback loop ending in swap death
+	// (found by the obsbench W1 run: 8.8 GB heap at 10M records). A backlog
+	// in this queue costs ~100 bytes per entry; queries against not-yet-
+	// indexed segments fall back to scans, which is degradation, not failure.
+	sealMu    sync.Mutex
+	sealQueue []SegmentMeta
+	sealWake  chan struct{}
+	sealStop  chan struct{}
+	sealDone  chan struct{}
 }
 
 // SetStore replaces the store used for sealed segments.
@@ -401,21 +415,96 @@ func (sm *SegmentManager) rotate() error {
 	}
 
 	if sm.onSeal != nil || sm.onSealComplete != nil {
-		onSeal := sm.onSeal
-		onSealComplete := sm.onSealComplete
-		go func() {
-			sealStart := time.Now()
-			if onSeal != nil {
-				onSeal(sealedMeta)
-			}
-			selfobs.SealDuration.WithLabelValues(filepath.Base(sm.dir)).Observe(time.Since(sealStart).Seconds())
-			if onSealComplete != nil {
-				onSealComplete(sealedMeta)
-			}
-		}()
+		sm.enqueueSeal(sealedMeta)
 	}
 
 	return sm.createNewSegment()
+}
+
+// enqueueSeal hands the sealed segment to the single seal worker, starting
+// it on first use. Caller holds sm.mu.
+func (sm *SegmentManager) enqueueSeal(meta SegmentMeta) {
+	sm.sealMu.Lock()
+	if sm.sealStop == nil {
+		sm.sealStop = make(chan struct{})
+		sm.sealDone = make(chan struct{})
+		sm.sealWake = make(chan struct{}, 1)
+		go sm.runSealWorker()
+	}
+	sm.sealQueue = append(sm.sealQueue, meta)
+	sm.sealMu.Unlock()
+	select {
+	case sm.sealWake <- struct{}{}:
+	default:
+	}
+}
+
+// SealBacklog reports queued-but-unbuilt seals; worth a gauge.
+func (sm *SegmentManager) SealBacklog() int {
+	sm.sealMu.Lock()
+	defer sm.sealMu.Unlock()
+	return len(sm.sealQueue)
+}
+
+func (sm *SegmentManager) runSealWorker() {
+	defer close(sm.sealDone)
+	for {
+		sm.sealMu.Lock()
+		var meta SegmentMeta
+		have := len(sm.sealQueue) > 0
+		if have {
+			meta = sm.sealQueue[0]
+			sm.sealQueue = sm.sealQueue[1:]
+		}
+		sm.sealMu.Unlock()
+
+		if !have {
+			select {
+			case <-sm.sealWake:
+				continue
+			case <-sm.sealStop:
+				return
+			}
+		}
+
+		// Hooks are registered once at startup; read them per job so a
+		// late SetOnSeal (bootstrap wiring) is still observed.
+		sm.mu.RLock()
+		onSeal, onSealComplete := sm.onSeal, sm.onSealComplete
+		sm.mu.RUnlock()
+
+		sealStart := time.Now()
+		if onSeal != nil {
+			onSeal(meta)
+		}
+		selfobs.SealDuration.WithLabelValues(filepath.Base(sm.dir)).Observe(time.Since(sealStart).Seconds())
+		if onSealComplete != nil {
+			onSealComplete(meta)
+		}
+
+		select {
+		case <-sm.sealStop:
+			return
+		default:
+		}
+	}
+}
+
+// stopSealWorker ends the worker after the in-flight job; queued seals are
+// dropped — bootstrap rebuilds missing sidecar indexes lazily on next open.
+func (sm *SegmentManager) stopSealWorker() {
+	sm.sealMu.Lock()
+	stop, done := sm.sealStop, sm.sealDone
+	sm.sealMu.Unlock()
+	if stop == nil {
+		return
+	}
+	select {
+	case <-stop:
+	default:
+		close(stop)
+	}
+	<-done
 }
 
 func (sm *SegmentManager) Rotate() error {
@@ -720,6 +809,11 @@ func (sm *SegmentManager) DeleteSegmentFilesLocal(meta SegmentMeta) error {
 }
 
 func (sm *SegmentManager) Close() error {
+	// Stop the seal worker before taking sm.mu: an in-flight seal callback
+	// reads hooks under sm.mu.RLock, so waiting for it while holding the
+	// write lock would deadlock.
+	sm.stopSealWorker()
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
