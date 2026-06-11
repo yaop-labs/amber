@@ -3,6 +3,7 @@ package obsbench
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,9 +24,11 @@ type IngestOptions struct {
 	Limit uint64
 }
 
-// IngestResult is the run summary. AckedRecords counts records in batches
-// the server acknowledged with 2xx; the gap to SentRecords plus the verify
-// step's queryable count is the loss accounting (METHODOLOGY.md §4).
+// IngestResult is the run summary. AckedRecords counts records the server
+// actually accepted — from the response body when the system reports
+// per-record accept/reject counts (amber), otherwise whole 2xx batches.
+// The gap to SentRecords plus the verify step's queryable count is the loss
+// accounting (METHODOLOGY.md §4).
 type IngestResult struct {
 	Target string `json:"target"`
 	// StartedAt/FinishedAt bound the ingest window; the query phase derives
@@ -88,19 +91,23 @@ func Ingest(ctx context.Context, targetName string, target TargetConfig, dataset
 					continue
 				}
 				start := time.Now()
-				status, err := post(ctx, client, target, path, contentType, body)
+				status, respBody, err := post(ctx, client, target, path, contentType, body)
 				elapsed := time.Since(start)
 				if err != nil {
 					failedBatches.Add(1)
 					recordErr(&mu, errCounts, "transport: "+err.Error())
 					continue
 				}
-				if status < 200 || status > 299 {
+				accepted, ok := countAccepted(target.Kind, status, respBody, len(batch))
+				if !ok {
 					failedBatches.Add(1)
 					recordErr(&mu, errCounts, fmt.Sprintf("status %d", status))
 					continue
 				}
-				acked.Add(uint64(len(batch)))
+				acked.Add(uint64(accepted))
+				if accepted < len(batch) {
+					recordErr(&mu, errCounts, "partial reject")
+				}
 				mu.Lock()
 				latencies = append(latencies, elapsed)
 				mu.Unlock()
@@ -189,10 +196,10 @@ readLoop:
 	return res, nil
 }
 
-func post(ctx context.Context, client *http.Client, target TargetConfig, path, contentType string, body []byte) (int, error) {
+func post(ctx context.Context, client *http.Client, target TargetConfig, path, contentType string, body []byte) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.BaseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
 	if target.APIKey != "" {
@@ -200,11 +207,34 @@ func post(ctx context.Context, client *http.Client, target TargetConfig, path, c
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	_ = resp.Body.Close()
-	return resp.StatusCode, nil
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// countAccepted extracts the per-batch accepted-record count. Amber answers
+// partial queue-full rejection with a 503 that still carries
+// {"accepted":N,"rejected":M} — trusting the status code alone undercounts
+// acked records on backpressure (and a 202 with rejections would overcount).
+// Other systems ack all-or-nothing by status code.
+func countAccepted(kind string, status int, body []byte, batchLen int) (int, bool) {
+	if kind == "amber" {
+		var resp struct {
+			Accepted *int `json:"accepted"`
+		}
+		if json.Unmarshal(body, &resp) == nil && resp.Accepted != nil {
+			return *resp.Accepted, true
+		}
+	}
+	if status >= 200 && status <= 299 {
+		return batchLen, true
+	}
+	return 0, false
 }
 
 func recordErr(mu *sync.Mutex, counts map[string]uint64, key string) {
