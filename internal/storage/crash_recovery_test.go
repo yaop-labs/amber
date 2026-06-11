@@ -176,3 +176,92 @@ func TestSegmentManager_CrashRecovery_PreservesTimeRange(t *testing.T) {
 			seg.MinTS, seg.MaxTS, wantMin, wantMax)
 	}
 }
+
+// TestSegmentManager_CrashRecovery_NoDuplicationWithoutCheckpoint proves that
+// a crash before the first checkpoint does not double every record on
+// recovery.
+//
+// The ingest batcher calls Flush() after each batch, so records reach the
+// segment fd long before a 4 MiB block flush triggers checkpoint(). A crash
+// in that state leaves meta with LastSyncedSize=0 — and recovery used to
+// treat zero as "nothing to truncate", keeping the crash-surviving records
+// in the file and then replaying the complete WAL on top of them: every
+// record came back twice. Found by the obsbench kill -9 test (acked=67000,
+// queryable=134000).
+func TestSegmentManager_CrashRecovery_NoDuplicationWithoutCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	policy := RotationPolicy{MaxRecords: 0, MaxBytes: 0}
+
+	sm, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("OpenSegmentManager: %v", err)
+	}
+	// Intentionally NOT closed: Close seals and checkpoints, masking the bug.
+
+	// Small records far below the block size: no block flush, no checkpoint.
+	const n = 200
+	base := time.Now().UnixNano()
+	items := make([]BatchItem, n)
+	for i := range items {
+		data := make([]byte, 64)
+		binary.LittleEndian.PutUint32(data[:4], uint32(i))
+		items[i] = BatchItem{Data: data, TS: base + int64(i)}
+	}
+	if err := sm.WriteBatch(items); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	// Mirror the batcher: Flush pushes the records to the fd post-batch.
+	if err := sm.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	meta, ok := sm.ActiveSegmentMeta()
+	if !ok {
+		t.Fatal("no active segment")
+	}
+	if meta.LastSyncedSeq != 0 || meta.LastSyncedSize != 0 {
+		t.Fatalf("test precondition not met: checkpoint ran (seq=%d size=%d) — shrink the batch",
+			meta.LastSyncedSeq, meta.LastSyncedSize)
+	}
+
+	// Crash + restart.
+	sm2, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer sm2.Close()
+	if err := sm2.Rotate(); err != nil {
+		t.Fatalf("rotate after recovery: %v", err)
+	}
+
+	counts := make(map[uint32]int, n)
+	total := 0
+	for _, seg := range sm2.Segments() {
+		if seg.RecordCount == 0 {
+			continue
+		}
+		sr, err := OpenSegmentReader(sm2.SegmentPath(seg), nil)
+		if err != nil {
+			t.Fatalf("open reader %s: %v", seg.FileName, err)
+		}
+		scanErr := sr.Scan(func(data []byte) error {
+			total++
+			if len(data) >= 4 {
+				counts[binary.LittleEndian.Uint32(data[:4])]++
+			}
+			return nil
+		})
+		_ = sr.Close()
+		if scanErr != nil {
+			t.Fatalf("scan %s: %v", seg.FileName, scanErr)
+		}
+	}
+
+	if total != n || len(counts) != n {
+		t.Fatalf("recovered %d records across %d distinct IDs, want exactly %d/%d", total, len(counts), n, n)
+	}
+	for id, c := range counts {
+		if c != 1 {
+			t.Fatalf("record %d recovered %d times: WAL replayed on top of crash-surviving segment bytes", id, c)
+		}
+	}
+}

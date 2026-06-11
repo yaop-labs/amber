@@ -132,12 +132,16 @@ func (sm *SegmentManager) replayWAL() error {
 	}
 
 	// Truncate the segment file back to the last fsynced offset. WAL replay
-	// rebuilds any missing tail.
-	if activeMeta.LastSyncedSize > 0 {
-		if info, err := os.Stat(segPath); err == nil && info.Size() > activeMeta.LastSyncedSize {
-			if err := os.Truncate(segPath, activeMeta.LastSyncedSize); err != nil {
-				return fmt.Errorf("segmgr: truncate to last synced size: %w", err)
-			}
+	// rebuilds any missing tail. LastSyncedSize == 0 means no checkpoint ever
+	// ran for this segment, so nothing past the header is known durable and
+	// the file is cut back to the bare header. Treating zero as "skip the
+	// truncate" kept the crash-surviving records in place and then replayed
+	// the entire WAL on top of them — every record duplicated (found by the
+	// obsbench kill -9 test).
+	syncedSize := max(activeMeta.LastSyncedSize, segHeaderSize)
+	if info, err := os.Stat(segPath); err == nil && info.Size() > syncedSize {
+		if err := os.Truncate(segPath, syncedSize); err != nil {
+			return fmt.Errorf("segmgr: truncate to last synced size: %w", err)
 		}
 	}
 
