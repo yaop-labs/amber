@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -111,21 +112,21 @@ func TestBitmapIndex_AddAndGet(t *testing.T) {
 	b.Add("ERROR", 3)
 	b.Add("INFO", 4)
 
-	errorBM := b.getShared("ERROR")
-	if errorBM.GetCardinality() != 3 {
-		t.Errorf("expected 3 ERROR entries, got %d", errorBM.GetCardinality())
+	errorIDs := b.getSortedShared("ERROR")
+	if len(errorIDs) != 3 {
+		t.Errorf("expected 3 ERROR entries, got %d", len(errorIDs))
 	}
 
-	infoBM := b.getShared("INFO")
-	if infoBM.GetCardinality() != 1 {
-		t.Errorf("expected 1 INFO entry, got %d", infoBM.GetCardinality())
+	infoIDs := b.getSortedShared("INFO")
+	if len(infoIDs) != 1 {
+		t.Errorf("expected 1 INFO entry, got %d", len(infoIDs))
 	}
 }
 
 func TestBitmapIndex_Get_NotFound(t *testing.T) {
 	b := NewBitmapIndex()
-	if bm := b.getShared("MISSING"); bm != nil {
-		t.Error("expected nil bitmap for unknown value")
+	if ids := b.getSortedShared("MISSING"); ids != nil {
+		t.Error("expected nil set for unknown value")
 	}
 }
 
@@ -136,8 +137,8 @@ func TestMultiFieldIndex_Filter_SingleField(t *testing.T) {
 	m.Add("level", "INFO", 3)
 
 	result := m.Filter(map[string]string{"level": "ERROR"})
-	if result.GetCardinality() != 2 {
-		t.Errorf("expected 2 ERROR entries, got %d", result.GetCardinality())
+	if len(result) != 2 {
+		t.Errorf("expected 2 ERROR entries, got %d", len(result))
 	}
 }
 
@@ -157,10 +158,10 @@ func TestMultiFieldIndex_Filter_MultiField_AND(t *testing.T) {
 		"level":   "ERROR",
 		"service": "api",
 	})
-	if result.GetCardinality() != 1 {
-		t.Errorf("expected 1, got %d", result.GetCardinality())
+	if len(result) != 1 {
+		t.Errorf("expected 1, got %d", len(result))
 	}
-	if !result.Contains(1) {
+	if !slices.Contains(result, 1) {
 		t.Error("expected entryID=1 in result")
 	}
 }
@@ -170,7 +171,7 @@ func TestMultiFieldIndex_Filter_UnknownField(t *testing.T) {
 	m.Add("level", "ERROR", 1)
 
 	result := m.Filter(map[string]string{"nonexistent": "value"})
-	if result.GetCardinality() != 0 {
+	if len(result) != 0 {
 		t.Error("expected empty result for unknown field")
 	}
 }
@@ -182,8 +183,8 @@ func TestMultiFieldIndex_FilterAny(t *testing.T) {
 	m.Add("level", "INFO", 3)
 
 	result := m.FilterAny("level", []string{"ERROR", "FATAL"})
-	if result.GetCardinality() != 2 {
-		t.Errorf("expected 2 (ERROR+FATAL), got %d", result.GetCardinality())
+	if len(result) != 2 {
+		t.Errorf("expected 2 (ERROR+FATAL), got %d", len(result))
 	}
 }
 
@@ -203,37 +204,31 @@ func TestMultiFieldIndex_FilterMulti_ORWithinFieldANDAcross(t *testing.T) {
 		"level":   {"ERROR", "FATAL"},
 		"service": {"api", "worker"},
 	})
-	if result.GetCardinality() != 2 {
-		t.Fatalf("expected 2 (entries 1 and 2), got %d", result.GetCardinality())
+	if len(result) != 2 {
+		t.Fatalf("expected 2 (entries 1 and 2), got %d", len(result))
 	}
-	if !result.Contains(1) || !result.Contains(2) {
-		t.Fatalf("expected entries 1 and 2, got %v", result.ToArray())
+	if !slices.Contains(result, 1) || !slices.Contains(result, 2) {
+		t.Fatalf("expected entries 1 and 2, got %v", result)
 	}
 
-	if r := m.FilterMulti(map[string][]string{"level": {"WARN"}}); r.GetCardinality() != 0 {
-		t.Fatalf("expected empty result for absent value, got %d", r.GetCardinality())
+	if r := m.FilterMulti(map[string][]string{"level": {"WARN"}}); len(r) != 0 {
+		t.Fatalf("expected empty result for absent value, got %d", len(r))
 	}
 }
 
-func TestMultiFieldIndex_FilterMultiWithSorted_SingleValueFastPath(t *testing.T) {
+func TestMultiFieldIndex_FilterMulti_ReturnsSorted(t *testing.T) {
 	m := NewMultiFieldIndex()
 	m.Add("level", "ERROR", 2)
 	m.Add("level", "ERROR", 1)
 
-	bm, sorted := m.FilterMultiWithSorted(map[string][]string{"level": {"ERROR"}})
-	if bm.GetCardinality() != 2 {
-		t.Fatalf("expected 2, got %d", bm.GetCardinality())
-	}
-	if sorted == nil {
-		t.Fatal("single field+value must take the sorted fast path")
+	ids := m.FilterMulti(map[string][]string{"level": {"ERROR"}})
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("expected sorted [1 2], got %v", ids)
 	}
 
-	bm, sorted = m.FilterMultiWithSorted(map[string][]string{"level": {"ERROR", "INFO"}})
-	if bm.GetCardinality() != 2 {
-		t.Fatalf("expected 2, got %d", bm.GetCardinality())
-	}
-	if sorted != nil {
-		t.Fatal("multi-value path must not claim a shared sorted slice")
+	ids = m.FilterMulti(map[string][]string{"level": {"ERROR", "INFO"}})
+	if len(ids) != 2 {
+		t.Fatalf("expected 2, got %d", len(ids))
 	}
 }
 
@@ -256,13 +251,13 @@ func TestMultiFieldIndex_SaveAndLoad(t *testing.T) {
 	}
 
 	result := loaded.Filter(map[string]string{"level": "ERROR"})
-	if result.GetCardinality() != 2 {
-		t.Errorf("after load: expected 2 ERROR, got %d", result.GetCardinality())
+	if len(result) != 2 {
+		t.Errorf("after load: expected 2 ERROR, got %d", len(result))
 	}
 
 	result = loaded.Filter(map[string]string{"service": "api"})
-	if result.GetCardinality() != 1 {
-		t.Errorf("after load: expected 1 api, got %d", result.GetCardinality())
+	if len(result) != 1 {
+		t.Errorf("after load: expected 1 api, got %d", len(result))
 	}
 }
 

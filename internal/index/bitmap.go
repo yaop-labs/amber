@@ -1,28 +1,38 @@
 package index
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"slices"
 	"sync"
-
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
+// BitmapIndex maps a field value to the sorted set of entry IDs carrying it.
+//
+// Sets are plain sorted []uint64, not roaring bitmaps: entry IDs derive from
+// ULIDs, whose high bits are millisecond timestamps, so roaring64 degraded
+// to one container per handful of IDs — in the first comparison run the
+// parsed .bidx bitmaps were 76% of amber's live heap and 82% of all live
+// objects (9.9M roaring containers for ~5M records). Sorted slices hold the
+// same sets in a few flat allocations and intersect/union by merge.
 type BitmapIndex struct {
 	mu     sync.RWMutex
 	values map[string]*valueBucket
 }
 
 type valueBucket struct {
-	mu      sync.Mutex
-	ids     []uint64
-	sorted  bool
-	roaring *roaring64.Bitmap
-	dirty   bool
-
-	sortedFrozen []uint64
+	mu     sync.Mutex
+	ids    []uint64
+	sorted bool
+	// normalized marks ids as sorted and deduplicated; reads hand out the
+	// slice itself, so writers must never mutate it in place afterwards
+	// (add appends, which is safe: readers hold their own len).
+	normalized bool
 }
 
 func newBucket() *valueBucket {
@@ -35,8 +45,7 @@ func (v *valueBucket) add(id uint64) {
 		v.sorted = false
 	}
 	v.ids = append(v.ids, id)
-	v.dirty = true
-	v.sortedFrozen = nil
+	v.normalized = false
 	v.mu.Unlock()
 }
 
@@ -49,49 +58,24 @@ func (v *valueBucket) addManySorted(ids []uint64) {
 		v.sorted = false
 	}
 	v.ids = append(v.ids, ids...)
-	v.dirty = true
-	v.sortedFrozen = nil
+	v.normalized = false
 	v.mu.Unlock()
 }
 
-func (v *valueBucket) materializeLocked() *roaring64.Bitmap {
-	if !v.dirty && v.roaring != nil {
-		return v.roaring
-	}
-	if v.ids != nil {
+// sortedShared returns the normalized ID set. The slice is shared: callers
+// must treat it as read-only.
+func (v *valueBucket) sortedShared() []uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.normalized {
 		if !v.sorted {
 			slices.Sort(v.ids)
 			v.sorted = true
 		}
 		v.ids = slices.Compact(v.ids)
-		bm := roaring64.New()
-		bm.AddMany(v.ids)
-		v.roaring = bm
-	} else if v.roaring == nil {
-		v.roaring = roaring64.New()
+		v.normalized = true
 	}
-	v.dirty = false
-	return v.roaring
-}
-
-func (v *valueBucket) materialize() *roaring64.Bitmap {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.materializeLocked()
-}
-
-func (v *valueBucket) sortedShared() []uint64 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.sortedFrozen != nil {
-		return v.sortedFrozen
-	}
-	v.materializeLocked()
-	if v.roaring == nil {
-		return nil
-	}
-	v.sortedFrozen = v.roaring.ToArray()
-	return v.sortedFrozen
+	return v.ids
 }
 
 func NewBitmapIndex() *BitmapIndex {
@@ -127,16 +111,6 @@ func (b *BitmapIndex) AddMany(value string, ids []uint64) {
 	}
 	slices.Sort(ids)
 	b.bucket(value).addManySorted(ids)
-}
-
-func (b *BitmapIndex) getShared(value string) *roaring64.Bitmap {
-	b.mu.RLock()
-	vb, ok := b.values[value]
-	b.mu.RUnlock()
-	if !ok {
-		return nil
-	}
-	return vb.materialize()
 }
 
 func (b *BitmapIndex) getSortedShared(value string) []uint64 {
@@ -214,145 +188,198 @@ func (m *MultiFieldIndex) GetOrCreate(field string) *BitmapIndex {
 	return bi
 }
 
-func (m *MultiFieldIndex) Filter(conditions map[string]string) *roaring64.Bitmap {
-	var result *roaring64.Bitmap
+// Filter intersects single-value per-field conditions (AND). The result is
+// freshly allocated unless it aliases one shared set (single condition).
+func (m *MultiFieldIndex) Filter(conditions map[string]string) []uint64 {
+	var result []uint64
 	first := true
 	for field, value := range conditions {
 		m.mu.RLock()
 		bi, ok := m.fields[field]
 		m.mu.RUnlock()
 		if !ok {
-			return roaring64.New()
+			return nil
 		}
-		bm := bi.getShared(value)
-		if bm == nil || bm.IsEmpty() {
-			return roaring64.New()
+		ids := bi.getSortedShared(value)
+		if len(ids) == 0 {
+			return nil
 		}
 		if first {
-			result = bm
+			result = ids
 			first = false
-		} else {
-			result = roaring64.And(result, bm)
-			if result.IsEmpty() {
-				return result
-			}
+			continue
+		}
+		result = IntersectSorted(result, ids)
+		if len(result) == 0 {
+			return nil
 		}
 	}
-	if result == nil {
-		return roaring64.New()
-	}
 	return result
-}
-
-func (m *MultiFieldIndex) FilterWithSorted(conditions map[string]string) (*roaring64.Bitmap, []uint64) {
-	if len(conditions) != 1 {
-		return m.Filter(conditions), nil
-	}
-	var field, value string
-	for f, v := range conditions {
-		field, value = f, v
-	}
-	m.mu.RLock()
-	bi, ok := m.fields[field]
-	m.mu.RUnlock()
-	if !ok {
-		return roaring64.New(), nil
-	}
-	bm := bi.getShared(value)
-	if bm == nil || bm.IsEmpty() {
-		return roaring64.New(), nil
-	}
-	return bm, bi.getSortedShared(value)
 }
 
 // FilterMulti intersects per-field conditions where each field matches any of
-// its values (OR within a field, AND across fields). A missing field or
-// all-missing values yield an empty result, mirroring Filter.
-func (m *MultiFieldIndex) FilterMulti(conditions map[string][]string) *roaring64.Bitmap {
-	var result *roaring64.Bitmap
+// its values (OR within a field, AND across fields).
+func (m *MultiFieldIndex) FilterMulti(conditions map[string][]string) []uint64 {
+	var result []uint64
 	first := true
 	for field, values := range conditions {
-		fieldBM := m.FilterAny(field, values)
-		if fieldBM.IsEmpty() {
-			return roaring64.New()
+		fieldIDs := m.FilterAny(field, values)
+		if len(fieldIDs) == 0 {
+			return nil
 		}
 		if first {
-			result = fieldBM
+			result = fieldIDs
 			first = false
-		} else {
-			result = roaring64.And(result, fieldBM)
-			if result.IsEmpty() {
-				return result
-			}
+			continue
 		}
-	}
-	if result == nil {
-		return roaring64.New()
+		result = IntersectSorted(result, fieldIDs)
+		if len(result) == 0 {
+			return nil
+		}
 	}
 	return result
 }
 
-// FilterMultiWithSorted is FilterMulti plus the shared sorted-ID slice for
-// the single-field single-value fast path (nil otherwise).
-func (m *MultiFieldIndex) FilterMultiWithSorted(conditions map[string][]string) (*roaring64.Bitmap, []uint64) {
-	if len(conditions) == 1 {
-		for field, values := range conditions {
-			if len(values) == 1 {
-				return m.FilterWithSorted(map[string]string{field: values[0]})
-			}
-		}
-	}
-	return m.FilterMulti(conditions), nil
-}
-
-func (m *MultiFieldIndex) FilterAny(field string, values []string) *roaring64.Bitmap {
+// FilterAny unions the value sets of one field (OR). Result aliases the
+// shared set when only one value matches.
+func (m *MultiFieldIndex) FilterAny(field string, values []string) []uint64 {
 	m.mu.RLock()
 	bi, ok := m.fields[field]
 	m.mu.RUnlock()
 	if !ok {
-		return roaring64.New()
+		return nil
 	}
-	result := roaring64.New()
+	var result []uint64
 	for _, v := range values {
-		if bm := bi.getShared(v); bm != nil {
-			result.Or(bm)
+		ids := bi.getSortedShared(v)
+		if len(ids) == 0 {
+			continue
 		}
+		if result == nil {
+			result = ids
+			continue
+		}
+		result = UnionSorted(result, ids)
 	}
 	return result
 }
 
-var bitmapIndexMagic = [4]byte{'B', 'I', 'D', 'X'}
+// IntersectSorted returns the sorted intersection in a fresh slice — inputs
+// are often shared cache state and must not be mutated.
+func IntersectSorted(a, b []uint64) []uint64 {
+	if len(b) < len(a) {
+		a, b = b, a
+	}
+	out := make([]uint64, 0, len(a))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+// UnionSorted returns the sorted union in a fresh slice.
+func UnionSorted(a, b []uint64) []uint64 {
+	out := make([]uint64, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, a[i])
+			i++
+			j++
+		case a[i] < b[j]:
+			out = append(out, a[i])
+			i++
+		default:
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	out = append(out, b[j:]...)
+	return out
+}
+
+// On-disk format ("BID2"): per field, per value, delta-varint sorted IDs
+// with a trailing CRC. Replaces the roaring serialization ("BIDX"), which
+// is rejected on load — bootstrap rebuilds, queries fall back to scans
+// until then.
+var bitmapIndexMagic = [4]byte{'B', 'I', 'D', '2'}
 
 func (m *MultiFieldIndex) Save(path string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var buf bytes.Buffer
-	buf.Write(bitmapIndexMagic[:])
-	writeUint32Buf(&buf, uint32(len(m.fields)))
-
-	for field, bi := range m.fields {
-		writeStringBuf(&buf, field)
-		bi.mu.RLock()
-		writeUint32Buf(&buf, uint32(len(bi.values)))
-		for value, vb := range bi.values {
-			bm := vb.materialize()
-			writeStringBuf(&buf, value)
-			bitmapData, err := bm.MarshalBinary()
-			if err != nil {
-				bi.mu.RUnlock()
-				return fmt.Errorf("bitmap: marshal %s=%s: %w", field, value, err)
-			}
-			writeUint32Buf(&buf, uint32(len(bitmapData)))
-			buf.Write(bitmapData)
+	return atomicWrite(path, func(file *os.File) error {
+		crc := crc32.NewIEEE()
+		w := bufio.NewWriterSize(file, 1<<20)
+		mw := func(b []byte) error {
+			crc.Write(b)
+			_, err := w.Write(b)
+			return err
 		}
-		bi.mu.RUnlock()
-	}
+		var scratch [binary.MaxVarintLen64]byte
+		uv := func(v uint64) error {
+			n := binary.PutUvarint(scratch[:], v)
+			return mw(scratch[:n])
+		}
 
-	if err := atomicWriteFile(path, buf.Bytes()); err != nil {
-		return fmt.Errorf("bitmap: %w", err)
-	}
-	return nil
+		if err := mw(bitmapIndexMagic[:]); err != nil {
+			return err
+		}
+		if err := uv(uint64(len(m.fields))); err != nil {
+			return err
+		}
+		for field, bi := range m.fields {
+			if err := uv(uint64(len(field))); err != nil {
+				return err
+			}
+			if err := mw([]byte(field)); err != nil {
+				return err
+			}
+			bi.mu.RLock()
+			values := bi.values
+			bi.mu.RUnlock()
+			if err := uv(uint64(len(values))); err != nil {
+				return err
+			}
+			for value, vb := range values {
+				ids := vb.sortedShared()
+				if err := uv(uint64(len(value))); err != nil {
+					return err
+				}
+				if err := mw([]byte(value)); err != nil {
+					return err
+				}
+				if err := uv(uint64(len(ids))); err != nil {
+					return err
+				}
+				var prev uint64
+				for _, id := range ids {
+					if err := uv(id - prev); err != nil {
+						return err
+					}
+					prev = id
+				}
+			}
+		}
+		var sum [4]byte
+		binary.LittleEndian.PutUint32(sum[:], crc.Sum32())
+		if _, err := w.Write(sum[:]); err != nil {
+			return err
+		}
+		return w.Flush()
+	})
 }
 
 func LoadMultiFieldIndex(path string) (*MultiFieldIndex, error) {
@@ -360,75 +387,76 @@ func LoadMultiFieldIndex(path string) (*MultiFieldIndex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bitmap: read %s: %w", path, err)
 	}
-
-	r := bytes.NewReader(data)
-
-	var magic [4]byte
-	if _, err := r.Read(magic[:]); err != nil {
-		return nil, fmt.Errorf("bitmap: read magic: %w", err)
+	if len(data) < 8 || !bytes.Equal(data[:4], bitmapIndexMagic[:]) {
+		return nil, errors.New("bitmap: bad magic (old or corrupt .bidx)")
 	}
-	if magic != bitmapIndexMagic {
-		return nil, fmt.Errorf("bitmap: bad magic %v", magic)
+	body, sum := data[:len(data)-4], data[len(data)-4:]
+	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(sum) {
+		return nil, errors.New("bitmap: crc mismatch")
 	}
 
-	fieldCount := readUint32Buf(r)
-	m := NewMultiFieldIndex()
-
-	for range fieldCount {
-		field := readStringBuf(r)
-		bi := NewBitmapIndex()
-
-		valueCount := readUint32Buf(r)
-		for range valueCount {
-			value := readStringBuf(r)
-
-			bitmapSize := readUint32Buf(r)
-			bitmapData := make([]byte, bitmapSize)
-			if _, err := r.Read(bitmapData); err != nil {
-				return nil, fmt.Errorf("bitmap: read bitmap data: %w", err)
-			}
-
-			bm := roaring64.New()
-			if err := bm.UnmarshalBinary(bitmapData); err != nil {
-				return nil, fmt.Errorf("bitmap: unmarshal %s=%s: %w", field, value, err)
-			}
-			bi.values[value] = &valueBucket{roaring: bm, dirty: false, sorted: true}
+	r := body[4:]
+	take := func() (uint64, error) {
+		v, n := binary.Uvarint(r)
+		if n <= 0 {
+			return 0, errors.New("bitmap: truncated varint")
 		}
+		r = r[n:]
+		return v, nil
+	}
+	takeStr := func() (string, error) {
+		l, err := take()
+		if err != nil {
+			return "", err
+		}
+		if l > uint64(len(r)) {
+			return "", errors.New("bitmap: string length out of range")
+		}
+		s := string(r[:l])
+		r = r[l:]
+		return s, nil
+	}
 
+	fieldCount, err := take()
+	if err != nil {
+		return nil, err
+	}
+	m := NewMultiFieldIndex()
+	for range fieldCount {
+		field, err := takeStr()
+		if err != nil {
+			return nil, err
+		}
+		valueCount, err := take()
+		if err != nil {
+			return nil, err
+		}
+		bi := NewBitmapIndex()
+		for range valueCount {
+			value, err := takeStr()
+			if err != nil {
+				return nil, err
+			}
+			count, err := take()
+			if err != nil {
+				return nil, err
+			}
+			if count > uint64(len(r)) {
+				return nil, errors.New("bitmap: id count out of range")
+			}
+			ids := make([]uint64, 0, count)
+			var prev uint64
+			for range count {
+				d, err := take()
+				if err != nil {
+					return nil, err
+				}
+				prev += d
+				ids = append(ids, prev)
+			}
+			bi.values[value] = &valueBucket{ids: ids, sorted: true, normalized: true}
+		}
 		m.fields[field] = bi
 	}
-
 	return m, nil
-}
-
-func writeUint32Buf(w *bytes.Buffer, v uint32) {
-	w.WriteByte(byte(v))
-	w.WriteByte(byte(v >> 8))
-	w.WriteByte(byte(v >> 16))
-	w.WriteByte(byte(v >> 24))
-}
-
-func writeStringBuf(w *bytes.Buffer, s string) {
-	l := uint16(len(s))
-	w.WriteByte(byte(l))
-	w.WriteByte(byte(l >> 8))
-	w.WriteString(s)
-}
-
-func readUint32Buf(r *bytes.Reader) uint32 {
-	b := make([]byte, 4)
-	_, _ = r.Read(b)
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-func readStringBuf(r *bytes.Reader) string {
-	b := make([]byte, 2)
-	_, _ = r.Read(b)
-	l := int(b[0]) | int(b[1])<<8
-	if l == 0 {
-		return ""
-	}
-	s := make([]byte, l)
-	_, _ = r.Read(s)
-	return string(s)
 }

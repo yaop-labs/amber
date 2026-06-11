@@ -16,8 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
-
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/indexer"
 	"github.com/yaop-labs/amber/internal/model"
@@ -872,16 +870,26 @@ func (e *Executor) execLogSegment(
 	ftsTokens [][]byte,
 ) (int, error) {
 
-	var allowedIDs *roaring64.Bitmap
-
+	// allowedSlice is the sorted candidate-ID set ANDed across the index
+	// steps; hasFilter distinguishes "no filtering" from "filtered to
+	// something" (an empty filtered set returns early).
 	var allowedSlice []uint64
+	hasFilter := false
+	restrict := func(ids []uint64) bool {
+		if !hasFilter {
+			allowedSlice = ids
+			hasFilter = true
+		} else {
+			allowedSlice = index.IntersectSorted(allowedSlice, ids)
+		}
+		return len(allowedSlice) > 0
+	}
 
 	if plan.HasStep(StepBitmapFilter) {
 		if bm, ok := e.logBitmap(seg.FileName); ok {
 			conditions := buildBitmapConditions(q)
 			if len(conditions) > 0 {
-				allowedIDs, allowedSlice = bm.FilterMultiWithSorted(conditions)
-				if allowedIDs.IsEmpty() {
+				if !restrict(bm.FilterMulti(conditions)) {
 					return 0, nil
 				}
 			}
@@ -904,19 +912,7 @@ func (e *Executor) execLogSegment(
 			if err != nil {
 				return 0, fmt.Errorf("fts search: %w", err)
 			}
-
-			ftsBitmap := roaring64.New()
-			ftsBitmap.AddMany(ftsIDs)
-
-			if allowedIDs == nil {
-				allowedIDs = ftsBitmap
-			} else {
-
-				allowedIDs = roaring64.And(allowedIDs, ftsBitmap)
-				allowedSlice = nil
-			}
-
-			if allowedIDs.IsEmpty() {
+			if !restrict(ftsIDs) {
 				return 0, nil
 			}
 		} else if len(ftsTokens) > 0 {
@@ -935,18 +931,9 @@ func (e *Executor) execLogSegment(
 			if len(ids) == 0 {
 				return 0, nil
 			}
-			traceBitmap := roaring64.New()
-			for _, id := range ids {
-				traceBitmap.Add(id)
-			}
-			if allowedIDs == nil {
-				allowedIDs = traceBitmap
-			} else {
-				allowedIDs = roaring64.And(allowedIDs, traceBitmap)
-				allowedSlice = nil
-				if allowedIDs.IsEmpty() {
-					return 0, nil
-				}
+			slices.Sort(ids)
+			if !restrict(ids) {
+				return 0, nil
 			}
 		}
 	}
@@ -982,14 +969,11 @@ func (e *Executor) execLogSegment(
 		ftsMemo = make(map[string]bool)
 	}
 
-	if allowedIDs != nil && allowedSlice == nil {
-		allowedSlice = allowedIDs.ToArray()
-	}
 	skip := func(minID, maxID uint64) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if allowedSlice != nil {
+		if hasFilter {
 			i := sort.Search(len(allowedSlice), func(i int) bool {
 				return allowedSlice[i] >= minID
 			})
@@ -1005,8 +989,10 @@ func (e *Executor) execLogSegment(
 			return err
 		}
 		id, idOK := peekEntryIDUint64(data)
-		if allowedIDs != nil && idOK && !allowedIDs.Contains(id) {
-			return nil
+		if hasFilter && idOK {
+			if _, found := slices.BinarySearch(allowedSlice, id); !found {
+				return nil
+			}
 		}
 
 		var entry model.LogEntry
@@ -1193,7 +1179,8 @@ func (e *Executor) execSpanSegment(
 	k int,
 ) (int, error) {
 
-	var allowedIDs *roaring64.Bitmap
+	var allowedSlice []uint64
+	hasFilter := false
 
 	if !model.IsZeroTraceID(q.TraceID) {
 		if ribbon, ok := e.spanRibbon(seg.FileName); ok {
@@ -1206,10 +1193,9 @@ func (e *Executor) execSpanSegment(
 			if len(ids) == 0 {
 				return 0, nil
 			}
-			allowedIDs = roaring64.New()
-			for _, id := range ids {
-				allowedIDs.Add(id)
-			}
+			slices.Sort(ids)
+			allowedSlice = ids
+			hasFilter = true
 		}
 	}
 
@@ -1238,9 +1224,11 @@ func (e *Executor) execSpanSegment(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if allowedIDs != nil {
-			if id, ok := peekEntryIDUint64(data); ok && !allowedIDs.Contains(id) {
-				return nil
+		if hasFilter {
+			if id, ok := peekEntryIDUint64(data); ok {
+				if _, found := slices.BinarySearch(allowedSlice, id); !found {
+					return nil
+				}
 			}
 		}
 
@@ -1299,15 +1287,11 @@ func (e *Executor) execSpanSegment(
 		}
 	}
 
-	var allowedSlice []uint64
-	if allowedIDs != nil {
-		allowedSlice = allowedIDs.ToArray()
-	}
 	skip := func(minID, maxID uint64) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if allowedSlice != nil {
+		if hasFilter {
 			i := sort.Search(len(allowedSlice), func(i int) bool {
 				return allowedSlice[i] >= minID
 			})
