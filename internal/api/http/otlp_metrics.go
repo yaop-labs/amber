@@ -57,21 +57,11 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 					accepted += a
 					rejected += r
 				case *metricspb.Metric_Histogram:
-					if h.histStore == nil {
-						unsupported += len(data.Histogram.GetDataPoints())
-						selfobs.MetricsIngestUnsupported.WithLabelValues("histogram").Add(uint64(len(data.Histogram.GetDataPoints())))
-						continue
-					}
 					series := explicitSeriesFor(metric, data.Histogram, resourceAttrs, scopeAttrs)
 					accepted += sumExplicitPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Add(uint64(sumExplicitPoints(series)))
 					explicitAll = append(explicitAll, series...)
 				case *metricspb.Metric_ExponentialHistogram:
-					if h.histStore == nil {
-						unsupported += len(data.ExponentialHistogram.GetDataPoints())
-						selfobs.MetricsIngestUnsupported.WithLabelValues("exphistogram").Add(uint64(len(data.ExponentialHistogram.GetDataPoints())))
-						continue
-					}
 					series := expSeriesFor(metric, data.ExponentialHistogram, resourceAttrs, scopeAttrs)
 					accepted += sumExpPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("exphistogram").Add(uint64(sumExpPoints(series)))
@@ -85,16 +75,16 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(expAll) > 0 || len(explicitAll) > 0 {
-		assignSeriesIDs(expAll, explicitAll)
-		if _, err := h.histStore.WriteBlock(expAll, explicitAll); err != nil {
-			// Treat block-write failure as ingest rejection: the histogram
-			// data never landed. Count by point total, not series count, so
-			// the counter matches scalar semantics.
-			pts := sumExpPoints(expAll) + sumExplicitPoints(explicitAll)
+		sketches := sketchSamples(expAll, explicitAll)
+		if _, err := h.metricStore.AppendSketches(sketches); err != nil {
+			// Treat append failure as ingest rejection: the histogram data
+			// never landed. Count by point total, not series count, so the
+			// counter matches scalar semantics.
+			pts := len(sketches)
 			rejected += pts
 			accepted -= pts
 			selfobs.MetricsIngestRejected.WithLabelValues("hist_write").Add(uint64(pts))
-			h.log.Warn("histogram block write failed", "err", err)
+			h.log.Warn("histogram append failed", "err", err)
 		}
 	}
 
@@ -202,17 +192,21 @@ func explicitSeriesFor(metric *metricspb.Metric, hist *metricspb.Histogram, reso
 	return meotlp.ExplicitSeries(batch, points)
 }
 
-// assignSeriesIDs assigns block-local series IDs.
-func assignSeriesIDs(exp []histogram.ExpSeries, explicit []histogram.ExplicitSeries) {
-	var next uint64 = 1
-	for i := range exp {
-		exp[i].ID = next
-		next++
+// sketchSamples flattens converted series into per-tick sketch samples for
+// the store; series IDs are assigned globally by the store's catalog.
+func sketchSamples(exp []histogram.ExpSeries, explicit []histogram.ExplicitSeries) []metricsengine.SketchSample {
+	out := make([]metricsengine.SketchSample, 0, sumExpPoints(exp)+sumExplicitPoints(explicit))
+	for _, series := range exp {
+		for i, ts := range series.Timestamps {
+			out = append(out, metricsengine.SketchSample{Labels: series.Labels, Timestamp: ts, Exp: series.Sketches[i]})
+		}
 	}
-	for i := range explicit {
-		explicit[i].ID = next
-		next++
+	for _, series := range explicit {
+		for i, ts := range series.Timestamps {
+			out = append(out, metricsengine.SketchSample{Labels: series.Labels, Timestamp: ts, Explicit: series.Buckets[i]})
+		}
 	}
+	return out
 }
 
 func sumExpPoints(s []histogram.ExpSeries) int {

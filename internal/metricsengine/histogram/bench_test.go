@@ -1,13 +1,16 @@
 package histogram
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"testing"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
+	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
 // buildDataset returns `ticks` exp-histograms at the given scale, each from
@@ -101,7 +104,7 @@ func TestBenchByteComparison(t *testing.T) {
 
 func BenchmarkHistogramQuantileMergePath(b *testing.B) {
 	dir := b.TempDir()
-	s, err := OpenStore(dir)
+	s, err := openBenchStore(dir)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -117,7 +120,7 @@ func BenchmarkHistogramQuantileMergePath(b *testing.B) {
 	sel := index.NewSelector(index.MetricName("lat"))
 
 	for b.Loop() {
-		if _, err := s.HistogramQuantile(sel, 0.99, fullRange()); err != nil {
+		if _, err := s.HistogramQuantile(sel, 0.99, FullRange()); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -151,7 +154,7 @@ func BenchmarkHistogramWriteBlock(b *testing.B) {
 	for b.Loop() {
 		b.StopTimer()
 		dir := b.TempDir()
-		s, err := OpenStore(dir)
+		s, err := openBenchStore(dir)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -183,7 +186,7 @@ func BenchmarkHistogramQuantileByLabel(b *testing.B) {
 	const hosts = 20
 
 	dir := b.TempDir()
-	s, err := OpenStore(dir)
+	s, err := openBenchStore(dir)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -213,7 +216,7 @@ func BenchmarkHistogramQuantileByLabel(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		out, err := s.HistogramQuantileBy(sel, 0.99, fullRange(), []string{"host"})
+		out, err := s.HistogramQuantileBy(sel, 0.99, FullRange(), []string{"host"})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -221,4 +224,40 @@ func BenchmarkHistogramQuantileByLabel(b *testing.B) {
 			b.Fatalf("expected %d groups, got %d", hosts, len(out))
 		}
 	}
+}
+
+// openBenchStore is a minimal path-based stand-in for the retired standalone
+// Store, enough for the benchmarks: one block file, path-based queries.
+type benchStore struct {
+	dir string
+	seq int
+}
+
+func openBenchStore(dir string) (*benchStore, error) { return &benchStore{dir: dir}, nil }
+
+func (s *benchStore) WriteBlock(exp []ExpSeries, explicit []ExplicitSeries) (string, error) {
+	path := filepath.Join(s.dir, fmt.Sprintf("hblock-%06d.mhb", s.seq))
+	s.seq++
+	return path, WriteBlock(path, exp, explicit)
+}
+
+func (s *benchStore) paths() []string {
+	out, _ := filepath.Glob(filepath.Join(s.dir, "hblock-*.mhb"))
+	return out
+}
+
+func (s *benchStore) HistogramQuantile(sel index.Selector, q float64, tr TimeRange) (float64, error) {
+	return QuantileForPaths(s.paths(), sel, q, tr)
+}
+
+func (s *benchStore) HistogramQuantileBy(sel index.Selector, q float64, tr TimeRange, by []string) (map[string]float64, error) {
+	return QuantileByForPaths(s.paths(), sel, q, tr, by)
+}
+
+func lbls(pairs ...string) model.LabelSet {
+	out := make(model.LabelSet, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		out = append(out, model.Label{Name: pairs[i], Value: pairs[i+1]})
+	}
+	return out.Canonical()
 }

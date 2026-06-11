@@ -46,6 +46,10 @@ type Engine struct {
 	// current WAL generation (since the last truncate).
 	declared map[index.SeriesID]struct{}
 
+	// sketchHead buffers histogram ticks, the sketch analogue of head.Head.
+	// Guarded by mu.
+	sketchHead map[index.SeriesID]*sketchBuf
+
 	// walRecovery captures what RecoverReplay found at open time. A non-zero
 	// TruncatedBytes means a corrupt or torn WAL tail was dropped.
 	walRecovery wal.RecoverStats
@@ -73,9 +77,10 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 		registry = index.NewRegistry()
 	}
 	e := &Engine{
-		registry: registry,
-		head:     head.New(registry),
-		declared: make(map[index.SeriesID]struct{}),
+		registry:   registry,
+		head:       head.New(registry),
+		declared:   make(map[index.SeriesID]struct{}),
+		sketchHead: make(map[index.SeriesID]*sketchBuf),
 	}
 	if opts.WALPath != "" {
 		// RecoverReplay tolerates a corrupt or torn tail (crash mid-write):
@@ -119,6 +124,8 @@ func (e *Engine) replayRecord(record wal.Record) error {
 	case wal.KindLegacySample:
 		e.head.Append(record.Labels, record.Type, record.Timestamp, record.Value)
 		return nil
+	case wal.KindSketchExp, wal.KindSketchExplicit:
+		return e.replaySketchRecord(record)
 	default:
 		return fmt.Errorf("engine: unknown WAL record kind %d", record.Kind)
 	}
@@ -289,6 +296,7 @@ func (e *Engine) writeBlockLocked(path string) error {
 
 func (e *Engine) commitFlushLocked() error {
 	e.head.Reset()
+	e.sketchHead = make(map[index.SeriesID]*sketchBuf)
 	// New WAL generation: every series must be re-declared before its next
 	// sample. Caller holds the flush gate, so no append interleaves between
 	// the truncate and this reset.

@@ -41,6 +41,8 @@ type Store = store.Store
 type StoreOptions = store.Options
 type StoreConfig = store.Config
 type StoreStats = store.Stats
+type SketchSample = engine.SketchSample
+type HistogramStats = store.HistogramStats
 
 const (
 	MetricTypeGauge                = model.MetricTypeGauge

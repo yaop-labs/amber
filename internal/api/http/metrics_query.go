@@ -27,20 +27,19 @@ func NewMetricsQueryHandler(store *metricsengine.Store, log *slog.Logger) *Metri
 // It returns scalar metric names and histogram names as separate arrays.
 type MetricsListHandler struct {
 	scalar *metricsengine.Store
-	hist   *histogram.Store
 	log    *slog.Logger
 }
 
-func NewMetricsListHandler(scalar *metricsengine.Store, hist *histogram.Store, log *slog.Logger) *MetricsListHandler {
-	return &MetricsListHandler{scalar: scalar, hist: hist, log: log}
+func NewMetricsListHandler(scalar *metricsengine.Store, log *slog.Logger) *MetricsListHandler {
+	return &MetricsListHandler{scalar: scalar, log: log}
 }
 
 type metricsListResponse struct {
 	// Metrics is the scalar (counter/gauge) set; backwards-compatible with the
 	// initial version of this endpoint.
 	Metrics []string `json:"metrics"`
-	// Histograms is the histogram-store set. Empty (not omitted) when the
-	// histogram store is disabled or empty, so the field is always present.
+	// Histograms is the histogram metric-name set. Empty (not omitted) when
+	// there are none, so the field is always present.
 	Histograms []string `json:"histograms"`
 }
 
@@ -54,16 +53,14 @@ func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		scalar = []string{}
 	}
 	hists := []string{}
-	if h.hist != nil {
-		names, err := h.hist.MetricNames()
-		if err != nil {
-			h.log.Warn("histogram metric-names failed", "err", err)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if names != nil {
-			hists = names
-		}
+	names, err := h.scalar.HistogramMetricNames()
+	if err != nil {
+		h.log.Warn("histogram metric-names failed", "err", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if names != nil {
+		hists = names
 	}
 	writeJSON(w, http.StatusOK, metricsListResponse{Metrics: scalar, Histograms: hists})
 }
@@ -72,12 +69,11 @@ func (h *MetricsListHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 // It returns storage counters for scalar and histogram stores.
 type MetricsStatsHandler struct {
 	scalar *metricsengine.Store
-	hist   *histogram.Store
 	log    *slog.Logger
 }
 
-func NewMetricsStatsHandler(scalar *metricsengine.Store, hist *histogram.Store, log *slog.Logger) *MetricsStatsHandler {
-	return &MetricsStatsHandler{scalar: scalar, hist: hist, log: log}
+func NewMetricsStatsHandler(scalar *metricsengine.Store, log *slog.Logger) *MetricsStatsHandler {
+	return &MetricsStatsHandler{scalar: scalar, log: log}
 }
 
 // metricsStatsResponse is the wire shape for GET /api/v1/metrics/stats.
@@ -125,23 +121,21 @@ func (h *MetricsStatsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) 
 		resp.MinTimeMS = &minT
 		resp.MaxTimeMS = &maxT
 	}
-	if h.hist != nil {
-		hs, err := h.hist.Stats()
-		if err != nil {
-			h.log.Warn("histogram stats failed", "err", err)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		resp.Histogram = histogramStatsSubResponse{
-			Blocks: hs.Blocks,
-			Series: hs.Series,
-			Bytes:  hs.Bytes,
-		}
-		if hs.HasTime {
-			minT, maxT := hs.MinTime, hs.MaxTime
-			resp.Histogram.MinTimeMS = &minT
-			resp.Histogram.MaxTimeMS = &maxT
-		}
+	hs, err := h.scalar.HistStats()
+	if err != nil {
+		h.log.Warn("histogram stats failed", "err", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp.Histogram = histogramStatsSubResponse{
+		Blocks: hs.Blocks,
+		Series: hs.Series,
+		Bytes:  hs.Bytes,
+	}
+	if hs.HasTime {
+		minT, maxT := hs.MinTime, hs.MaxTime
+		resp.Histogram.MinTimeMS = &minT
+		resp.Histogram.MaxTimeMS = &maxT
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -257,11 +251,11 @@ func parseEndParam(raw string) (int64, error) {
 // MetricsQuantileHandler serves GET /api/v1/metrics/quantile.
 // It answers one quantile over matching exponential histograms.
 type MetricsQuantileHandler struct {
-	store *histogram.Store
+	store *metricsengine.Store
 	log   *slog.Logger
 }
 
-func NewMetricsQuantileHandler(store *histogram.Store, log *slog.Logger) *MetricsQuantileHandler {
+func NewMetricsQuantileHandler(store *metricsengine.Store, log *slog.Logger) *MetricsQuantileHandler {
 	return &MetricsQuantileHandler{store: store, log: log}
 }
 

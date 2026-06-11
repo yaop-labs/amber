@@ -142,8 +142,8 @@ func (p ExplicitHistogramPoint) Histogram() *histogram.ExplicitBucketHistogram {
 }
 
 // ExponentialSeries groups exp-histogram points by their full label set into
-// per-series sketch lists ready to hand to histogram.Store.WriteBlock. Points of
-// the same series are ordered by timestamp.
+// per-series sketch lists ready to flatten into store sketch samples. Points
+// of the same series are ordered by timestamp.
 func ExponentialSeries(batch Batch, points []ExponentialHistogramPoint) []histogram.ExpSeries {
 	type acc struct {
 		labels model.LabelSet
@@ -179,7 +179,7 @@ func ExponentialSeries(batch Batch, points []ExponentialHistogramPoint) []histog
 }
 
 // ExplicitSeries groups explicit-bucket points by label set into per-series
-// vectors ready for histogram.Store.WriteBlock.
+// vectors ready to flatten into store sketch samples.
 func ExplicitSeries(batch Batch, points []ExplicitHistogramPoint) []histogram.ExplicitSeries {
 	type acc struct {
 		labels model.LabelSet

@@ -398,3 +398,44 @@ func readTimestamps(r *reader, n int) ([]int64, error) {
 	}
 	return out, nil
 }
+
+// EncodeExplicitTick encodes one explicit-bucket histogram self-contained
+// (bounds included) for the WAL sketch record.
+func EncodeExplicitTick(h *ExplicitBucketHistogram) []byte {
+	dst := appendUvarint(nil, uint64(len(h.Bounds)))
+	for _, b := range h.Bounds {
+		dst = appendFloat(dst, b)
+	}
+	dst = appendExplicitScalars(dst, h)
+	dst = appendSparseCounts(dst, h.Counts)
+	return dst
+}
+
+// DecodeExplicitTick decodes one EncodeExplicitTick payload.
+func DecodeExplicitTick(b []byte) (*ExplicitBucketHistogram, error) {
+	r := reader{b: b}
+	n, err := r.uvarint()
+	if err != nil {
+		return nil, err
+	}
+	if n > uint64(len(b)) {
+		return nil, errors.New("histogram: explicit tick bounds count out of range")
+	}
+	bounds := make([]float64, n)
+	for i := range bounds {
+		bounds[i], err = r.float()
+		if err != nil {
+			return nil, err
+		}
+	}
+	h := &ExplicitBucketHistogram{Bounds: bounds}
+	if err := readExplicitScalars(&r, h); err != nil {
+		return nil, err
+	}
+	counts, err := readSparseCounts(&r, len(bounds)+1)
+	if err != nil {
+		return nil, err
+	}
+	h.Counts = counts
+	return h, nil
+}

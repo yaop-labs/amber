@@ -26,6 +26,11 @@ const (
 	// KindLegacySample is produced only by the decoder for records written
 	// by the pre-binary JSON format: a sample carrying its own labels.
 	KindLegacySample RecordKind = 3
+	// KindSketchExp / KindSketchExplicit carry one histogram tick:
+	// (id, ts, opaque sketch payload). The payload codec lives in the
+	// histogram package; the WAL treats it as bytes.
+	KindSketchExp      RecordKind = 4
+	KindSketchExplicit RecordKind = 5
 )
 
 // Record is the logical WAL record. Which fields are meaningful depends on
@@ -38,6 +43,8 @@ type Record struct {
 	Type      model.MetricType
 	Timestamp int64
 	Value     int64
+	// Payload carries the encoded sketch for KindSketchExp/KindSketchExplicit.
+	Payload []byte
 }
 
 // legacyRecord mirrors the retired JSON format for decoding old WAL files.
@@ -144,6 +151,10 @@ func encodeRecord(record Record) ([]byte, error) {
 		payload = append(payload, byte(record.Type))
 		payload = appendZigZag(payload, record.Timestamp)
 		payload = appendZigZag(payload, record.Value)
+	case KindSketchExp, KindSketchExplicit:
+		payload = appendUvarint([]byte{byte(record.Kind)}, record.ID)
+		payload = appendZigZag(payload, record.Timestamp)
+		payload = append(payload, record.Payload...)
 	default:
 		return nil, errors.New("wal: unknown record kind")
 	}
@@ -200,6 +211,15 @@ func decodeRecord(payload []byte) (Record, error) {
 		if r.err != nil || r.remaining() != 0 {
 			return Record{}, errors.New("wal: malformed sample record")
 		}
+		return rec, nil
+	case KindSketchExp, KindSketchExplicit:
+		rec := Record{Kind: RecordKind(payload[0])}
+		rec.ID = r.uvarint()
+		rec.Timestamp = r.zigzag()
+		if r.err != nil {
+			return Record{}, errors.New("wal: malformed sketch record")
+		}
+		rec.Payload = append([]byte(nil), r.buf...)
 		return rec, nil
 	default:
 		return Record{}, errors.New("wal: unknown record kind")

@@ -16,8 +16,13 @@ type Manifest struct {
 	Blocks  []BlockMeta `json:"blocks"`
 }
 
+// BlockKindHistogram marks a histogram (sketch) block in the manifest;
+// the empty kind is a scalar block.
+const BlockKindHistogram = "hist"
+
 type BlockMeta struct {
 	Path        string              `json:"path"`
+	Kind        string              `json:"kind,omitempty"`
 	MinTime     int64               `json:"min_time"`
 	MaxTime     int64               `json:"max_time"`
 	SeriesCount int                 `json:"series_count"`

@@ -18,7 +18,6 @@ import (
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
-	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -139,9 +138,6 @@ type Stack struct {
 
 	// MetricStore is nil when metrics are disabled.
 	MetricStore *mestore.Store
-
-	// HistogramStore is nil when metrics are disabled.
-	HistogramStore *histogram.Store
 
 	dogfoodStop chan struct{}
 	dogfoodDone chan struct{}
@@ -321,7 +317,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	})
 
 	var metricStore *mestore.Store
-	var histStore *histogram.Store
 	if !cfg.Metrics.Disabled {
 		metricsDir := cfg.Metrics.Dir
 		if metricsDir == "" {
@@ -347,28 +342,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			return nil, fmt.Errorf("runtime: open metric store: %w", err)
 		}
 		metricStore = ms
-
-		hs, err := histogram.OpenStoreWithOptions(filepath.Join(metricsDir, "histograms"), histogram.Options{
-			Retention:          cfg.Metrics.Retention,
-			MaxActiveSeries:    cfg.Metrics.MaxActiveSeries,
-			MaxLabelsPerSeries: cfg.Metrics.MaxLabelsPerSeries,
-			// Histogram blocks are written one per OTLP request; auto-compact
-			// keeps the file count bounded (0 → store default of 64).
-			CompactMinBlocks: cfg.Metrics.CompactionMinBlocks,
-		})
-		if err != nil {
-			if logUp != nil {
-				logUp.Stop()
-			}
-			if spanUp != nil {
-				spanUp.Stop()
-			}
-			_ = metricStore.Close()
-			_ = logManager.Close()
-			_ = spanManager.Close()
-			return nil, fmt.Errorf("runtime: open histogram store: %w", err)
-		}
-		histStore = hs
 	}
 
 	s.LogManager = logManager
@@ -380,7 +353,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.Executor = exec
 	s.Batcher = batcher
 	s.MetricStore = metricStore
-	s.HistogramStore = histStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
 	s.lock = dirLock

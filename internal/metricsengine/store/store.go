@@ -14,6 +14,7 @@ import (
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
 	"github.com/yaop-labs/amber/internal/metricsengine/engine"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/query"
@@ -336,7 +337,7 @@ func (s *Store) Flush() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.engine.BufferedSeries() == 0 {
+	if s.engine.BufferedSeries() == 0 && s.engine.BufferedSketchSeries() == 0 {
 		return "", ErrNoSamples
 	}
 	path := s.nextBlockPath()
@@ -358,6 +359,38 @@ func (s *Store) Flush() (string, error) {
 		SeriesCount: len(dir.Series),
 		LabelValues: labelValues(dir),
 	}
+
+	// Histogram head flushes into a sibling hist block under the same gate,
+	// markers, and commit.
+	exp, explicit := s.engine.SketchSnapshot()
+	histPath := ""
+	var histMeta BlockMeta
+	if len(exp) > 0 || len(explicit) > 0 {
+		histPath = strings.TrimSuffix(s.nextBlockPathWithPrefix("hist"), ".meb") + ".mhb"
+		if err := histogram.WriteBlock(histPath, exp, explicit); err != nil {
+			s.engine.AbortFlush()
+			return "", err
+		}
+		hdir, err := histogram.ReadDirectory(histPath)
+		if err != nil {
+			s.engine.AbortFlush()
+			return "", err
+		}
+		hmin, hmax, _ := hdir.TimeRange()
+		histMeta = BlockMeta{
+			Path:        filepath.Base(histPath),
+			Kind:        BlockKindHistogram,
+			MinTime:     hmin,
+			MaxTime:     hmax,
+			SeriesCount: len(hdir.Series),
+			LabelValues: histLabelValues(hdir),
+		}
+		if err := writeFlushPendingMarker(histPath, "prepared"); err != nil {
+			s.engine.AbortFlush()
+			return "", err
+		}
+	}
+
 	if err := writeFlushPendingMarker(path, "prepared"); err != nil {
 		s.engine.AbortFlush()
 		return "", err
@@ -368,14 +401,41 @@ func (s *Store) Flush() (string, error) {
 	if err := writeFlushPendingMarker(path, "committed"); err != nil {
 		return "", err
 	}
-	s.manifest.Blocks = append(s.manifest.Blocks, meta)
+	if histPath != "" {
+		if err := writeFlushPendingMarker(histPath, "committed"); err != nil {
+			return "", err
+		}
+	}
+	if meta.SeriesCount > 0 {
+		s.manifest.Blocks = append(s.manifest.Blocks, meta)
+	}
+	if histPath != "" {
+		s.manifest.Blocks = append(s.manifest.Blocks, histMeta)
+	}
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return "", err
+	}
+	if meta.SeriesCount == 0 {
+		// Sketch-only flush: drop the empty scalar block.
+		_ = os.Remove(path)
 	}
 	if err := clearFlushPendingMarker(path); err != nil {
 		return "", err
 	}
-	s.directoryCache[path] = dir
+	if histPath != "" {
+		if err := clearFlushPendingMarker(histPath); err != nil {
+			return "", err
+		}
+	}
+	if meta.SeriesCount > 0 {
+		s.directoryCache[path] = dir
+	}
+	if meta.SeriesCount == 0 && histPath == "" {
+		return "", ErrNoSamples
+	}
+	if meta.SeriesCount == 0 {
+		return histPath, nil
+	}
 	return path, nil
 }
 
@@ -443,18 +503,41 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 			_ = os.Remove(marker)
 			continue
 		}
-		dirInfo, err := block.ReadDirectory(blockPath)
-		if err != nil {
-			return err
+		var adopted BlockMeta
+		if strings.HasSuffix(base, ".mhb") {
+			hdir, err := histogram.ReadDirectory(blockPath)
+			if err != nil {
+				return err
+			}
+			hmin, hmax, _ := hdir.TimeRange()
+			adopted = BlockMeta{
+				Path:        base,
+				Kind:        BlockKindHistogram,
+				MinTime:     hmin,
+				MaxTime:     hmax,
+				SeriesCount: len(hdir.Series),
+				LabelValues: histLabelValues(hdir),
+			}
+		} else {
+			dirInfo, err := block.ReadDirectory(blockPath)
+			if err != nil {
+				return err
+			}
+			minTime, maxTime, _ := dirInfo.TimeRange()
+			adopted = BlockMeta{
+				Path:        base,
+				MinTime:     minTime,
+				MaxTime:     maxTime,
+				SeriesCount: len(dirInfo.Series),
+				LabelValues: labelValues(dirInfo),
+			}
 		}
-		minTime, maxTime, _ := dirInfo.TimeRange()
-		manifest.Blocks = append(manifest.Blocks, BlockMeta{
-			Path:        base,
-			MinTime:     minTime,
-			MaxTime:     maxTime,
-			SeriesCount: len(dirInfo.Series),
-			LabelValues: labelValues(dirInfo),
-		})
+		if adopted.SeriesCount == 0 {
+			_ = os.Remove(blockPath)
+			_ = os.Remove(marker)
+			continue
+		}
+		manifest.Blocks = append(manifest.Blocks, adopted)
 		known[base] = struct{}{}
 		changed = true
 		_ = os.Remove(marker)
@@ -540,6 +623,12 @@ func (s *Store) Compact() (string, error) {
 		return "", err
 	}
 	if len(paths) <= 1 {
+		// Nothing to do on the scalar side; histogram blocks may still merge.
+		if histPath, err := s.compactHistLocked(); err != nil {
+			return "", err
+		} else if histPath != "" {
+			return histPath, nil
+		}
 		return "", ErrNoSamples
 	}
 
@@ -605,14 +694,22 @@ func (s *Store) Compact() (string, error) {
 		return "", err
 	}
 	minTime, maxTime, _ := dir.TimeRange()
-	oldBlocks := append([]BlockMeta(nil), s.manifest.Blocks...)
-	s.manifest.Blocks = []BlockMeta{{
+	oldBlocks := make([]BlockMeta, 0, len(s.manifest.Blocks))
+	kept := make([]BlockMeta, 0, len(s.manifest.Blocks))
+	for _, meta := range s.manifest.Blocks {
+		if meta.Kind == "" {
+			oldBlocks = append(oldBlocks, meta)
+		} else {
+			kept = append(kept, meta)
+		}
+	}
+	s.manifest.Blocks = append(kept, BlockMeta{
 		Path:        filepath.Base(path),
 		MinTime:     minTime,
 		MaxTime:     maxTime,
 		SeriesCount: len(dir.Series),
 		LabelValues: labelValues(dir),
-	}}
+	})
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return "", err
 	}
@@ -620,6 +717,9 @@ func (s *Store) Compact() (string, error) {
 		_ = os.Remove(filepath.Join(s.dir, meta.Path))
 	}
 	s.directoryCache = map[string]block.Directory{path: dir}
+	if _, err := s.compactHistLocked(); err != nil {
+		return path, err
+	}
 	return path, nil
 }
 
@@ -680,6 +780,10 @@ func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options
 	if len(s.manifest.Blocks) > 0 {
 		paths := make([]string, 0, len(s.manifest.Blocks))
 		for _, meta := range s.manifest.Blocks {
+			if meta.Kind != "" {
+				// Histogram blocks have their own query path.
+				continue
+			}
 			if !metaMatchesTime(meta, opts) || !metaMatchesSelector(meta, selector) {
 				continue
 			}
@@ -1145,6 +1249,9 @@ func (s *Store) Stats() (Stats, error) {
 			if meta.MaxTime > stats.MaxTime {
 				stats.MaxTime = meta.MaxTime
 			}
+		}
+		if meta.Kind != "" {
+			continue
 		}
 		dir, err := s.readDirectory(path)
 		if err != nil {

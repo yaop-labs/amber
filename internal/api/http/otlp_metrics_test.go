@@ -22,7 +22,6 @@ import (
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
-	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -32,7 +31,6 @@ import (
 type metricsHarness struct {
 	mux         *http.ServeMux
 	metricStore *metricsengine.Store
-	histStore   *histogram.Store
 }
 
 func setupMetricsHarness(t *testing.T) *metricsHarness {
@@ -67,10 +65,6 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 	if err != nil {
 		t.Fatalf("open metric store: %v", err)
 	}
-	histStore, err := histogram.OpenStore(filepath.Join(dir, "metrics", "histograms"))
-	if err != nil {
-		t.Fatalf("open histogram store: %v", err)
-	}
 
 	mux := http.NewServeMux()
 	var ready atomic.Bool
@@ -78,9 +72,8 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 	RegisterRoutes(mux, RoutesDeps{
 		Batcher: batcher, Executor: exec,
 		LogManager: logManager, LogSparse: logSparse,
-		MetricStore:    metricStore,
-		HistogramStore: histStore,
-		IsReady:        ready.Load, Logger: log,
+		MetricStore: metricStore,
+		IsReady:     ready.Load, Logger: log,
 	}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
 
 	t.Cleanup(func() {
@@ -93,7 +86,7 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 		_ = spanManager.Close()
 	})
 
-	return &metricsHarness{mux: mux, metricStore: metricStore, histStore: histStore}
+	return &metricsHarness{mux: mux, metricStore: metricStore}
 }
 
 func (h *metricsHarness) post(t *testing.T, path string, body []byte) *httptest.ResponseRecorder {
@@ -331,7 +324,7 @@ func TestOTLPMetrics_ExponentialHistogramAccepted(t *testing.T) {
 	}
 }
 
-func TestOTLPMetrics_HistogramUnsupportedWhenHistStoreNil(t *testing.T) {
+func TestOTLPMetrics_HistogramAcceptedOnMetricStore(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dir := t.TempDir()
 	metricStore, err := metricsengine.OpenStore(filepath.Join(dir, "metrics"))
@@ -340,7 +333,7 @@ func TestOTLPMetrics_HistogramUnsupportedWhenHistStoreNil(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = metricStore.Close() })
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/metrics", NewOTLPHandler(noopBatcher(t), metricStore, nil, log))
+	mux.Handle("POST /v1/metrics", NewOTLPHandler(noopBatcher(t), metricStore, log))
 
 	req := &collectormetrics.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{{
@@ -375,8 +368,9 @@ func TestOTLPMetrics_HistogramUnsupportedWhenHistStoreNil(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Unsupported != 1 {
-		t.Fatalf("unsupported = %d, want 1; full=%+v", resp.Unsupported, resp)
+	if resp.Accepted != 1 || resp.Unsupported != 0 || resp.Rejected != 0 {
+		t.Fatalf("accepted/rejected/unsupported = %d/%d/%d, want 1/0/0",
+			resp.Accepted, resp.Rejected, resp.Unsupported)
 	}
 }
 
@@ -390,7 +384,7 @@ func TestOTLPMetrics_IgnoresLogSpanBreaker(t *testing.T) {
 	t.Cleanup(func() { _ = metricStore.Close() })
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/metrics", NewOTLPHandler(openLogSpanBreakerBatcher(t), metricStore, nil, log))
+	mux.Handle("POST /v1/metrics", NewOTLPHandler(openLogSpanBreakerBatcher(t), metricStore, log))
 
 	req := &collectormetrics.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{{

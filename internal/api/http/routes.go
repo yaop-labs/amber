@@ -9,7 +9,6 @@ import (
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
-	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 	"github.com/yaop-labs/amber/metricsengine"
@@ -20,15 +19,12 @@ type RoutesDeps struct {
 	Executor   *query.Executor
 	LogManager *storage.SegmentManager
 	LogSparse  *index.SparseIndex
-	// MetricStore is the embedded metricsengine store for scalar metrics
-	// (counters, gauges). nil disables the scalar path of /v1/metrics.
+	// MetricStore is the embedded metricsengine store for all metric shapes
+	// (counters, gauges, histograms). nil disables /v1/metrics ingest and the
+	// metric query endpoints.
 	MetricStore *metricsengine.Store
-	// HistogramStore is the embedded histogram store. nil makes the OTLP
-	// handler treat Histogram/ExponentialHistogram points as unsupported
-	// (same behavior as before this was wired).
-	HistogramStore *histogram.Store
-	IsReady        func() bool
-	Logger         *slog.Logger
+	IsReady     func() bool
+	Logger      *slog.Logger
 }
 
 type RoutesConfig struct {
@@ -63,15 +59,15 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/traces", auth(NewTracesHandler(deps.Executor, deps.Logger)))
 	mux.Handle("GET /api/v1/services", auth(NewServicesHandler(deps.Executor, deps.Logger)))
 
-	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.HistogramStore, deps.Logger)
+	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger)
 	mux.Handle("POST /v1/logs", authPost(otlpH))
 	mux.Handle("POST /v1/traces", authPost(otlpH))
 	mux.Handle("POST /v1/metrics", authPost(otlpH))
 
-	mux.Handle("GET /api/v1/metrics", auth(NewMetricsListHandler(deps.MetricStore, deps.HistogramStore, deps.Logger)))
+	mux.Handle("GET /api/v1/metrics", auth(NewMetricsListHandler(deps.MetricStore, deps.Logger)))
 	mux.Handle("GET /api/v1/metrics/rate", auth(NewMetricsQueryHandler(deps.MetricStore, deps.Logger)))
-	mux.Handle("GET /api/v1/metrics/stats", auth(NewMetricsStatsHandler(deps.MetricStore, deps.HistogramStore, deps.Logger)))
-	mux.Handle("GET /api/v1/metrics/quantile", auth(NewMetricsQuantileHandler(deps.HistogramStore, deps.Logger)))
+	mux.Handle("GET /api/v1/metrics/stats", auth(NewMetricsStatsHandler(deps.MetricStore, deps.Logger)))
+	mux.Handle("GET /api/v1/metrics/quantile", auth(NewMetricsQuantileHandler(deps.MetricStore, deps.Logger)))
 
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Batcher, deps.Logger)
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))

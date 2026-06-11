@@ -198,7 +198,7 @@ func TestMetricsList_IncludesHistograms(t *testing.T) {
 // TestMetricsList_StoreDisabledReturns503 mirrors the rate handler guard.
 func TestMetricsList_StoreDisabledReturns503(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("GET /api/v1/metrics", NewMetricsListHandler(nil, nil, nil))
+	mux.Handle("GET /api/v1/metrics", NewMetricsListHandler(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -267,13 +267,16 @@ func TestMetricsStats_EmptyStore(t *testing.T) {
 }
 
 // TestMetricsStats_HistogramSection verifies the nested histogram counters
-// reflect a histogram ingest end-to-end. Histogram blocks are written
-// synchronously per request (no head), so we expect Blocks=1, Series=1,
-// Bytes>0, and a populated time range immediately.
+// reflect a histogram ingest end-to-end. Histogram ticks buffer in the head
+// until a flush seals them into a hist block, so we flush before expecting
+// Blocks=1, Series=1, Bytes>0, and a populated time range.
 func TestMetricsStats_HistogramSection(t *testing.T) {
 	h := setupMetricsHarness(t)
 	seedExpHistogram(t, h, "rpc_latency_seconds", nil,
 		2, 0, []uint64{1, 1, 1, 1}, 1.0, 4)
+	if _, err := h.metricStore.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
 	req.Header.Set("Authorization", "Bearer secret")
@@ -296,7 +299,7 @@ func TestMetricsStats_HistogramSection(t *testing.T) {
 
 func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil, nil))
+	mux.Handle("GET /api/v1/metrics/stats", NewMetricsStatsHandler(nil, nil))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/metrics/stats", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -307,7 +310,7 @@ func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
 
 // seedExpHistogram POSTs an exponential-histogram OTLP request into the
 // harness. We go through the public ingest path on purpose: it forces the
-// same OTLP → ExpSeries → histogram.Store.WriteBlock flow that real clients
+// same OTLP → SketchSample → Store.AppendSketches flow that real clients
 // take, so the quantile test catches regressions in the whole chain instead
 // of just the store-level math.
 func seedExpHistogram(t *testing.T, h *metricsHarness, name string, attrs map[string]string, scale int32, positiveOffset int32, counts []uint64, sum float64, count uint64) {
