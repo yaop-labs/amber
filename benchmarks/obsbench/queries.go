@@ -99,7 +99,11 @@ func instance(scenario string, iter int, opts QueryRunOptions) QueryInstance {
 			qi.To = qi.From.Add(span / 4)
 		}
 	case ScenarioQ3FTS:
+		// Token+service: with bare tokens (4 distinct values) most
+		// iterations repeat within result-cache TTLs and the latency
+		// distribution measures the cache, not the query path.
 		qi.Token = q3Tokens[rng.IntN(len(q3Tokens))]
+		qi.Service = genServices[rng.IntN(len(genServices))]
 	case ScenarioQ4Rare:
 		qi.Token = RareToken(opts.DatasetSeed)
 	}
