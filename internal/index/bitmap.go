@@ -265,6 +265,46 @@ func (m *MultiFieldIndex) FilterWithSorted(conditions map[string]string) (*roari
 	return bm, bi.getSortedShared(value)
 }
 
+// FilterMulti intersects per-field conditions where each field matches any of
+// its values (OR within a field, AND across fields). A missing field or
+// all-missing values yield an empty result, mirroring Filter.
+func (m *MultiFieldIndex) FilterMulti(conditions map[string][]string) *roaring64.Bitmap {
+	var result *roaring64.Bitmap
+	first := true
+	for field, values := range conditions {
+		fieldBM := m.FilterAny(field, values)
+		if fieldBM.IsEmpty() {
+			return roaring64.New()
+		}
+		if first {
+			result = fieldBM
+			first = false
+		} else {
+			result = roaring64.And(result, fieldBM)
+			if result.IsEmpty() {
+				return result
+			}
+		}
+	}
+	if result == nil {
+		return roaring64.New()
+	}
+	return result
+}
+
+// FilterMultiWithSorted is FilterMulti plus the shared sorted-ID slice for
+// the single-field single-value fast path (nil otherwise).
+func (m *MultiFieldIndex) FilterMultiWithSorted(conditions map[string][]string) (*roaring64.Bitmap, []uint64) {
+	if len(conditions) == 1 {
+		for field, values := range conditions {
+			if len(values) == 1 {
+				return m.FilterWithSorted(map[string]string{field: values[0]})
+			}
+		}
+	}
+	return m.FilterMulti(conditions), nil
+}
+
 func (m *MultiFieldIndex) FilterAny(field string, values []string) *roaring64.Bitmap {
 	m.mu.RLock()
 	bi, ok := m.fields[field]

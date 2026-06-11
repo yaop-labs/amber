@@ -187,6 +187,56 @@ func TestMultiFieldIndex_FilterAny(t *testing.T) {
 	}
 }
 
+func TestMultiFieldIndex_FilterMulti_ORWithinFieldANDAcross(t *testing.T) {
+	m := NewMultiFieldIndex()
+	// entryID=1: level=ERROR, service=api
+	m.Add("level", "ERROR", 1)
+	m.Add("service", "api", 1)
+	// entryID=2: level=FATAL, service=worker
+	m.Add("level", "FATAL", 2)
+	m.Add("service", "worker", 2)
+	// entryID=3: level=INFO, service=api
+	m.Add("level", "INFO", 3)
+	m.Add("service", "api", 3)
+
+	result := m.FilterMulti(map[string][]string{
+		"level":   {"ERROR", "FATAL"},
+		"service": {"api", "worker"},
+	})
+	if result.GetCardinality() != 2 {
+		t.Fatalf("expected 2 (entries 1 and 2), got %d", result.GetCardinality())
+	}
+	if !result.Contains(1) || !result.Contains(2) {
+		t.Fatalf("expected entries 1 and 2, got %v", result.ToArray())
+	}
+
+	if r := m.FilterMulti(map[string][]string{"level": {"WARN"}}); r.GetCardinality() != 0 {
+		t.Fatalf("expected empty result for absent value, got %d", r.GetCardinality())
+	}
+}
+
+func TestMultiFieldIndex_FilterMultiWithSorted_SingleValueFastPath(t *testing.T) {
+	m := NewMultiFieldIndex()
+	m.Add("level", "ERROR", 2)
+	m.Add("level", "ERROR", 1)
+
+	bm, sorted := m.FilterMultiWithSorted(map[string][]string{"level": {"ERROR"}})
+	if bm.GetCardinality() != 2 {
+		t.Fatalf("expected 2, got %d", bm.GetCardinality())
+	}
+	if sorted == nil {
+		t.Fatal("single field+value must take the sorted fast path")
+	}
+
+	bm, sorted = m.FilterMultiWithSorted(map[string][]string{"level": {"ERROR", "INFO"}})
+	if bm.GetCardinality() != 2 {
+		t.Fatalf("expected 2, got %d", bm.GetCardinality())
+	}
+	if sorted != nil {
+		t.Fatal("multi-value path must not claim a shared sorted slice")
+	}
+}
+
 func TestMultiFieldIndex_SaveAndLoad(t *testing.T) {
 	m := NewMultiFieldIndex()
 	m.Add("level", "ERROR", 1)

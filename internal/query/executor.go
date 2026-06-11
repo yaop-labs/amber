@@ -855,7 +855,7 @@ func (e *Executor) execLogSegment(
 		if bm, ok := e.logBitmap(seg.FileName); ok {
 			conditions := buildBitmapConditions(q)
 			if len(conditions) > 0 {
-				allowedIDs, allowedSlice = bm.FilterWithSorted(conditions)
+				allowedIDs, allowedSlice = bm.FilterMultiWithSorted(conditions)
 				if allowedIDs.IsEmpty() {
 					return 0, nil
 				}
@@ -1303,16 +1303,16 @@ func (e *Executor) execSpanSegment(
 	return matched, nil
 }
 
-func buildBitmapConditions(q *LogQuery) map[string]string {
-	conditions := make(map[string]string)
-	if len(q.Services) == 1 {
-		conditions["service"] = q.Services[0]
+func buildBitmapConditions(q *LogQuery) map[string][]string {
+	conditions := make(map[string][]string)
+	if len(q.Services) > 0 {
+		conditions["service"] = q.Services
 	}
-	if len(q.Hosts) == 1 {
-		conditions["host"] = q.Hosts[0]
+	if len(q.Hosts) > 0 {
+		conditions["host"] = q.Hosts
 	}
-	if len(q.Levels) == 1 {
-		conditions["level"] = q.Levels[0]
+	if len(q.Levels) > 0 {
+		conditions["level"] = q.Levels
 	}
 	return conditions
 }
