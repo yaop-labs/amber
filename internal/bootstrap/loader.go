@@ -201,6 +201,10 @@ func SetupSealCallbacks(
 			log.Error("seal: build log indexes gave up", "segment", meta.FileName, "err", err)
 			return
 		}
+		// Register the in-memory indexes so the first query against the
+		// fresh segment doesn't re-parse them from disk.
+		exec.RegisterBitmapIndex(meta.FileName, built.Bitmap)
+		exec.RegisterFTSIndex(meta.FileName, built.FTS)
 		if built.Ribbon != nil {
 			exec.RegisterLogRibbon(meta.FileName, built.Ribbon)
 		}

@@ -9,9 +9,14 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-// LogSealIndexes is the output of the one-pass seal build: the ribbons are
-// returned for executor registration; bitmap/FTS/posting land on disk only.
+// LogSealIndexes is the output of the one-pass seal build. Everything except
+// the posting list is returned for executor cache registration: the indexes
+// already exist in memory here, and discarding them forces the first query
+// against the fresh segment to re-parse the snapshot from disk (~450 ms per
+// .fidx first touch).
 type LogSealIndexes struct {
+	Bitmap    *MultiFieldIndex
+	FTS       *FTSIndex
 	Ribbon    *RibbonFilter
 	FTSRibbon *RibbonFilter
 }
@@ -91,7 +96,7 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	// high-cardinality token sets — pre-existing, see BuildRibbonFilter)
 	// degrades queries to scans for this segment but must not discard the
 	// core indexes built above or trigger a full re-scan retry.
-	out := &LogSealIndexes{}
+	out := &LogSealIndexes{Bitmap: bitmap, FTS: fts}
 	if ribbon, err := BuildRibbonFilter(traceKeys, 8); err != nil {
 		if log != nil {
 			log.Warn("seal_builder: trace ribbon failed, queries fall back to scan", "path", segmentPath, "err", err)
