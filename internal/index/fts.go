@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"slices"
 	"sort"
 
 	"github.com/dariasmyr/fts-engine/pkg/textproc"
@@ -32,10 +33,33 @@ type FTSIndex struct {
 	// build-mode state: token -> sorted entry IDs. Nil after load.
 	building map[string]*postingBuilder
 
-	// sealed state: parsed flat form. Nil until Save or load.
+	// sealed dictionary: tokens with df >= 2 (template words; tens of
+	// thousands per segment).
 	tokens   []string // sorted; slices into buf
 	postings [][]byte // delta-varint blobs, parallel to tokens
 	counts   []int
+
+	// sealed unique-token section. UUID-bearing bodies make ~80% of a
+	// segment's tokens df==1; keeping them in the string dictionary cost
+	// ~40 bytes of string/slice headers per token (~50 MB of headers per
+	// 100k-record segment in the LRU). Here they are two flat byte arrays
+	// searched in place: fnv64a(token) sorted ascending and the parallel
+	// full entry ID, 8 bytes each. Colliding hashes stay adjacent and
+	// lookup returns all of them, so a 64-bit collision within a segment
+	// (~1M tokens → P ≈ 3e-8) can only surface one foreign record in a
+	// result, never lose one; accepted deliberately — the result-count
+	// equality gate in benchmarks would flag it.
+	uniqHashes []byte // 8-byte big-endian hashes, sorted
+	uniqIDs    []byte // 8-byte big-endian entry IDs, parallel
+}
+
+func tokenHash(tok string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(tok); i++ {
+		h ^= uint64(tok[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 type postingBuilder struct {
@@ -82,13 +106,25 @@ func (f *FTSIndex) Index(_ context.Context, entryID uint64, body string) error {
 	return nil
 }
 
-// seal converts build-mode maps into the flat sorted form.
+// seal converts build-mode maps into the flat sorted form: df>=2 tokens go
+// to the dictionary, df==1 tokens to the unique hash section.
 func (f *FTSIndex) seal() {
 	if f.building == nil {
 		return
 	}
+
+	type uniqPair struct{ hash, id uint64 }
+	var uniqs []uniqPair
 	tokens := make([]string, 0, len(f.building))
-	for tok := range f.building {
+	for tok, pb := range f.building {
+		if pb.unsorted {
+			sort.Slice(pb.ids, func(a, b int) bool { return pb.ids[a] < pb.ids[b] })
+			pb.ids = dedupSorted(pb.ids)
+		}
+		if len(pb.ids) == 1 {
+			uniqs = append(uniqs, uniqPair{tokenHash(tok), pb.ids[0]})
+			continue
+		}
 		tokens = append(tokens, tok)
 	}
 	sort.Strings(tokens)
@@ -98,10 +134,6 @@ func (f *FTSIndex) seal() {
 	f.counts = make([]int, len(tokens))
 	for i, tok := range tokens {
 		pb := f.building[tok]
-		if pb.unsorted {
-			sort.Slice(pb.ids, func(a, b int) bool { return pb.ids[a] < pb.ids[b] })
-			pb.ids = dedupSorted(pb.ids)
-		}
 		blob := make([]byte, 0, len(pb.ids)*2)
 		var prev uint64
 		for _, id := range pb.ids {
@@ -111,7 +143,36 @@ func (f *FTSIndex) seal() {
 		f.postings[i] = blob
 		f.counts[i] = len(pb.ids)
 	}
+
+	sort.Slice(uniqs, func(a, b int) bool { return uniqs[a].hash < uniqs[b].hash })
+	f.uniqHashes = make([]byte, len(uniqs)*8)
+	f.uniqIDs = make([]byte, len(uniqs)*8)
+	for i, u := range uniqs {
+		binary.BigEndian.PutUint64(f.uniqHashes[i*8:], u.hash)
+		binary.BigEndian.PutUint64(f.uniqIDs[i*8:], u.id)
+	}
 	f.building = nil
+}
+
+// lookupUnique returns the entry IDs of df==1 tokens matching the hash
+// (adjacent duplicates included, so collisions can't drop records).
+func (f *FTSIndex) lookupUnique(token string) []uint64 {
+	n := len(f.uniqHashes) / 8
+	if n == 0 {
+		return nil
+	}
+	h := tokenHash(token)
+	i := sort.Search(n, func(i int) bool {
+		return binary.BigEndian.Uint64(f.uniqHashes[i*8:]) >= h
+	})
+	var ids []uint64
+	for ; i < n && binary.BigEndian.Uint64(f.uniqHashes[i*8:]) == h; i++ {
+		ids = append(ids, binary.BigEndian.Uint64(f.uniqIDs[i*8:]))
+	}
+	if len(ids) > 1 {
+		slices.Sort(ids)
+	}
+	return ids
 }
 
 func dedupSorted(ids []uint64) []uint64 {
@@ -136,6 +197,9 @@ func (f *FTSIndex) Search(_ context.Context, query string, limit int) ([]uint64,
 	var acc []uint64
 	for i, tok := range tokens {
 		ids := f.lookup(tok)
+		if len(ids) == 0 {
+			ids = f.lookupUnique(tok)
+		}
 		if len(ids) == 0 {
 			return nil, nil
 		}
@@ -192,13 +256,14 @@ func intersectSorted(a, b []uint64) []uint64 {
 	return out
 }
 
-// On-disk format ("AFT1"):
+// On-disk format ("AFT2"):
 //
-//	magic [4] | uvarint tokenCount
-//	per token, sorted: uvarint len | bytes | uvarint postingCount |
-//	                   uvarint blobLen | delta-varint postings
+//	magic [4] | uvarint dictTokenCount
+//	per dict token, sorted: uvarint len | bytes | uvarint postingCount |
+//	                        uvarint blobLen | delta-varint postings
+//	uvarint uniqCount | uniqCount×8B BE sorted hashes | uniqCount×8B BE IDs
 //	crc32 IEEE over everything above [4, little-endian]
-var ftsMagic = [4]byte{'A', 'F', 'T', '1'}
+var ftsMagic = [4]byte{'A', 'F', 'T', '2'}
 
 func (f *FTSIndex) Save(path string) error {
 	f.seal()
@@ -238,6 +303,15 @@ func (f *FTSIndex) Save(path string) error {
 			if err := mw(f.postings[i]); err != nil {
 				return err
 			}
+		}
+		if err := uv(uint64(len(f.uniqHashes) / 8)); err != nil {
+			return err
+		}
+		if err := mw(f.uniqHashes); err != nil {
+			return err
+		}
+		if err := mw(f.uniqIDs); err != nil {
+			return err
 		}
 		var sum [4]byte
 		binary.LittleEndian.PutUint32(sum[:], crc.Sum32())
@@ -311,5 +385,15 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 		f.counts = append(f.counts, int(cnt))
 		r = r[bl:]
 	}
+
+	uniqCount, err := take()
+	if err != nil {
+		return nil, err
+	}
+	if uniqCount*16 > uint64(len(r)) {
+		return nil, errors.New("fts: load index: unique section out of range")
+	}
+	f.uniqHashes = r[:uniqCount*8]
+	f.uniqIDs = r[uniqCount*8 : uniqCount*16]
 	return f, nil
 }
