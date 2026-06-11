@@ -31,10 +31,16 @@ type readerCache struct {
 	flight singleflight.Group
 }
 
+// cachedReader tracks one shared SegmentReader. SegmentReader scans are
+// position-stateless (pread), so concurrent queries share one reader without
+// serializing; refs/evicted (guarded by readerCache.mu) only defer Close
+// until the last in-flight scan releases.
 type cachedReader struct {
-	mu     sync.Mutex
 	path   string
 	reader *storage.SegmentReader
+
+	refs    int
+	evicted bool
 }
 
 type readerCacheEntry struct {
@@ -109,8 +115,8 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 	if el, ok := c.items[path]; ok {
 		c.order.MoveToFront(el)
 		cr := el.Value.(*readerCacheEntry).cached
+		cr.refs++
 		c.mu.Unlock()
-		cr.mu.Lock()
 		return cr, nil
 	}
 	c.mu.Unlock()
@@ -135,50 +141,61 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 
 	c.mu.Lock()
 	if el, ok := c.items[path]; ok {
-
 		cr := el.Value.(*readerCacheEntry).cached
 		c.order.MoveToFront(el)
+		cr.refs++
 		c.mu.Unlock()
 		_ = sr.Close()
-		cr.mu.Lock()
 		return cr, nil
 	}
 
-	cr := &cachedReader{path: path, reader: sr}
+	cr := &cachedReader{path: path, reader: sr, refs: 1}
 	ent := &readerCacheEntry{path: path, cached: cr}
 	el := c.order.PushFront(ent)
 	c.items[path] = el
 
-	var evicted *cachedReader
+	var closeReader *storage.SegmentReader
 	if c.order.Len() > c.capacity {
 		oldest := c.order.Back()
 		if oldest != nil {
 			oldEnt := oldest.Value.(*readerCacheEntry)
 			c.order.Remove(oldest)
 			delete(c.items, oldEnt.path)
-			evicted = oldEnt.cached
+			closeReader = evictLocked(oldEnt.cached)
 		}
 	}
 	c.mu.Unlock()
 
-	if evicted != nil {
-
-		go func(e *cachedReader) {
-			e.mu.Lock()
-			if e.reader != nil {
-				_ = e.reader.Close()
-				e.reader = nil
-			}
-			e.mu.Unlock()
-		}(evicted)
+	if closeReader != nil {
+		_ = closeReader.Close()
 	}
-
-	cr.mu.Lock()
 	return cr, nil
 }
 
+// evictLocked marks the entry evicted and, when no scan holds it, detaches
+// the reader for the caller to close. Caller holds c.mu.
+func evictLocked(cr *cachedReader) *storage.SegmentReader {
+	cr.evicted = true
+	if cr.refs > 0 || cr.reader == nil {
+		return nil
+	}
+	r := cr.reader
+	cr.reader = nil
+	return r
+}
+
 func (c *readerCache) release(cr *cachedReader) {
-	cr.mu.Unlock()
+	c.mu.Lock()
+	cr.refs--
+	var closeReader *storage.SegmentReader
+	if cr.evicted && cr.refs == 0 && cr.reader != nil {
+		closeReader = cr.reader
+		cr.reader = nil
+	}
+	c.mu.Unlock()
+	if closeReader != nil {
+		_ = closeReader.Close()
+	}
 }
 
 func (c *readerCache) invalidate(path string) {
@@ -191,30 +208,27 @@ func (c *readerCache) invalidate(path string) {
 	ent := el.Value.(*readerCacheEntry)
 	c.order.Remove(el)
 	delete(c.items, path)
+	closeReader := evictLocked(ent.cached)
 	c.mu.Unlock()
 
-	go func(e *cachedReader) {
-		e.mu.Lock()
-		if e.reader != nil {
-			_ = e.reader.Close()
-			e.reader = nil
-		}
-		e.mu.Unlock()
-	}(ent.cached)
+	if closeReader != nil {
+		_ = closeReader.Close()
+	}
 }
 
 func (c *readerCache) close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	var closeReaders []*storage.SegmentReader
 	for _, el := range c.items {
 		ent := el.Value.(*readerCacheEntry)
-		ent.cached.mu.Lock()
-		if ent.cached.reader != nil {
-			_ = ent.cached.reader.Close()
-			ent.cached.reader = nil
+		if r := evictLocked(ent.cached); r != nil {
+			closeReaders = append(closeReaders, r)
 		}
-		ent.cached.mu.Unlock()
 	}
 	c.items = make(map[string]*list.Element)
 	c.order.Init()
+	c.mu.Unlock()
+	for _, r := range closeReaders {
+		_ = r.Close()
+	}
 }

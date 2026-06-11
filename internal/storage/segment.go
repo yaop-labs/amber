@@ -353,23 +353,14 @@ func (sw *SegmentWriter) SnapshotBlockIndex() (*BlockIndexHint, bool) {
 	return hint, true
 }
 
+// SegmentReader is safe for concurrent scans once OpenSegmentReader returns:
+// block reads go through ReadAt (no shared file position) and zstd DecodeAll
+// is concurrency-safe. Only Close mutates state.
 type SegmentReader struct {
 	file    *os.File
 	decoder *zstd.Decoder
 	footer  SegmentFooter
 	version uint16
-}
-
-func (sr *SegmentReader) ensureDecoder() error {
-	if sr.decoder != nil {
-		return nil
-	}
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		return fmt.Errorf("segment: create zstd decoder: %w", err)
-	}
-	sr.decoder = dec
-	return nil
 }
 
 func OpenSegmentReader(path string, hint *BlockIndexHint) (*SegmentReader, error) {
@@ -378,12 +369,23 @@ func OpenSegmentReader(path string, hint *BlockIndexHint) (*SegmentReader, error
 		return nil, fmt.Errorf("segment: open %s: %w", path, err)
 	}
 
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("segment: create zstd decoder: %w", err)
+	}
+
 	sr := &SegmentReader{
-		file: f,
+		file:    f,
+		decoder: dec,
+	}
+	closeAll := func() {
+		dec.Close()
+		_ = f.Close()
 	}
 
 	if err := sr.readHeader(); err != nil {
-		_ = f.Close()
+		closeAll()
 		return nil, err
 	}
 
@@ -401,12 +403,12 @@ func OpenSegmentReader(path string, hint *BlockIndexHint) (*SegmentReader, error
 
 	if err := sr.readFooter(); err != nil {
 		if err != ErrNoFooter {
-			_ = f.Close()
+			closeAll()
 			return nil, err
 		}
 
 		if err2 := sr.scanBlockOffsets(); err2 != nil {
-			_ = f.Close()
+			closeAll()
 			return nil, err2
 		}
 	}
@@ -415,9 +417,6 @@ func OpenSegmentReader(path string, hint *BlockIndexHint) (*SegmentReader, error
 }
 
 func (sr *SegmentReader) scanBlockOffsets() error {
-	if err := sr.ensureDecoder(); err != nil {
-		return err
-	}
 	if _, err := sr.file.Seek(int64(segHeaderSize), io.SeekStart); err != nil {
 		return fmt.Errorf("segment: seek to blocks: %w", err)
 	}
@@ -678,15 +677,10 @@ func (sr *SegmentReader) scanBlocks(offsets []int64, fn func(data []byte) error)
 }
 
 func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) error {
-	if err := sr.ensureDecoder(); err != nil {
-		return err
-	}
-	if _, err := sr.file.Seek(offset, io.SeekStart); err != nil {
-		return fmt.Errorf("segment: seek to block %d: %w", offset, err)
-	}
-
+	// pread (ReadAt) keeps the reader free of shared file-position state, so
+	// concurrent scans of one segment don't serialize on a mutex.
 	var blockHeader [blockHeaderSize]byte
-	if _, err := io.ReadFull(sr.file, blockHeader[:]); err != nil {
+	if _, err := sr.file.ReadAt(blockHeader[:], offset); err != nil {
 		return fmt.Errorf("segment: read block header at %d: %w", offset, err)
 	}
 
@@ -713,7 +707,7 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 		}
 	}()
 
-	if _, err := io.ReadFull(sr.file, compressed); err != nil {
+	if _, err := sr.file.ReadAt(compressed, offset+blockHeaderSize); err != nil {
 		return fmt.Errorf("segment: read block data at %d: %w", offset, err)
 	}
 

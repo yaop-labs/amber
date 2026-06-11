@@ -258,4 +258,75 @@ func TestReaderCache_PropagatesStoreErrorOnMissingRemote(t *testing.T) {
 	}
 }
 
+// TestReaderCache_ConcurrentScansShareReader verifies the post-pread
+// contract: many goroutines scan one cached segment reader simultaneously
+// (no per-scan serialization) and every scan sees the full record set.
+func TestReaderCache_ConcurrentScansShareReader(t *testing.T) {
+	srcDir, fileName := produceSealedSegment(t)
+	path := filepath.Join(srcDir, fileName)
+	cache := newReaderCache(2)
+	defer cache.close()
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	start := make(chan struct{})
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			cr, err := cache.acquire(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer cache.release(cr)
+			records := 0
+			if err := cr.reader.Scan(func([]byte) error { records++; return nil }); err != nil {
+				errs <- err
+				return
+			}
+			if records != 1 {
+				errs <- os.ErrInvalid
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent scan: %v", err)
+	}
+}
+
+// TestReaderCache_EvictionWaitsForActiveScans pins capacity to 1 so a second
+// acquire evicts the first entry while it is still held: the held reader must
+// stay usable until release, and release must close it.
+func TestReaderCache_EvictionWaitsForActiveScans(t *testing.T) {
+	srcA, fileA := produceSealedSegment(t)
+	srcB, fileB := produceSealedSegment(t)
+	cache := newReaderCache(1)
+	defer cache.close()
+
+	crA, err := cache.acquire(filepath.Join(srcA, fileA))
+	if err != nil {
+		t.Fatalf("acquire A: %v", err)
+	}
+	crB, err := cache.acquire(filepath.Join(srcB, fileB))
+	if err != nil {
+		t.Fatalf("acquire B: %v", err)
+	}
+
+	// A is evicted but held: its reader must still scan.
+	if err := crA.reader.Scan(func([]byte) error { return nil }); err != nil {
+		t.Fatalf("scan evicted-but-held reader: %v", err)
+	}
+	cache.release(crA)
+	if crA.reader != nil {
+		t.Fatal("evicted reader not closed on release")
+	}
+	cache.release(crB)
+}
+
 var _ storage.SegmentStore = (*queryMemStore)(nil)
