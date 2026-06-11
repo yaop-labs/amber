@@ -106,6 +106,20 @@ type SpanQuery struct {
 	Cursor string
 }
 
+func (q *SpanQuery) FromUnixNano() int64 {
+	if q.From.IsZero() {
+		return 0
+	}
+	return q.From.UnixNano()
+}
+
+func (q *SpanQuery) ToUnixNano() int64 {
+	if q.To.IsZero() {
+		return int64(^uint64(0) >> 1)
+	}
+	return q.To.UnixNano()
+}
+
 func (q *SpanQuery) Validate() error {
 	if q.Limit < 0 {
 		return fmt.Errorf("query: span limit cannot be negative")

@@ -434,8 +434,9 @@ func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*mode
 	if b.indexer != nil && len(logEntries) > 0 && b.segmentStillActive(b.logManager, targetMeta, hasTarget) {
 		b.indexer.IndexLogEntries(logEntries)
 	}
-	if b.cacheInvalidator != nil {
-		b.cacheInvalidator.ClearResultCache()
+	if b.cacheInvalidator != nil && len(logItems) > 0 {
+		from, to := batchTimeRange(logItems)
+		b.cacheInvalidator.InvalidateResultRange(from, to)
 	}
 	b.resetLogFailures()
 	return false
@@ -462,11 +463,26 @@ func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*m
 	if b.indexer != nil && len(spanEntries) > 0 && b.segmentStillActive(b.spanManager, targetMeta, hasTarget) {
 		b.indexer.IndexSpanEntries(spanEntries)
 	}
-	if b.cacheInvalidator != nil {
-		b.cacheInvalidator.ClearResultCache()
+	if b.cacheInvalidator != nil && len(spanItems) > 0 {
+		from, to := batchTimeRange(spanItems)
+		b.cacheInvalidator.InvalidateResultRange(from, to)
 	}
 	b.resetSpanFailures()
 	return false
+}
+
+// batchTimeRange returns the min/max event timestamps of a written batch.
+func batchTimeRange(items []storage.BatchItem) (int64, int64) {
+	from, to := items[0].TS, items[0].TS
+	for _, item := range items[1:] {
+		if item.TS < from {
+			from = item.TS
+		}
+		if item.TS > to {
+			to = item.TS
+		}
+	}
+	return from, to
 }
 
 func (b *Batcher) recordLogFailure() {

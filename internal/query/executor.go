@@ -3,7 +3,6 @@
 package query
 
 import (
-	"slices"
 	"bytes"
 	"container/heap"
 	"context"
@@ -12,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -124,6 +124,12 @@ type queryCacheEntry struct {
 	logs    *LogResult
 	spans   *SpanResult
 	expires int64
+	// from/to is the query's time window (unixnano), used to invalidate only
+	// entries an ingest batch can affect. Records carry event time, so a
+	// batch may land anywhere — overlap with the batch's [min,max] timestamp
+	// range is the correctness condition, not "touches the active segment".
+	from int64
+	to   int64
 }
 
 type queryCache struct {
@@ -197,7 +203,7 @@ func (c *queryCache) getSpan(key [32]byte) (*SpanResult, bool) {
 	return e.spans, true
 }
 
-func (c *queryCache) putLog(key [32]byte, r *LogResult) {
+func (c *queryCache) putLog(key [32]byte, r *LogResult, from, to int64) {
 	if c == nil || r == nil {
 		return
 	}
@@ -212,11 +218,13 @@ func (c *queryCache) putLog(key [32]byte, r *LogResult) {
 	c.entries[key] = queryCacheEntry{
 		logs:    r,
 		expires: time.Now().Add(c.ttl).UnixNano(),
+		from:    from,
+		to:      to,
 	}
 	c.mu.Unlock()
 }
 
-func (c *queryCache) putSpan(key [32]byte, r *SpanResult) {
+func (c *queryCache) putSpan(key [32]byte, r *SpanResult, from, to int64) {
 	if c == nil || r == nil {
 		return
 	}
@@ -230,6 +238,23 @@ func (c *queryCache) putSpan(key [32]byte, r *SpanResult) {
 	c.entries[key] = queryCacheEntry{
 		spans:   r,
 		expires: time.Now().Add(c.ttl).UnixNano(),
+		from:    from,
+		to:      to,
+	}
+	c.mu.Unlock()
+}
+
+// invalidateRange drops cached results whose query window overlaps
+// [from, to] (unixnano).
+func (c *queryCache) invalidateRange(from, to int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if e.from <= to && e.to >= from {
+			delete(c.entries, k)
+		}
 	}
 	c.mu.Unlock()
 }
@@ -423,6 +448,13 @@ func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 // ClearResultCache drops cached query results.
 func (e *Executor) ClearResultCache() {
 	e.resultCache.clear()
+}
+
+// InvalidateResultRange drops cached results whose query window overlaps the
+// given event-time range (unixnano). Ingest calls this per batch so steady
+// writes stop wiping results for historical windows.
+func (e *Executor) InvalidateResultRange(from, to int64) {
+	e.resultCache.invalidateRange(from, to)
 }
 
 func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
@@ -800,7 +832,7 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 		SegTotal:   len(segs),
 		SegScanned: scanned,
 	}
-	e.resultCache.putLog(cacheKey, result)
+	e.resultCache.putLog(cacheKey, result, q.FromUnixNano(), q.ToUnixNano())
 	return result, nil
 }
 
@@ -1120,7 +1152,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 		Truncated:  truncated,
 		NextCursor: nextCursor,
 	}
-	e.resultCache.putSpan(cacheKey, result)
+	e.resultCache.putSpan(cacheKey, result, q.FromUnixNano(), q.ToUnixNano())
 	return result, nil
 }
 

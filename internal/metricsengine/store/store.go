@@ -27,17 +27,17 @@ var ErrLabelLimitExceeded = errors.New("store: label limit exceeded")
 var ErrActiveSeriesLimitExceeded = errors.New("store: active series limit exceeded")
 
 type Store struct {
-	dir               string
-	engine            *engine.Engine
-	opts              Options
-	clock             func() time.Time
-	mu                sync.RWMutex
-	manifest          Manifest
-	catalog           Catalog
+	dir      string
+	engine   *engine.Engine
+	opts     Options
+	clock    func() time.Time
+	mu       sync.RWMutex
+	manifest Manifest
+	catalog  Catalog
 	// catalogKeys indexes catalog entries by canonical label key. Kept in
 	// step with catalog.Series (register + evict) so ensureCatalog stays
 	// O(batch) instead of rebuilding an O(active series) map per append.
-	catalogKeys map[string]uint64
+	catalogKeys       map[string]uint64
 	directoryCache    map[string]block.Directory
 	allowGlobFallback bool
 	stopBackground    chan struct{}

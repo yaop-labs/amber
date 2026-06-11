@@ -19,7 +19,10 @@ type ActiveIndexer interface {
 }
 
 type CacheInvalidator interface {
-	ClearResultCache()
+	// InvalidateResultRange drops cached query results whose window overlaps
+	// the written batch's event-time range (unixnano), so steady ingest only
+	// evicts results the new records can actually change.
+	InvalidateResultRange(from, to int64)
 }
 
 type Handler struct {
