@@ -463,6 +463,25 @@ func (r *Registry) Match(selector Selector) ([]SeriesID, error) {
 	return out, nil
 }
 
+// MatchLabels reports whether a label set satisfies every matcher in the
+// selector. Absent labels satisfy only negative matchers, mirroring the
+// query-layer entry matching.
+func MatchLabels(labels model.LabelSet, selector Selector) bool {
+	for _, m := range selector.Matchers {
+		got, ok := labels.Get(m.Name)
+		if !ok {
+			if m.Op == MatchNotEqual || m.Op == MatchNotRegexp {
+				continue
+			}
+			return false
+		}
+		if !m.Matches(got) {
+			return false
+		}
+	}
+	return true
+}
+
 func (m Matcher) Matches(value string) bool {
 	switch m.Op {
 	case MatchEqual:

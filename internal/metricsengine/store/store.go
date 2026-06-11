@@ -274,6 +274,14 @@ func catalogKeyMap(c Catalog) map[string]uint64 {
 	return keys
 }
 
+// headSnapshot copies only the head series matching the selector, so a
+// selective query doesn't pay for copying the whole buffered head.
+func (s *Store) headSnapshot(selector index.Selector) []block.Series {
+	return s.engine.SnapshotMatching(func(labels model.LabelSet) bool {
+		return index.MatchLabels(labels, selector)
+	})
+}
+
 func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 	if len(labelSets) == 0 {
 		return nil
@@ -838,7 +846,7 @@ func (s *Store) Select(selector index.Selector, opts query.Options) ([]block.Dec
 		}
 		out = append(out, series...)
 	}
-	headSeries, err := query.SelectSeries(s.engine.Snapshot(), selector, opts)
+	headSeries, err := query.SelectSeries(s.headSnapshot(selector), selector, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -884,7 +892,7 @@ func (s *Store) Explain(plan query.Plan) (query.ExecutionPlan, error) {
 		stats.BucketSamples += bucketSamples
 		stats.PartialBucketSeries += partialBucketSeries
 	}
-	headSeries, headSamples, err := query.SeriesStats(s.engine.Snapshot(), selector, opts)
+	headSeries, headSamples, err := query.SeriesStats(s.headSnapshot(selector), selector, opts)
 	if err != nil {
 		return query.ExecutionPlan{}, err
 	}
@@ -1009,7 +1017,7 @@ func (s *Store) AggregateByLabel(selector index.Selector, opts query.Options, la
 		}
 		mergeAggregates(out, partial)
 	}
-	headSeries, err := query.SelectSeries(s.engine.Snapshot(), selector, opts)
+	headSeries, err := query.SelectSeries(s.headSnapshot(selector), selector, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,7 +1065,7 @@ func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label s
 		return nil, err
 	}
 	if len(paths) == 0 {
-		return query.RateByLabelInSeries(s.engine.Snapshot(), selector, opts, label)
+		return query.RateByLabelInSeries(s.headSnapshot(selector), selector, opts, label)
 	}
 	if len(paths) == 1 && s.engine.BufferedSeries() == 0 {
 		dir, err := s.readDirectory(paths[0])
@@ -1083,7 +1091,7 @@ func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label s
 			addRateSummary(seriesRates, summary, summary.Labels)
 		}
 	}
-	head := s.engine.Snapshot()
+	head := s.headSnapshot(selector)
 	headSummaries, err := query.RateSummariesInSeries(head, selector, opts)
 	if err != nil {
 		return nil, err
@@ -1187,7 +1195,7 @@ func (s *Store) IncreaseByLabel(selector index.Selector, opts query.Options, lab
 		return nil, err
 	}
 	if len(paths) == 0 {
-		return query.IncreaseByLabelInSeries(s.engine.Snapshot(), selector, opts, label)
+		return query.IncreaseByLabelInSeries(s.headSnapshot(selector), selector, opts, label)
 	}
 	if len(paths) == 1 && s.engine.BufferedSeries() == 0 {
 		dir, err := s.readDirectory(paths[0])
@@ -1213,7 +1221,7 @@ func (s *Store) IncreaseByLabel(selector index.Selector, opts query.Options, lab
 			addRateSummary(seriesRates, summary, summary.Labels)
 		}
 	}
-	headSummaries, err := query.RateSummariesInSeries(s.engine.Snapshot(), selector, opts)
+	headSummaries, err := query.RateSummariesInSeries(s.headSnapshot(selector), selector, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1629,7 +1637,7 @@ func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, 
 		targets = append(targets, blockScanTarget{path: path, dir: dir})
 		mapHint += len(dir.Series)
 	}
-	head := s.engine.Snapshot()
+	head := s.headSnapshot(selector)
 	mapHint += len(head)
 	capacityHints := make(map[uint64]int, mapHint)
 	for _, target := range targets {
@@ -1846,7 +1854,7 @@ func (s *Store) collectRangeStepSummaries(paths []string, selector index.Selecto
 			return nil, err
 		}
 	}
-	if err := query.ScanSeries(s.engine.Snapshot(), selector, opts, func(series block.DecodedSeries) error {
+	if err := query.ScanSeries(s.headSnapshot(selector), selector, opts, func(series block.DecodedSeries) error {
 		return addRangeStepSummaries(grouped, series, steps, window, opts)
 	}); err != nil {
 		return nil, err

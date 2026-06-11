@@ -20,6 +20,9 @@ type bufferedSeries struct {
 	labels     model.LabelSet
 	timestamps []int64
 	values     []int64
+	// dirty marks out-of-order appends; snapshots sort lazily so in-order
+	// series (the common case) pay a plain copy instead of a sort per query.
+	dirty bool
 }
 
 func New(registry *index.Registry) *Head {
@@ -46,14 +49,26 @@ func (h *Head) AppendWithID(id index.SeriesID, labels model.LabelSet, typ model.
 		buf = &bufferedSeries{typ: typ, labels: labels.Canonical()}
 		h.series[id] = buf
 	}
+	if n := len(buf.timestamps); n > 0 && timestamp < buf.timestamps[n-1] {
+		buf.dirty = true
+	}
 	buf.timestamps = append(buf.timestamps, timestamp)
 	buf.values = append(buf.values, value)
 	return id
 }
 
 func (h *Head) Snapshot() []block.Series {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	return h.SnapshotMatching(nil)
+}
+
+// SnapshotMatching copies only the series whose labels satisfy match
+// (nil = all). Series stay sorted in place after the first dirty snapshot, so
+// the per-query cost for a series is two slice copies, and zero when the
+// selector rejects it.
+func (h *Head) SnapshotMatching(match func(model.LabelSet) bool) []block.Series {
+	// Write lock: lazy sorting rewrites series buffers in place.
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	ids := make([]int, 0, len(h.series))
 	for id := range h.series {
@@ -65,13 +80,19 @@ func (h *Head) Snapshot() []block.Series {
 	for _, rawID := range ids {
 		id := index.SeriesID(rawID)
 		buf := h.series[id]
-		timestamps, values := sortedSamples(buf.timestamps, buf.values)
+		if match != nil && !match(buf.labels) {
+			continue
+		}
+		if buf.dirty {
+			buf.timestamps, buf.values = sortedSamples(buf.timestamps, buf.values)
+			buf.dirty = false
+		}
 		out = append(out, block.Series{
 			ID:         uint64(id),
 			Type:       buf.typ,
 			Labels:     append(model.LabelSet(nil), buf.labels...),
-			Timestamps: timestamps,
-			Values:     values,
+			Timestamps: append([]int64(nil), buf.timestamps...),
+			Values:     append([]int64(nil), buf.values...),
 		})
 	}
 	return out

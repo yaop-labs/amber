@@ -323,6 +323,14 @@ func (e *Engine) Snapshot() []block.Series {
 	return e.head.Snapshot()
 }
 
+// SnapshotMatching copies only head series whose labels satisfy match
+// (nil = all), so selective queries skip copying the rest of the head.
+func (e *Engine) SnapshotMatching(match func(model.LabelSet) bool) []block.Series {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.head.SnapshotMatching(match)
+}
+
 func (e *Engine) Registry() *index.Registry {
 	return e.registry
 }
