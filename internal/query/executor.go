@@ -118,6 +118,20 @@ type Executor struct {
 	spanReaders *readerCache
 
 	resultCache *queryCache
+
+	// logActiveServices/spanActiveServices memoize the one-time service scan
+	// of the current active segment (records that predate this process and so
+	// are absent from ActiveIndex). Entries written while the process runs
+	// reach ActiveIndex, and rotation changes the file name, so a cached set
+	// stays valid for the lifetime of its segment.
+	logActiveServices  activeServicesCache
+	spanActiveServices activeServicesCache
+}
+
+type activeServicesCache struct {
+	mu   sync.Mutex
+	file string
+	set  map[string]struct{}
 }
 
 type queryCacheEntry struct {
@@ -660,7 +674,9 @@ func (e *Executor) Services() []string {
 }
 
 func (e *Executor) scanActiveServices(seen map[string]struct{}) {
-	for _, mgr := range []*storage.SegmentManager{e.logManager, e.spanManager} {
+	managers := [2]*storage.SegmentManager{e.logManager, e.spanManager}
+	caches := [2]*activeServicesCache{&e.logActiveServices, &e.spanActiveServices}
+	for i, mgr := range managers {
 		if mgr == nil {
 			continue
 		}
@@ -675,29 +691,38 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 			continue
 		}
 
-		segPath := mgr.SegmentPath(activeMeta)
-		hint, _ := mgr.ActiveBlockIndex(activeMeta.FileName)
-		sr, err := storage.OpenSegmentReader(segPath, hint)
-		if err != nil {
-			continue
+		cache := caches[i]
+		cache.mu.Lock()
+		if cache.file != activeMeta.FileName {
+			set := make(map[string]struct{})
+			segPath := mgr.SegmentPath(activeMeta)
+			hint, _ := mgr.ActiveBlockIndex(activeMeta.FileName)
+			if sr, err := storage.OpenSegmentReader(segPath, hint); err == nil {
+				_ = sr.Scan(func(data []byte) error {
+					var logEntry model.LogEntry
+					if _, err := logEntry.ReadFrom(bytes.NewReader(data)); err == nil {
+						if logEntry.Service != "" {
+							set[logEntry.Service] = struct{}{}
+						}
+						return nil
+					}
+					var spanEntry model.SpanEntry
+					if _, err := spanEntry.ReadFrom(bytes.NewReader(data)); err == nil {
+						if spanEntry.Service != "" {
+							set[spanEntry.Service] = struct{}{}
+						}
+					}
+					return nil
+				})
+				_ = sr.Close()
+				cache.file = activeMeta.FileName
+				cache.set = set
+			}
 		}
-		_ = sr.Scan(func(data []byte) error {
-			var logEntry model.LogEntry
-			if _, err := logEntry.ReadFrom(bytes.NewReader(data)); err == nil {
-				if logEntry.Service != "" {
-					seen[logEntry.Service] = struct{}{}
-				}
-				return nil
-			}
-			var spanEntry model.SpanEntry
-			if _, err := spanEntry.ReadFrom(bytes.NewReader(data)); err == nil {
-				if spanEntry.Service != "" {
-					seen[spanEntry.Service] = struct{}{}
-				}
-			}
-			return nil
-		})
-		_ = sr.Close()
+		for s := range cache.set {
+			seen[s] = struct{}{}
+		}
+		cache.mu.Unlock()
 	}
 }
 
