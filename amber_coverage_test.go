@@ -357,12 +357,12 @@ func TestEmbedded_QueryTraceReturnsBothSides(t *testing.T) {
 func TestEmbedded_SecondOpenSameDirFails(t *testing.T) {
 	dir := t.TempDir()
 
-	db, err := amber.Open(dir)
+	db, err := amber.Open(dir, nil)
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
 
-	if _, err := amber.Open(dir); err == nil {
+	if _, err := amber.Open(dir, nil); err == nil {
 		t.Fatal("second Open on the same data dir must fail while the first DB is open")
 	}
 
@@ -370,7 +370,7 @@ func TestEmbedded_SecondOpenSameDirFails(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	db2, err := amber.Open(dir)
+	db2, err := amber.Open(dir, nil)
 	if err != nil {
 		t.Fatalf("reopen after Close: %v", err)
 	}

@@ -20,7 +20,7 @@ import (
 func TestEmbedded_MetricStore_RateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
-	db, err := amber.Open(dir)
+	db, err := amber.Open(dir, nil)
 	if err != nil {
 		t.Fatalf("amber.Open: %v", err)
 	}

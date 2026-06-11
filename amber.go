@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/runtime"
@@ -102,11 +103,10 @@ type DB struct {
 	cancel context.CancelFunc
 }
 
-func Open(dataDir string, opts ...*Options) (*DB, error) {
-	var o *Options
-	if len(opts) > 0 {
-		o = opts[0]
-	}
+// Open opens (or creates) a database rooted at dataDir. opts may be nil for
+// defaults.
+func Open(dataDir string, opts *Options) (*DB, error) {
+	o := opts
 	if o == nil {
 		o = &Options{}
 	}
@@ -173,13 +173,22 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 // not "durable". Entries sitting in the queue or an unflushed batch are lost
 // on a crash (kill -9, power loss). Call Flush for a durability barrier, or
 // Close for a clean shutdown that drains the queue.
-func (db *DB) Log(_ context.Context, entry LogEntry) error {
+//
+// The enqueue itself never blocks (a full queue returns ErrQueueFull), so
+// ctx is consulted only up front: a canceled context fails fast.
+func (db *DB) Log(ctx context.Context, entry LogEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return db.stack.Batcher.SendLog(entry)
 }
 
-// Span enqueues a span for asynchronous ingest. Same durability semantics as
-// Log: nil means queued, not persisted; see Flush.
-func (db *DB) Span(_ context.Context, span SpanEntry) error {
+// Span enqueues a span for asynchronous ingest. Same durability and context
+// semantics as Log: nil means queued, not persisted; see Flush.
+func (db *DB) Span(ctx context.Context, span SpanEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return db.stack.Batcher.SendSpan(span)
 }
 
@@ -206,7 +215,8 @@ type TraceResult struct {
 	Spans []SpanEntry
 }
 
-// QueryTrace fetches logs and spans for one trace ID.
+// QueryTrace fetches logs and spans for one trace ID. The limit applies to
+// logs and spans independently: limit=100 can return up to 100 of each.
 func (db *DB) QueryTrace(ctx context.Context, traceID TraceID, limit int) (*TraceResult, error) {
 	logs, err := db.stack.Executor.ExecLog(ctx, &LogQuery{TraceID: traceID, Limit: limit})
 	if err != nil {
@@ -237,4 +247,11 @@ func (db *DB) Close() error {
 var (
 	NewLogEntry  = model.NewLogEntry
 	NewSpanEntry = model.NewSpanEntry
+)
+
+// Ingest errors returned by Log and Span, for errors.Is.
+var (
+	ErrQueueFull   = ingest.ErrQueueFull
+	ErrBreakerOpen = ingest.ErrBreakerOpen
+	ErrCardinality = ingest.ErrCardinality
 )
