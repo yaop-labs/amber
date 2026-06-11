@@ -44,6 +44,10 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "compare":
 		err = cmdCompare(os.Args[2:])
+	case "verify":
+		err = cmdVerify(os.Args[2:])
+	case "kill9":
+		err = cmdKill9(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -55,7 +59,122 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare|verify|kill9> [flags]`)
+}
+
+func cmdVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	ingestSummary := fs.String("ingest-summary", "", "ingest summary JSON; supplies the expected count")
+	expected := fs.Uint64("expected", 0, "expected record count (overrides ingest summary)")
+	_ = fs.Parse(args)
+
+	if *targetName == "" {
+		return fmt.Errorf("verify: -target is required")
+	}
+	cfg, err := obsbench.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	target, ok := cfg.Targets[*targetName]
+	if !ok {
+		return fmt.Errorf("verify: target %q not in %s", *targetName, *configPath)
+	}
+
+	want := *expected
+	if *ingestSummary != "" && want == 0 {
+		data, err := os.ReadFile(*ingestSummary)
+		if err != nil {
+			return err
+		}
+		var ir obsbench.IngestResult
+		if err := json.Unmarshal(data, &ir); err != nil {
+			return fmt.Errorf("ingest summary: %w", err)
+		}
+		want = ir.AckedRecords
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	got, err := obsbench.CountQueryable(ctx, target)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("queryable=%d expected=%d\n", got, want)
+	if want > 0 && got != want {
+		return fmt.Errorf("verify: count mismatch (silent loss or duplication) — numbers from this run are void")
+	}
+	return nil
+}
+
+func cmdKill9(args []string) error {
+	fs := flag.NewFlagSet("kill9", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	dataset := fs.String("dataset", "dataset.ndjson.zst", "dataset path")
+	serverCmd := fs.String("server-cmd", "", "command starting the system under test (required)")
+	readyURL := fs.String("ready-url", "", "readiness URL polled for 200 (required)")
+	dataDir := fs.String("data-dir", "", "SUT data dir, wiped before each run (required)")
+	logDir := fs.String("log-dir", "kill9-logs", "server stdout/stderr captures")
+	runs := fs.Int("runs", 5, "independent kill cycles")
+	rate := fs.Int("rate", 20_000, "steady ingest records/second")
+	workers := fs.Int("workers", 4, "ingest workers")
+	batch := fs.Int("batch", 500, "records per batch")
+	killMin := fs.Duration("kill-after-min", 5*time.Second, "earliest kill point")
+	killMax := fs.Duration("kill-after-max", 20*time.Second, "latest kill point")
+	seed := fs.Uint64("seed", 1, "kill-point seed")
+	out := fs.String("out", "", "JSON result path")
+	_ = fs.Parse(args)
+
+	if *targetName == "" || *serverCmd == "" || *readyURL == "" || *dataDir == "" {
+		return fmt.Errorf("kill9: -target, -server-cmd, -ready-url and -data-dir are required")
+	}
+	cfg, err := obsbench.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	target, ok := cfg.Targets[*targetName]
+	if !ok {
+		return fmt.Errorf("kill9: target %q not in %s", *targetName, *configPath)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	res, err := obsbench.RunKill9(ctx, obsbench.Kill9Options{
+		ServerCmd:    strings.Fields(*serverCmd),
+		ReadyURL:     *readyURL,
+		DataDir:      *dataDir,
+		ServerLogDir: *logDir,
+		Target:       target,
+		TargetName:   *targetName,
+		DatasetPath:  *dataset,
+		Ingest:       obsbench.IngestOptions{Workers: *workers, BatchSize: *batch, Rate: *rate},
+		Runs:         *runs,
+		KillAfterMin: *killMin,
+		KillAfterMax: *killMax,
+		Seed:         *seed,
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "kill9: "+format+"\n", args...)
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		return err
+	}
+	if *out != "" {
+		data, _ := json.MarshalIndent(res, "", "  ")
+		if err := os.WriteFile(*out, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cmdPreflight(args []string) error {
