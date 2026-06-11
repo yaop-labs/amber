@@ -11,6 +11,8 @@ import (
 	"github.com/dariasmyr/fts-engine/pkg/index/slicedradix"
 	"github.com/dariasmyr/fts-engine/pkg/keygen"
 	"github.com/dariasmyr/fts-engine/pkg/textproc"
+
+	"github.com/yaop-labs/amber/internal/index/radix"
 )
 
 func init() {
@@ -37,8 +39,12 @@ type FTSIndex struct {
 }
 
 func NewFTSIndex() *FTSIndex {
+	// radix is our byte-compatible copy of the library's slicedradix with an
+	// O(1) tail duplicate check (see internal/index/radix): the write side
+	// uses it, while LoadFTSIndex keeps reading through the library — the
+	// snapshot format and the "slicedradix" codec name are unchanged.
 	svc := fts.New(
-		slicedradix.New(),
+		radix.New(),
 		keygen.Word,
 		fts.WithPipeline(textproc.DefaultMultilingualPipeline()),
 	)
