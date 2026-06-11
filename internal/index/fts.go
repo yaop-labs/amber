@@ -51,6 +51,16 @@ type FTSIndex struct {
 	// equality gate in benchmarks would flag it.
 	uniqHashes []byte // 8-byte big-endian hashes, sorted
 	uniqIDs    []byte // 8-byte big-endian entry IDs, parallel
+
+	// Loaded (file-backed) mode: the unique section is NOT resident — it is
+	// binary-searched with pread on demand. Explicit reads, not mmap, on
+	// purpose: page faults would make tail latency depend on page-cache
+	// state and turn storage errors into SIGBUS process kills ("Are You
+	// Sure You Want to Use MMAP in Your DBMS?", CIDR 2022), while pread
+	// returns errors as values and still benefits from the OS page cache.
+	path      string
+	uniqOff   int64
+	uniqCount int
 }
 
 func tokenHash(tok string) uint64 {
@@ -155,19 +165,72 @@ func (f *FTSIndex) seal() {
 }
 
 // lookupUnique returns the entry IDs of df==1 tokens matching the hash
-// (adjacent duplicates included, so collisions can't drop records).
+// (adjacent duplicates included, so collisions can't drop records). The
+// in-memory arrays serve freshly built indexes; loaded indexes search the
+// file with pread instead of keeping ~13 MB per segment resident.
 func (f *FTSIndex) lookupUnique(token string) []uint64 {
-	n := len(f.uniqHashes) / 8
-	if n == 0 {
+	if f.uniqHashes != nil {
+		n := len(f.uniqHashes) / 8
+		if n == 0 {
+			return nil
+		}
+		h := tokenHash(token)
+		i := sort.Search(n, func(i int) bool {
+			return binary.BigEndian.Uint64(f.uniqHashes[i*8:]) >= h
+		})
+		var ids []uint64
+		for ; i < n && binary.BigEndian.Uint64(f.uniqHashes[i*8:]) == h; i++ {
+			ids = append(ids, binary.BigEndian.Uint64(f.uniqIDs[i*8:]))
+		}
+		if len(ids) > 1 {
+			slices.Sort(ids)
+		}
+		return ids
+	}
+	if f.uniqCount == 0 || f.path == "" {
 		return nil
 	}
+	file, err := os.Open(f.path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
 	h := tokenHash(token)
-	i := sort.Search(n, func(i int) bool {
-		return binary.BigEndian.Uint64(f.uniqHashes[i*8:]) >= h
-	})
+	var buf [8]byte
+	readU64 := func(off int64) (uint64, bool) {
+		if _, err := file.ReadAt(buf[:], off); err != nil {
+			return 0, false
+		}
+		return binary.BigEndian.Uint64(buf[:]), true
+	}
+
+	n := f.uniqCount
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		v, ok := readU64(f.uniqOff + int64(mid)*8)
+		if !ok {
+			return nil
+		}
+		if v < h {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	idsOff := f.uniqOff + int64(n)*8
 	var ids []uint64
-	for ; i < n && binary.BigEndian.Uint64(f.uniqHashes[i*8:]) == h; i++ {
-		ids = append(ids, binary.BigEndian.Uint64(f.uniqIDs[i*8:]))
+	for i := lo; i < n; i++ {
+		v, ok := readU64(f.uniqOff + int64(i)*8)
+		if !ok || v != h {
+			break
+		}
+		id, ok := readU64(idsOff + int64(i)*8)
+		if !ok {
+			break
+		}
+		ids = append(ids, id)
 	}
 	if len(ids) > 1 {
 		slices.Sort(ids)
@@ -365,8 +428,9 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 		if tl > uint64(len(r)) {
 			return nil, errors.New("fts: load index: token length out of range")
 		}
-		// The token strings reference the file buffer — one allocation for
-		// the whole index instead of one per token.
+		// Clone dictionary bytes out of the file buffer: retaining
+		// sub-slices would pin the whole file — including the unique
+		// section, which deliberately stays on disk.
 		tok := string(r[:tl])
 		r = r[tl:]
 		cnt, err := take()
@@ -381,7 +445,7 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 			return nil, errors.New("fts: load index: posting blob out of range")
 		}
 		f.tokens = append(f.tokens, tok)
-		f.postings = append(f.postings, r[:bl])
+		f.postings = append(f.postings, bytes.Clone(r[:bl]))
 		f.counts = append(f.counts, int(cnt))
 		r = r[bl:]
 	}
@@ -393,7 +457,9 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 	if uniqCount*16 > uint64(len(r)) {
 		return nil, errors.New("fts: load index: unique section out of range")
 	}
-	f.uniqHashes = r[:uniqCount*8]
-	f.uniqIDs = r[uniqCount*8 : uniqCount*16]
+	// The unique section is searched via pread; record its position only.
+	f.path = path
+	f.uniqCount = int(uniqCount)
+	f.uniqOff = int64(len(data) - 4 - len(r))
 	return f, nil
 }

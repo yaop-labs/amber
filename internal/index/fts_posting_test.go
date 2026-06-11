@@ -139,3 +139,48 @@ func TestFTSIndex_SizeOnDisk(t *testing.T) {
 		t.Fatalf(".fidx = %d bytes for 100k records — format regressed", info.Size())
 	}
 }
+
+// TestFTSIndex_UniqueSectionPreadPath pins the file-backed df==1 lookup:
+// unique tokens are not resident after load and must be found via pread.
+func TestFTSIndex_UniqueSectionPreadPath(t *testing.T) {
+	idx := NewFTSIndex()
+	ctx := context.Background()
+	// "deadbeefcafe" appears once (df==1 → unique section); "timeout" twice
+	// (dictionary).
+	_ = idx.Index(ctx, 100, "timeout while calling deadbeefcafe")
+	_ = idx.Index(ctx, 200, "timeout retrying")
+
+	path := filepath.Join(t.TempDir(), "u.fidx")
+	if err := idx.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := LoadFTSIndex(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.uniqHashes != nil {
+		t.Fatal("loaded index must not keep the unique section resident")
+	}
+	if loaded.uniqCount == 0 {
+		t.Fatal("unique section missing from loaded index")
+	}
+
+	ids, err := loaded.Search(ctx, "deadbeefcafe", 10)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != 100 {
+		t.Fatalf("unique pread search = %v, want [100]", ids)
+	}
+	// AND across dictionary and unique sections.
+	ids, err = loaded.Search(ctx, "timeout deadbeefcafe", 10)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != 100 {
+		t.Fatalf("mixed AND search = %v, want [100]", ids)
+	}
+	if ids, _ := loaded.Search(ctx, "nosuchtokenanywhere", 10); len(ids) != 0 {
+		t.Fatalf("absent token returned %v", ids)
+	}
+}
