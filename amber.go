@@ -168,12 +168,28 @@ func Open(dataDir string, opts ...*Options) (*DB, error) {
 	return &DB{stack: stack, cancel: cancel}, nil
 }
 
+// Log enqueues an entry for asynchronous ingest and returns before anything
+// reaches the WAL: a nil error means "accepted into the in-process queue",
+// not "durable". Entries sitting in the queue or an unflushed batch are lost
+// on a crash (kill -9, power loss). Call Flush for a durability barrier, or
+// Close for a clean shutdown that drains the queue.
 func (db *DB) Log(_ context.Context, entry LogEntry) error {
 	return db.stack.Batcher.SendLog(entry)
 }
 
+// Span enqueues a span for asynchronous ingest. Same durability semantics as
+// Log: nil means queued, not persisted; see Flush.
 func (db *DB) Span(_ context.Context, span SpanEntry) error {
 	return db.stack.Batcher.SendSpan(span)
+}
+
+// Flush blocks until every Log/Span call that returned before Flush started
+// has been written to the WAL and synced (or counted as dropped — write
+// failures surface via the ingest circuit breaker and metrics, not via
+// Flush's error). Use it as a durability barrier before process exit or
+// after writes the application cannot afford to lose.
+func (db *DB) Flush(ctx context.Context) error {
+	return db.stack.Batcher.Flush(ctx)
 }
 
 func (db *DB) QueryLogs(ctx context.Context, q *LogQuery) (*LogResult, error) {

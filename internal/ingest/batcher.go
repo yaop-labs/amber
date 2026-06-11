@@ -20,6 +20,9 @@ import (
 type item struct {
 	log  *model.LogEntry
 	span *model.SpanEntry
+	// barrier marks a Flush sentinel: the worker flushes the pending batch,
+	// then closes the channel. Never carries data.
+	barrier chan struct{}
 }
 
 var (
@@ -290,6 +293,11 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 			for {
 				select {
 				case it := <-queue:
+					if it.barrier != nil {
+						flush()
+						close(it.barrier)
+						continue
+					}
 					batch = append(batch, it)
 					if len(batch) >= batchSize {
 						flush()
@@ -301,6 +309,11 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 			}
 
 		case it := <-queue:
+			if it.barrier != nil {
+				flush()
+				close(it.barrier)
+				continue
+			}
 			batch = append(batch, it)
 			if len(batch) >= batchSize {
 				flush()
@@ -311,6 +324,32 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 			flush()
 		}
 	}
+}
+
+// Flush blocks until both lanes have processed everything enqueued before the
+// call: queued entries are handed to storage (WAL write + sync) or counted as
+// dropped. Write failures don't fail Flush — they surface through the
+// circuit breaker and ingest metrics.
+func (b *Batcher) Flush(ctx context.Context) error {
+	lanes := [2]chan item{b.logQueue, b.spanQueue}
+	var dones [2]chan struct{}
+	for i, queue := range lanes {
+		done := make(chan struct{})
+		select {
+		case queue <- item{barrier: done}:
+			dones[i] = done
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for _, done := range dones {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (b *Batcher) processBatch(_ context.Context, batch []item) {

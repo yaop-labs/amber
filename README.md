@@ -213,6 +213,29 @@ curl "http://localhost:8080/api/v1/admin/segments" \
 - sparse index size
 - heap usage snapshot
 
+## Durability semantics (embedded API)
+
+`db.Log()` and `db.Span()` are **asynchronous**: a nil error means the entry
+was accepted into the in-process ingest queue (10k entries by default), not
+that it reached disk. Entries are batched, written to the WAL with an fsync,
+and acknowledged internally — but a crash (`kill -9`, OOM, power loss) loses
+whatever was still in the queue or an unflushed batch.
+
+When you need a durability barrier, call:
+
+```go
+if err := db.Flush(ctx); err != nil { /* ctx expired */ }
+```
+
+`Flush` returns once every `Log`/`Span` call that completed before it was
+invoked has been written to the WAL and synced (or counted as dropped —
+write failures surface via the ingest circuit breaker and the
+`ingest_dropped_total` self-metric, not via `Flush`). `db.Close()` drains the
+queue the same way on shutdown.
+
+The HTTP ingest API has the same model and makes it explicit with status
+`202 Accepted`.
+
 ## Metrics value model (alpha)
 
 The embedded metrics engine stores every sample as an **int64**. OTLP float
