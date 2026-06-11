@@ -71,6 +71,7 @@ func (s *Store) evictOnce() int {
 	kept := s.catalog.Series[:0]
 	for _, entry := range s.catalog.Series {
 		if _, gone := evictedSet[entry.ID]; gone {
+			delete(s.catalogKeys, entry.Labels.Canonical().Key())
 			continue
 		}
 		kept = append(kept, entry)

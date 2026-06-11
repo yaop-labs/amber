@@ -34,6 +34,10 @@ type Store struct {
 	mu                sync.RWMutex
 	manifest          Manifest
 	catalog           Catalog
+	// catalogKeys indexes catalog entries by canonical label key. Kept in
+	// step with catalog.Series (register + evict) so ensureCatalog stays
+	// O(batch) instead of rebuilding an O(active series) map per append.
+	catalogKeys map[string]uint64
 	directoryCache    map[string]block.Directory
 	allowGlobFallback bool
 	stopBackground    chan struct{}
@@ -203,6 +207,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		clock:             opts.Clock,
 		manifest:          manifest,
 		catalog:           catalog,
+		catalogKeys:       catalogKeyMap(catalog),
 		directoryCache:    make(map[string]block.Directory),
 		allowGlobFallback: allowGlobFallback,
 		catalogLog:        catLog,
@@ -260,17 +265,21 @@ func (s *Store) AppendScaledFloat(labels model.LabelSet, typ model.MetricType, t
 	return id, nil
 }
 
+// catalogKeyMap indexes catalog entries by canonical label key.
+func catalogKeyMap(c Catalog) map[string]uint64 {
+	keys := make(map[string]uint64, len(c.Series))
+	for _, entry := range c.Series {
+		keys[entry.Labels.Canonical().Key()] = entry.ID
+	}
+	return keys
+}
+
 func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 	if len(labelSets) == 0 {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	existing := make(map[string]uint64, len(s.catalog.Series))
-	for _, entry := range s.catalog.Series {
-		existing[entry.Labels.Canonical().Key()] = entry.ID
-	}
 
 	newSeries := make(map[string]model.LabelSet)
 	for _, labels := range labelSets {
@@ -279,7 +288,7 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		}
 		canonical := labels.Canonical()
 		key := canonical.Key()
-		if _, ok := existing[key]; ok {
+		if _, ok := s.catalogKeys[key]; ok {
 			continue
 		}
 		if _, ok := newSeries[key]; ok {
@@ -311,6 +320,7 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		s.catalog.NextID = id + 1
 		labels := newSeries[key]
 		s.catalog.Series = append(s.catalog.Series, CatalogEntry{ID: id, Labels: labels})
+		s.catalogKeys[key] = id
 		s.engine.Registry().Import(index.SeriesID(id), labels)
 		registered = append(registered, struct {
 			id     uint64
