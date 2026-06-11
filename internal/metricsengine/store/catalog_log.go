@@ -42,6 +42,20 @@ type catalogLog struct {
 
 	// rotationStop is a test-only crash-injection point for rotation steps.
 	rotationStop string
+
+	// failed fail-stops the writer after a failed fsync or partial write:
+	// the durable state of the appended tail is unknowable (fsyncgate), so
+	// no further catalog mutation may be acknowledged. Guarded by mu.
+	failed error
+}
+
+// failStop records a fatal writer error; subsequent appends return it.
+// Caller holds c.mu.
+func (c *catalogLog) failStop(err error) error {
+	if c.failed == nil {
+		c.failed = err
+	}
+	return err
 }
 
 // openCatalogLog opens the live catalog.log file for append.
@@ -85,11 +99,14 @@ func (c *catalogLog) AppendEvict(seriesID uint64, ts int64) error {
 func (c *catalogLog) appendAndSync(rec []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.failed != nil {
+		return c.failed
+	}
 	if _, err := c.f.Write(rec); err != nil {
-		return fmt.Errorf("catalog log: write: %w", err)
+		return c.failStop(fmt.Errorf("catalog log: write: %w", err))
 	}
 	if err := c.f.Sync(); err != nil {
-		return fmt.Errorf("catalog log: fsync: %w", err)
+		return c.failStop(fmt.Errorf("catalog log: fsync: %w", err))
 	}
 	return nil
 }
@@ -98,11 +115,14 @@ func (c *catalogLog) appendAndSync(rec []byte) error {
 func (c *catalogLog) writeUnsynced(rec []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.failed != nil {
+		return c.failed
+	}
 	if c.f == nil {
 		return fmt.Errorf("catalog log: closed")
 	}
 	if _, err := c.f.Write(rec); err != nil {
-		return fmt.Errorf("catalog log: write: %w", err)
+		return c.failStop(fmt.Errorf("catalog log: write: %w", err))
 	}
 	return nil
 }
@@ -111,10 +131,16 @@ func (c *catalogLog) writeUnsynced(rec []byte) error {
 func (c *catalogLog) sync() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.failed != nil {
+		return c.failed
+	}
 	if c.f == nil {
 		return fmt.Errorf("catalog log: closed")
 	}
-	return c.f.Sync()
+	if err := c.f.Sync(); err != nil {
+		return c.failStop(fmt.Errorf("catalog log: fsync: %w", err))
+	}
+	return nil
 }
 
 // Close drains the committer and closes the live log.

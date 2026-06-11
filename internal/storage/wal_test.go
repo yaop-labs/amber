@@ -346,3 +346,34 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 		t.Errorf("expected %d records, got %d", goroutines*perGoroutine, count)
 	}
 }
+
+// TestWAL_FailStopAfterWriteError pins the fsync-failure policy: once a
+// write/flush/fsync fails, the writer is fail-stopped — no later append may
+// ack (the durable state is unknowable) and Truncate refuses to destroy the
+// on-disk evidence.
+func TestWAL_FailStopAfterWriteError(t *testing.T) {
+	wal, err := OpenWAL(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenWAL: %v", err)
+	}
+	// Close the descriptor behind the writer so the next flush/fsync fails.
+	if err := wal.file.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	if _, err := wal.Write([]byte("x")); err == nil {
+		t.Fatal("expected Write to fail on closed file")
+	}
+	if _, err := wal.Write([]byte("y")); err == nil {
+		t.Fatal("fail-stopped writer accepted a write")
+	}
+	if _, err := wal.WriteBatch([][]byte{[]byte("z")}); err == nil {
+		t.Fatal("fail-stopped writer accepted a batch")
+	}
+	if _, err := wal.WriteBatchTS([]BatchItem{{Data: []byte("z"), TS: 1}}); err == nil {
+		t.Fatal("fail-stopped writer accepted a TS batch")
+	}
+	if err := wal.Truncate(); err == nil {
+		t.Fatal("fail-stopped writer allowed Truncate")
+	}
+}

@@ -53,6 +53,21 @@ type WAL struct {
 	// (SegmentManager) seed it from durable state at startup so seqs stay
 	// monotonic across restarts.
 	nextSeq atomic.Uint64
+
+	// failed fail-stops the writer. After a failed fsync the kernel may have
+	// dropped the dirty pages without retrying (PostgreSQL's "fsyncgate"), and
+	// after a partial buffered write the tail is torn — replay stops there, so
+	// records appended past it would be silently lost. Either way the durable
+	// state is unknowable; no further append may be acknowledged. Guarded by mu.
+	failed error
+}
+
+// failStop records a fatal writer error; every subsequent write returns it.
+func (w *WAL) failStop(err error) error {
+	if w.failed == nil {
+		w.failed = err
+	}
+	return err
 }
 
 // SetLogger attaches a logger used to surface WAL replay corruption events.
@@ -109,17 +124,21 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.failed != nil {
+		return 0, w.failed
+	}
+
 	seq, err := w.writeRecord(payload)
 	if err != nil {
-		return 0, err
+		return 0, w.failStop(err)
 	}
 
 	if err := w.buf.Flush(); err != nil {
-		return 0, fmt.Errorf("wal: flush: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: flush: %w", err))
 	}
 
 	if err := w.file.Sync(); err != nil {
-		return 0, fmt.Errorf("wal: sync: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: sync: %w", err))
 	}
 
 	return seq, nil
@@ -140,6 +159,10 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.failed != nil {
+		return 0, w.failed
+	}
 
 	// Reserve len(items) sequential seqs in a single atomic op.
 	n := uint64(len(items))
@@ -163,21 +186,21 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 		binary.LittleEndian.PutUint64(header[12:20], firstSeq+uint64(i))
 
 		if _, err := w.buf.Write(header[:]); err != nil {
-			return 0, fmt.Errorf("wal: write header: %w", err)
+			return 0, w.failStop(fmt.Errorf("wal: write header: %w", err))
 		}
 		if _, err := w.buf.Write(tsBuf[:]); err != nil {
-			return 0, fmt.Errorf("wal: write ts: %w", err)
+			return 0, w.failStop(fmt.Errorf("wal: write ts: %w", err))
 		}
 		if _, err := w.buf.Write(item.Data); err != nil {
-			return 0, fmt.Errorf("wal: write data: %w", err)
+			return 0, w.failStop(fmt.Errorf("wal: write data: %w", err))
 		}
 	}
 
 	if err := w.buf.Flush(); err != nil {
-		return 0, fmt.Errorf("wal: batch flush: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: batch flush: %w", err))
 	}
 	if err := w.file.Sync(); err != nil {
-		return 0, fmt.Errorf("wal: batch sync: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: batch sync: %w", err))
 	}
 
 	return firstSeq, nil
@@ -193,22 +216,26 @@ func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.failed != nil {
+		return 0, w.failed
+	}
+
 	firstSeq, err := w.writeRecord(payloads[0])
 	if err != nil {
-		return 0, err
+		return 0, w.failStop(err)
 	}
 	for _, payload := range payloads[1:] {
 		if _, err := w.writeRecord(payload); err != nil {
-			return 0, err
+			return 0, w.failStop(err)
 		}
 	}
 
 	if err := w.buf.Flush(); err != nil {
-		return 0, fmt.Errorf("wal: batch flush: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: batch flush: %w", err))
 	}
 
 	if err := w.file.Sync(); err != nil {
-		return 0, fmt.Errorf("wal: batch sync: %w", err)
+		return 0, w.failStop(fmt.Errorf("wal: batch sync: %w", err))
 	}
 
 	return firstSeq, nil
@@ -326,8 +353,14 @@ func (w *WAL) Truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// A failed writer may hold acked records the disk never got; truncating
+	// would destroy the only copy. Refuse and keep the evidence on disk.
+	if w.failed != nil {
+		return w.failed
+	}
+
 	if err := w.buf.Flush(); err != nil {
-		return fmt.Errorf("wal: truncate flush: %w", err)
+		return w.failStop(fmt.Errorf("wal: truncate flush: %w", err))
 	}
 
 	if err := w.file.Truncate(0); err != nil {

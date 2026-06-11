@@ -81,6 +81,23 @@ type SegmentWriter struct {
 
 	blockSize int
 	closed    bool
+
+	// failed fail-stops the writer. After a failed fsync the kernel may have
+	// dropped the dirty pages (PostgreSQL's "fsyncgate"), and after a partial
+	// buffered write fileOffset no longer matches the file — later block
+	// offsets would be wrong. Either way the segment can't accept more
+	// records; the manager recovers from WAL + last synced size on restart.
+	// Guarded by mu.
+	failed error
+}
+
+// failStop records a fatal writer error; subsequent writes return it.
+// Caller holds sw.mu.
+func (sw *SegmentWriter) failStop(err error) error {
+	if sw.failed == nil {
+		sw.failed = err
+	}
+	return err
 }
 
 func OpenSegmentWriter(path string) (*SegmentWriter, error) {
@@ -130,6 +147,9 @@ func (sw *SegmentWriter) WriteRecord(data []byte, ts int64) error {
 
 	if sw.closed {
 		return fmt.Errorf("segment: writer is closed")
+	}
+	if sw.failed != nil {
+		return sw.failed
 	}
 
 	if sw.recordCount == 0 || ts < sw.minTS {
@@ -199,13 +219,13 @@ func (sw *SegmentWriter) flushBlock() error {
 	n, err := sw.bw.Write(blockHeader[:])
 	sw.fileOffset += int64(n)
 	if err != nil {
-		return fmt.Errorf("segment: write block header: %w", err)
+		return sw.failStop(fmt.Errorf("segment: write block header: %w", err))
 	}
 
 	n, err = sw.bw.Write(compressed)
 	sw.fileOffset += int64(n)
 	if err != nil {
-		return fmt.Errorf("segment: write block data: %w", err)
+		return sw.failStop(fmt.Errorf("segment: write block data: %w", err))
 	}
 
 	sw.blockBuf.Reset()
@@ -223,12 +243,18 @@ func (sw *SegmentWriter) Flush() error {
 	if sw.closed {
 		return nil
 	}
+	if sw.failed != nil {
+		return sw.failed
+	}
 	if sw.blockBuf.Len() > 0 {
 		if err := sw.flushBlock(); err != nil {
 			return err
 		}
 	}
-	return sw.bw.Flush()
+	if err := sw.bw.Flush(); err != nil {
+		return sw.failStop(err)
+	}
+	return nil
 }
 
 func (sw *SegmentWriter) Close() error {
@@ -239,6 +265,14 @@ func (sw *SegmentWriter) Close() error {
 		return nil
 	}
 	sw.closed = true
+
+	// A failed writer must not append a footer: fileOffset may not match the
+	// file, and the pages on disk are suspect. Close the handle and let
+	// footerless recovery deal with whatever actually landed.
+	if sw.failed != nil {
+		_ = sw.file.Close()
+		return sw.failed
+	}
 
 	if err := sw.flushBlock(); err != nil {
 		return err
@@ -319,11 +353,14 @@ func (sw *SegmentWriter) Sync() (int64, error) {
 	if sw.closed {
 		return sw.fileOffset, nil
 	}
+	if sw.failed != nil {
+		return 0, sw.failed
+	}
 	if err := sw.bw.Flush(); err != nil {
-		return 0, fmt.Errorf("segment: sync flush: %w", err)
+		return 0, sw.failStop(fmt.Errorf("segment: sync flush: %w", err))
 	}
 	if err := sw.file.Sync(); err != nil {
-		return 0, fmt.Errorf("segment: sync fsync: %w", err)
+		return 0, sw.failStop(fmt.Errorf("segment: sync fsync: %w", err))
 	}
 	return sw.fileOffset, nil
 }

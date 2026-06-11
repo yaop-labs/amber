@@ -386,3 +386,33 @@ func TestRecordCodecRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestWAL_FailStopAfterSyncError pins the fsync-failure policy: a failed
+// write or fsync fail-stops the writer, and Truncate refuses to destroy the
+// on-disk evidence.
+func TestWAL_FailStopAfterSyncError(t *testing.T) {
+	w, err := Open(filepath.Join(t.TempDir(), "head.wal"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := w.file.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	rec := Record{Kind: KindSample, ID: 1, Timestamp: 1, Value: 1}
+	if err := w.Append(rec); err == nil {
+		t.Fatal("expected Append to fail on closed file")
+	}
+	if err := w.Append(rec); err == nil {
+		t.Fatal("fail-stopped writer accepted an append")
+	}
+	if err := w.AppendBatchUnsynced([]Record{rec}); err == nil {
+		t.Fatal("fail-stopped writer accepted an unsynced append")
+	}
+	if err := w.Sync(); err == nil {
+		t.Fatal("fail-stopped writer reported a clean sync")
+	}
+	if err := w.Truncate(); err == nil {
+		t.Fatal("fail-stopped writer allowed Truncate")
+	}
+}

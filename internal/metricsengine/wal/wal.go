@@ -59,6 +59,22 @@ type WAL struct {
 	mu   sync.Mutex
 	path string
 	file *os.File
+
+	// failed fail-stops the writer. After a failed fsync the kernel may have
+	// dropped the dirty pages without retrying (PostgreSQL's "fsyncgate"), and
+	// after a partial write the tail is torn — replay stops there, so records
+	// appended past it would be silently lost. Either way the durable state
+	// is unknowable; no further append may be acknowledged. Guarded by mu.
+	failed error
+}
+
+// failStop records a fatal writer error; every subsequent append returns it.
+// Caller holds w.mu.
+func (w *WAL) failStop(err error) error {
+	if w.failed == nil {
+		w.failed = err
+	}
+	return err
 }
 
 func Open(path string) (*WAL, error) {
@@ -88,10 +104,16 @@ func (w *WAL) AppendBatch(records []Record) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := w.file.Write(batch); err != nil {
-		return err
+	if w.failed != nil {
+		return w.failed
 	}
-	return w.file.Sync()
+	if _, err := w.file.Write(batch); err != nil {
+		return w.failStop(err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return w.failStop(err)
+	}
+	return nil
 }
 
 // AppendBatchUnsynced writes records without fsync.
@@ -111,8 +133,11 @@ func (w *WAL) AppendBatchUnsynced(records []Record) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.failed != nil {
+		return w.failed
+	}
 	if _, err := w.file.Write(batch); err != nil {
-		return err
+		return w.failStop(err)
 	}
 	return nil
 }
@@ -122,10 +147,16 @@ func (w *WAL) AppendBatchUnsynced(records []Record) error {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.failed != nil {
+		return w.failed
+	}
 	if w.file == nil {
 		return nil
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		return w.failStop(err)
+	}
+	return nil
 }
 
 // Binary payload layouts (framing — len[4]|crc[4] — is unchanged, so the
@@ -296,6 +327,11 @@ func (r *byteReader) str() string {
 func (w *WAL) Truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// A failed writer may hold acked records the disk never got; truncating
+	// would destroy the only copy. Refuse and keep the evidence on disk.
+	if w.failed != nil {
+		return w.failed
+	}
 	if err := w.file.Close(); err != nil {
 		return err
 	}

@@ -368,3 +368,28 @@ func statFile(path string) (int64, error) {
 func createFile(path string) (*os.File, error) {
 	return os.Create(path)
 }
+
+// TestSegmentWriter_FailStopAfterSyncError pins the fsync-failure policy for
+// the active segment: after a failed sync the writer rejects records and
+// Close does not append a footer over an unknowable file state.
+func TestSegmentWriter_FailStopAfterSyncError(t *testing.T) {
+	sw, err := OpenSegmentWriter(filepath.Join(t.TempDir(), "seg.alog"))
+	if err != nil {
+		t.Fatalf("OpenSegmentWriter: %v", err)
+	}
+	if err := sw.WriteRecord(make([]byte, 16), 1); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+	if err := sw.file.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+	if _, err := sw.Sync(); err == nil {
+		t.Fatal("expected Sync to fail on closed file")
+	}
+	if err := sw.WriteRecord(make([]byte, 16), 2); err == nil {
+		t.Fatal("fail-stopped writer accepted a record")
+	}
+	if err := sw.Close(); err == nil {
+		t.Fatal("Close on a failed writer must surface the failure")
+	}
+}
