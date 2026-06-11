@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +40,10 @@ func main() {
 		err = cmdSample(os.Args[2:])
 	case "ingest":
 		err = cmdIngest(os.Args[2:])
+	case "query":
+		err = cmdQuery(os.Args[2:])
+	case "compare":
+		err = cmdCompare(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -50,7 +55,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare> [flags]`)
 }
 
 func cmdPreflight(args []string) error {
@@ -79,9 +84,9 @@ func cmdPreflight(args []string) error {
 func cmdDatagen(args []string) error {
 	fs := flag.NewFlagSet("datagen", flag.ExitOnError)
 	out := fs.String("out", "dataset.ndjson.zst", "output path")
-	count := fs.Uint64("count", 100_000_000, "records to generate")
+	count := fs.Uint64("count", 20_000_000, "records to generate")
 	seed := fs.Uint64("seed", 1, "PRNG seed (same seed = byte-identical dataset)")
-	rareEvery := fs.Uint64("rare-every", 1_000_000, "inject rare FTS token every N records (0 = off)")
+	rareEvery := fs.Uint64("rare-every", 200_000, "inject rare FTS token every N records (0 = off)")
 	_ = fs.Parse(args)
 
 	start := time.Now()
@@ -129,6 +134,155 @@ func cmdSample(args []string) error {
 	defer stop()
 	sampler := &obsbench.MemSampler{Match: re, Interval: *interval, Out: w}
 	return sampler.Run(ctx)
+}
+
+func cmdQuery(args []string) error {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	scenarios := fs.String("scenarios", "all", "comma-separated scenario list or 'all'")
+	iterations := fs.Int("iterations", 50, "instances per scenario")
+	seed := fs.Uint64("seed", 1, "instance-parameter seed (same seed across systems = same queries)")
+	datasetSeed := fs.Uint64("dataset-seed", 1, "seed the dataset was generated with (drives the Q4 rare token)")
+	limit := fs.Int("limit", 100, "result limit per query")
+	qps := fs.Int("qps", 0, "pace queries (0 = back-to-back)")
+	ingestSummary := fs.String("ingest-summary", "", "ingest summary JSON; supplies the time window")
+	fromFlag := fs.String("from", "", "window start (RFC3339; overrides ingest summary)")
+	toFlag := fs.String("to", "", "window end (RFC3339; overrides ingest summary)")
+	out := fs.String("out", "", "results JSON path (required for compare)")
+	_ = fs.Parse(args)
+
+	if *targetName == "" {
+		return fmt.Errorf("query: -target is required")
+	}
+	cfg, err := obsbench.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	target, ok := cfg.Targets[*targetName]
+	if !ok {
+		return fmt.Errorf("query: target %q not in %s", *targetName, *configPath)
+	}
+
+	opts := obsbench.QueryRunOptions{
+		Iterations:  *iterations,
+		Seed:        *seed,
+		DatasetSeed: *datasetSeed,
+		Limit:       *limit,
+		QPS:         *qps,
+	}
+	if *scenarios == "all" {
+		opts.Scenarios = obsbench.AllScenarios
+	} else {
+		opts.Scenarios = strings.Split(*scenarios, ",")
+	}
+
+	if *ingestSummary != "" {
+		data, err := os.ReadFile(*ingestSummary)
+		if err != nil {
+			return err
+		}
+		var ir obsbench.IngestResult
+		if err := json.Unmarshal(data, &ir); err != nil {
+			return fmt.Errorf("ingest summary: %w", err)
+		}
+		opts.From, opts.To = ir.StartedAt, ir.FinishedAt
+	}
+	if *fromFlag != "" {
+		if opts.From, err = time.Parse(time.RFC3339, *fromFlag); err != nil {
+			return fmt.Errorf("-from: %w", err)
+		}
+	}
+	if *toFlag != "" {
+		if opts.To, err = time.Parse(time.RFC3339, *toFlag); err != nil {
+			return fmt.Errorf("-to: %w", err)
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	outcomes, err := obsbench.RunQueries(ctx, target, opts)
+	if err != nil {
+		return err
+	}
+
+	rf := obsbench.ResultFile{Target: *targetName, Outcomes: outcomes}
+	if *out != "" {
+		if err := obsbench.WriteResultFile(*out, rf); err != nil {
+			return err
+		}
+	}
+	printQuerySummary(rf)
+	return nil
+}
+
+func printQuerySummary(rf obsbench.ResultFile) {
+	type agg struct {
+		lat         []time.Duration
+		errs, total int
+		countMin    int
+		countMax    int
+	}
+	byScenario := map[string]*agg{}
+	for _, oc := range rf.Outcomes {
+		a := byScenario[oc.Scenario]
+		if a == nil {
+			a = &agg{countMin: -1}
+			byScenario[oc.Scenario] = a
+		}
+		a.total++
+		if oc.Error != "" {
+			a.errs++
+			continue
+		}
+		a.lat = append(a.lat, oc.Latency)
+		if a.countMin == -1 || oc.Count < a.countMin {
+			a.countMin = oc.Count
+		}
+		if oc.Count > a.countMax {
+			a.countMax = oc.Count
+		}
+	}
+	for scenario, a := range byScenario {
+		p50, p95, p99 := obsbench.Percentiles(a.lat)
+		fmt.Printf("%-12s n=%d errs=%d count=[%d..%d] p50=%s p95=%s p99=%s\n",
+			scenario, a.total, a.errs, a.countMin, a.countMax,
+			p50.Round(time.Microsecond), p95.Round(time.Microsecond), p99.Round(time.Microsecond))
+	}
+}
+
+func cmdCompare(args []string) error {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	_ = fs.Parse(args)
+	paths := fs.Args()
+	if len(paths) < 2 {
+		return fmt.Errorf("compare: need at least two result files")
+	}
+	files := make([]obsbench.ResultFile, 0, len(paths))
+	for _, p := range paths {
+		rf, err := obsbench.ReadResultFile(p)
+		if err != nil {
+			return err
+		}
+		files = append(files, rf)
+	}
+	mismatches := obsbench.CompareCounts(files)
+	if len(mismatches) == 0 {
+		fmt.Println("equality gate: all shared query instances agree")
+		return nil
+	}
+	for _, m := range mismatches {
+		fmt.Printf("MISMATCH %s iter=%d %s\n", m.Scenario, m.Iteration, m.Params)
+		for target, count := range m.Counts {
+			line := fmt.Sprintf("  %-16s count=%d", target, count)
+			if e := m.Errors[target]; e != "" {
+				line += " error=" + e
+			}
+			fmt.Println(line)
+		}
+	}
+	return fmt.Errorf("equality gate: %d mismatching instances — latency comparison void for them", len(mismatches))
 }
 
 func cmdIngest(args []string) error {

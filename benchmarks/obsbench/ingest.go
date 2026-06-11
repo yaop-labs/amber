@@ -27,7 +27,11 @@ type IngestOptions struct {
 // the server acknowledged with 2xx; the gap to SentRecords plus the verify
 // step's queryable count is the loss accounting (METHODOLOGY.md §4).
 type IngestResult struct {
-	Target        string        `json:"target"`
+	Target string `json:"target"`
+	// StartedAt/FinishedAt bound the ingest window; the query phase derives
+	// its time ranges from them (records carry send-time timestamps).
+	StartedAt     time.Time     `json:"started_at"`
+	FinishedAt    time.Time     `json:"finished_at"`
 	SentRecords   uint64        `json:"sent_records"`
 	AckedRecords  uint64        `json:"acked_records"`
 	FailedBatches uint64        `json:"failed_batches"`
@@ -170,6 +174,8 @@ readLoop:
 
 	res := IngestResult{
 		Target:        targetName,
+		StartedAt:     start,
+		FinishedAt:    start.Add(duration),
 		SentRecords:   sent,
 		AckedRecords:  acked.Load(),
 		FailedBatches: failedBatches.Load(),
@@ -179,7 +185,7 @@ readLoop:
 	if duration > 0 {
 		res.RecPerSec = float64(res.AckedRecords) / duration.Seconds()
 	}
-	res.LatencyP50, res.LatencyP95, res.LatencyP99 = percentiles(latencies)
+	res.LatencyP50, res.LatencyP95, res.LatencyP99 = Percentiles(latencies)
 	return res, nil
 }
 
@@ -207,7 +213,8 @@ func recordErr(mu *sync.Mutex, counts map[string]uint64, key string) {
 	mu.Unlock()
 }
 
-func percentiles(latencies []time.Duration) (p50, p95, p99 time.Duration) {
+// Percentiles reports p50/p95/p99 over client-measured latencies.
+func Percentiles(latencies []time.Duration) (p50, p95, p99 time.Duration) {
 	if len(latencies) == 0 {
 		return 0, 0, 0
 	}
