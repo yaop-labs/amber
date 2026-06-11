@@ -1,3 +1,10 @@
+// Package metricsengine is the public face of the embedded metrics store.
+//
+// The supported contract is Store (Open*, Append*, query methods, Flush,
+// Compact, Stats, Close) plus the types its signatures need: selectors,
+// query options, plans/results for Explain, and the OTLP adapters. Engine
+// internals and per-block execution helpers live in internal/metricsengine
+// and are deliberately not re-exported.
 package metricsengine
 
 import (
@@ -9,8 +16,6 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/store"
 )
 
-type Engine = engine.Engine
-type Options = engine.Options
 type SeriesID = index.SeriesID
 type Label = model.Label
 type LabelSet = model.LabelSet
@@ -80,44 +85,21 @@ const (
 	OTLPNumberFloat                = otlp.NumberFloat
 )
 
-func New() *Engine {
-	return engine.New()
-}
-
-func Open(opts Options) (*Engine, error) {
-	return engine.Open(opts)
-}
-
+// Selector construction.
 var NewSelector = index.NewSelector
 var MetricName = index.MetricName
 var LabelEqual = index.LabelEqual
 var LabelRegexp = index.LabelRegexp
 var LabelNotEqual = index.LabelNotEqual
 var LabelNotRegexp = index.LabelNotRegexp
-var SelectBlock = query.SelectBlock
-var SelectBlockWithDirectory = query.SelectBlockWithDirectory
-var SelectSeries = query.SelectSeries
+
+// Query-option construction.
 var TimeRange = query.TimeRange
 var TimeWindow = query.TimeWindow
 var ValueRange = query.ValueRange
 var StepMillis = query.StepMillis
-var SumByLabel = query.SumByLabel
-var SumByLabelSteps = query.SumByLabelSteps
-var SumByLabelInBlock = query.SumByLabelInBlock
-var AggregateByLabel = query.AggregateByLabel
-var AggregateByLabelSteps = query.AggregateByLabelSteps
-var AggregateByLabelStepsInBlockWithDirectory = query.AggregateByLabelStepsInBlockWithDirectory
-var AggregateByLabelInBlock = query.AggregateByLabelInBlock
-var AggregateByLabelInDirectoryBuckets = query.AggregateByLabelInDirectoryBuckets
-var Rate = query.Rate
-var RateByLabel = query.RateByLabel
-var RateByLabelSteps = query.RateByLabelSteps
-var RateByLabelStepsInBlockWithDirectory = query.RateByLabelStepsInBlockWithDirectory
-var Increase = query.Increase
-var IncreaseByLabel = query.IncreaseByLabel
-var IncreaseByLabelSteps = query.IncreaseByLabelSteps
-var IncreaseByLabelStepsInBlockWithDirectory = query.IncreaseByLabelStepsInBlockWithDirectory
-var PlanExecution = query.PlanExecution
+
+// OTLP adapters.
 var OTLPSamples = otlp.Samples
 var OTLPSamplesSkipped = otlp.SamplesSkipped
 
