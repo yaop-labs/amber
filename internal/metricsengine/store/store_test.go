@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/metricsengine/engine"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/query"
@@ -70,6 +72,61 @@ func TestStoreSelectIncludesHead(t *testing.T) {
 	}
 	if len(series) != 1 || len(series[0].Values) != 2 {
 		t.Fatalf("series after flush = %+v, want one persisted series without duplicate head data", series)
+	}
+}
+
+// TestStoreReopenWithHistogramBlocks pins the reopen path for a store that
+// holds both scalar and histogram blocks: rebuildCatalogFromManifest and
+// reconcileLastTouchFromBlocks must skip Kind=histogram entries — reading an
+// MHB1 file with the scalar (MEB1) reader made every such store unopenable
+// ("invalid file magic"; found by the metrics benchmark campaign).
+func TestStoreReopenWithHistogramBlocks(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scalarLabels := model.LabelSet{
+		{Name: model.MetricNameLabel, Value: "http_requests_total"},
+		{Name: "job", Value: "api"},
+	}
+	if _, err := st.Append(scalarLabels, model.MetricTypeCounter, 1000, 1); err != nil {
+		t.Fatal(err)
+	}
+	histLabels := model.LabelSet{
+		{Name: model.MetricNameLabel, Value: "rpc_latency"},
+		{Name: "job", Value: "api"},
+	}
+	if _, err := st.AppendSketches([]engine.SketchSample{{
+		Labels:    histLabels,
+		Timestamp: 1000,
+		Exp: &histogram.ExponentialHistogram{
+			Scale:    2,
+			Positive: histogram.Buckets{Offset: 0, Counts: []uint64{1, 2, 1}},
+			Sum:      4,
+			Count:    4,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen with histogram blocks: %v", err)
+	}
+	defer reopened.Close()
+	hs, err := reopened.HistStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hs.Blocks != 1 || hs.Series != 1 {
+		t.Fatalf("hist stats after reopen = %+v, want blocks=1 series=1", hs)
 	}
 }
 
