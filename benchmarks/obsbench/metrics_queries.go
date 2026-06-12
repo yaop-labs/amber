@@ -266,11 +266,18 @@ func (promQuerier) Execute(ctx context.Context, client *http.Client, target Targ
 	default: // QM1, QM3, QM4: instant queries
 		var q string
 		if qi.Scenario == ScenarioQM3Quantile {
-			// Native-histogram form; systems without native-histogram
-			// support return empty and fail the equality gate — that is a
-			// finding, not a harness error.
-			q = fmt.Sprintf(`histogram_quantile(%g, sum by (%s) (rate(%s[%ds])))`,
-				qi.Quantile, qi.By, qi.Metric, winSec)
+			if target.Kind == "victoriametrics" {
+				// VictoriaMetrics rewrites OTLP exponential histograms into
+				// its own vmrange bucket series; MetricsQL histogram_quantile
+				// consumes those. Same group count, different sketch — a
+				// documented semantic difference (METHODOLOGY.md §6).
+				q = fmt.Sprintf(`histogram_quantile(%g, sum by (%s, vmrange) (rate(%s_bucket[%ds])))`,
+					qi.Quantile, qi.By, qi.Metric, winSec)
+			} else {
+				// Prometheus/Mimir native-histogram form.
+				q = fmt.Sprintf(`histogram_quantile(%g, sum by (%s) (rate(%s[%ds])))`,
+					qi.Quantile, qi.By, qi.Metric, winSec)
+			}
 		} else {
 			q = fmt.Sprintf(`sum by (%s) (rate(%s[%ds]))`, qi.By, qi.Metric, winSec)
 		}
