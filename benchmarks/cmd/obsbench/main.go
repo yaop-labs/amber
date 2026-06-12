@@ -48,6 +48,12 @@ func main() {
 		err = cmdVerify(os.Args[2:])
 	case "kill9":
 		err = cmdKill9(os.Args[2:])
+	case "metrics-ingest":
+		err = cmdMetricsIngest(os.Args[2:])
+	case "metrics-query":
+		err = cmdMetricsQuery(os.Args[2:])
+	case "metrics-verify":
+		err = cmdMetricsVerify(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -59,7 +65,195 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare|verify|kill9> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare|verify|kill9|metrics-ingest|metrics-query|metrics-verify> [flags]`)
+}
+
+// loadTarget resolves -config/-target, the boilerplate every subcommand shares.
+func loadTarget(configPath, targetName string) (obsbench.TargetConfig, error) {
+	if targetName == "" {
+		return obsbench.TargetConfig{}, fmt.Errorf("-target is required")
+	}
+	cfg, err := obsbench.LoadConfig(configPath)
+	if err != nil {
+		return obsbench.TargetConfig{}, err
+	}
+	target, ok := cfg.Targets[targetName]
+	if !ok {
+		return obsbench.TargetConfig{}, fmt.Errorf("target %q not in %s", targetName, configPath)
+	}
+	return target, nil
+}
+
+func cmdMetricsIngest(args []string) error {
+	fs := flag.NewFlagSet("metrics-ingest", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	seed := fs.Uint64("seed", 1, "series/value seed (same seed across systems = same workload)")
+	scalarSeries := fs.Int("scalar-series", 100_000, "active scalar series (half counters, half gauges)")
+	histSeries := fs.Int("hist-series", 10_000, "exponential-histogram series")
+	routes := fs.Int("routes", 1000, "route label cardinality (QM4 group-by target)")
+	churnPercent := fs.Int("churn-percent", 0, "percent of series replaced each churn epoch (I2; 0 = off)")
+	churnEvery := fs.Duration("churn-every", 5*time.Minute, "churn epoch length")
+	interval := fs.Duration("interval", 10*time.Second, "tick interval (one sample per series per tick)")
+	ticks := fs.Int("ticks", 0, "run length in ticks (required)")
+	workers := fs.Int("workers", 4, "concurrent senders")
+	batch := fs.Int("batch", 2000, "series per OTLP request")
+	out := fs.String("out", "", "write JSON summary here in addition to stdout")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("metrics-ingest: %w", err)
+	}
+	if *ticks <= 0 {
+		return fmt.Errorf("metrics-ingest: -ticks is required")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	res, err := obsbench.IngestMetrics(ctx, *targetName, target, obsbench.MetricsIngestOptions{
+		Gen: obsbench.MetricsGenConfig{
+			Seed:         *seed,
+			ScalarSeries: *scalarSeries,
+			HistSeries:   *histSeries,
+			Routes:       *routes,
+			ChurnPercent: *churnPercent,
+		},
+		Interval:    *interval,
+		Ticks:       *ticks,
+		ChurnEvery:  *churnEvery,
+		Workers:     *workers,
+		BatchSeries: *batch,
+	}, func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "metrics-ingest: "+format+"\n", args...)
+	})
+	if err != nil {
+		return err
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		return err
+	}
+	if *out != "" {
+		data, _ := json.MarshalIndent(res, "", "  ")
+		if err := os.WriteFile(*out, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cmdMetricsQuery(args []string) error {
+	fs := flag.NewFlagSet("metrics-query", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	scenarios := fs.String("scenarios", "all", "comma-separated scenario list or 'all'")
+	iterations := fs.Int("iterations", 30, "instances per scenario")
+	seed := fs.Uint64("seed", 1, "instance-parameter seed (same seed across systems = same queries)")
+	qps := fs.Int("qps", 0, "pace queries (0 = back-to-back)")
+	ingestSummary := fs.String("ingest-summary", "", "metrics ingest summary JSON; supplies the time window")
+	fromFlag := fs.String("from", "", "window start (RFC3339; overrides ingest summary)")
+	toFlag := fs.String("to", "", "window end (RFC3339; overrides ingest summary)")
+	out := fs.String("out", "", "results JSON path (required for compare)")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("metrics-query: %w", err)
+	}
+
+	opts := obsbench.MetricsQueryRunOptions{
+		Iterations: *iterations,
+		Seed:       *seed,
+		QPS:        *qps,
+	}
+	if *scenarios == "all" {
+		opts.Scenarios = obsbench.AllMetricsScenarios
+	} else {
+		opts.Scenarios = strings.Split(*scenarios, ",")
+	}
+
+	if *ingestSummary != "" {
+		data, err := os.ReadFile(*ingestSummary)
+		if err != nil {
+			return err
+		}
+		var ir obsbench.MetricsIngestResult
+		if err := json.Unmarshal(data, &ir); err != nil {
+			return fmt.Errorf("metrics ingest summary: %w", err)
+		}
+		opts.From, opts.To = ir.StartedAt, ir.FinishedAt
+	}
+	if *fromFlag != "" {
+		if opts.From, err = time.Parse(time.RFC3339, *fromFlag); err != nil {
+			return fmt.Errorf("-from: %w", err)
+		}
+	}
+	if *toFlag != "" {
+		if opts.To, err = time.Parse(time.RFC3339, *toFlag); err != nil {
+			return fmt.Errorf("-to: %w", err)
+		}
+	}
+	if opts.From.IsZero() || opts.To.IsZero() {
+		return fmt.Errorf("metrics-query: time window required (-ingest-summary or -from/-to)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	outcomes, err := obsbench.RunMetricsQueries(ctx, target, opts)
+	if err != nil {
+		return err
+	}
+
+	rf := obsbench.ResultFile{Target: *targetName, Outcomes: outcomes}
+	if *out != "" {
+		if err := obsbench.WriteResultFile(*out, rf); err != nil {
+			return err
+		}
+	}
+	printQuerySummary(rf)
+	return nil
+}
+
+func cmdMetricsVerify(args []string) error {
+	fs := flag.NewFlagSet("metrics-verify", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	ingestSummary := fs.String("ingest-summary", "", "metrics ingest summary JSON (required): expected scalar count + window")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("metrics-verify: %w", err)
+	}
+	if *ingestSummary == "" {
+		return fmt.Errorf("metrics-verify: -ingest-summary is required")
+	}
+	data, err := os.ReadFile(*ingestSummary)
+	if err != nil {
+		return err
+	}
+	var ir obsbench.MetricsIngestResult
+	if err := json.Unmarshal(data, &ir); err != nil {
+		return fmt.Errorf("metrics ingest summary: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	got, err := obsbench.CountQueryableMetricSamples(ctx, target, ir.StartedAt, ir.FinishedAt)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("queryable_scalar=%d sent_scalar=%d (hist sent=%d, verified per system)\n",
+		got, ir.SentScalar, ir.SentHist)
+	if got != ir.SentScalar {
+		return fmt.Errorf("metrics-verify: scalar count mismatch (silent loss or duplication) — numbers from this run are void")
+	}
+	return nil
 }
 
 func cmdVerify(args []string) error {

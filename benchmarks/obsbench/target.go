@@ -23,7 +23,8 @@ import (
 // same-client fairness baseline); "native" is the system's own bulk API
 // (documented per system, METHODOLOGY.md §5).
 type TargetConfig struct {
-	// Kind: amber | loki | victorialogs | otlp
+	// Kind: amber | loki | victorialogs (logs) | mimir | victoriametrics |
+	// prometheus (metrics; amber doubles as a metrics target).
 	Kind     string `yaml:"kind"`
 	BaseURL  string `yaml:"base_url"`
 	APIKey   string `yaml:"api_key,omitempty"`
@@ -31,6 +32,15 @@ type TargetConfig struct {
 	// OTLPPath overrides the OTLP logs path; systems mount it differently
 	// (amber /v1/logs, Loki /otlp/v1/logs, VictoriaLogs /insert/opentelemetry/v1/logs).
 	OTLPPath string `yaml:"otlp_path,omitempty"`
+	// OTLPMetricsPath overrides the OTLP metrics mount (defaults per kind in
+	// otlpMetricsPath).
+	OTLPMetricsPath string `yaml:"otlp_metrics_path,omitempty"`
+	// PromPrefix prepends the PromQL API mount (Mimir serves it under
+	// /prometheus; Prometheus and VictoriaMetrics at the root).
+	PromPrefix string `yaml:"prom_prefix,omitempty"`
+	// OrgID is sent as X-Scope-OrgID on every request when set (Mimir
+	// multitenancy; "anonymous" matches auth-disabled mode).
+	OrgID string `yaml:"org_id,omitempty"`
 }
 
 type Config struct {

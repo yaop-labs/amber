@@ -339,6 +339,9 @@ func getBody(ctx context.Context, client *http.Client, target TargetConfig, path
 	if target.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+target.APIKey)
 	}
+	if target.OrgID != "" {
+		req.Header.Set("X-Scope-OrgID", target.OrgID)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
