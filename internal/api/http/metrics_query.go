@@ -248,6 +248,149 @@ func parseEndParam(raw string) (int64, error) {
 	return t.UnixMilli(), nil
 }
 
+// MetricsRateRangeHandler serves GET /api/v1/metrics/rate_range:
+// per-step rate evaluation over [from, to], the range twin of /metrics/rate.
+type MetricsRateRangeHandler struct {
+	store *metricsengine.Store
+	log   *slog.Logger
+}
+
+func NewMetricsRateRangeHandler(store *metricsengine.Store, log *slog.Logger) *MetricsRateRangeHandler {
+	return &MetricsRateRangeHandler{store: store, log: log}
+}
+
+// rateRangeResponse is the JSON shape returned by GET /api/v1/metrics/rate_range.
+// Steps are aligned to from, from+step, ... and always cover to (the store
+// appends the final boundary when the span is not a step multiple).
+type rateRangeResponse struct {
+	Metric   string          `json:"metric"`
+	WindowMS int64           `json:"window_ms"`
+	FromMS   int64           `json:"from_ms"`
+	ToMS     int64           `json:"to_ms"`
+	StepMS   int64           `json:"step_ms"`
+	By       string          `json:"by,omitempty"`
+	Steps    []rateRangeStep `json:"steps"`
+}
+
+type rateRangeStep struct {
+	TimestampMS int64              `json:"ts_ms"`
+	Rates       map[string]float64 `json:"rates"`
+}
+
+func (h *MetricsRateRangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "metrics store disabled")
+		return
+	}
+	start := time.Now()
+	var ok bool
+	defer func() {
+		selfobs.MetricsQueryDuration.WithLabelValues("rate_range").Observe(time.Since(start).Seconds())
+		if !ok {
+			selfobs.MetricsQueryErrors.WithLabelValues("rate_range").Inc()
+			return
+		}
+		selfobs.MetricsQueryTotal.WithLabelValues("rate_range").Inc()
+	}()
+	q := r.URL.Query()
+	metric := strings.TrimSpace(q.Get("metric"))
+	if metric == "" {
+		writeError(w, http.StatusBadRequest, "metric is required")
+		return
+	}
+	window, err := parsePositiveDuration(q.Get("window"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "window: "+err.Error())
+		return
+	}
+	step, err := parsePositiveDuration(q.Get("step"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "step: "+err.Error())
+		return
+	}
+	rawFrom := strings.TrimSpace(q.Get("from"))
+	if rawFrom == "" {
+		writeError(w, http.StatusBadRequest, "from is required")
+		return
+	}
+	fromMillis, err := parseEndParam(rawFrom)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "from: "+err.Error())
+		return
+	}
+	toMillis := time.Now().UnixMilli()
+	if raw := strings.TrimSpace(q.Get("to")); raw != "" {
+		if toMillis, err = parseEndParam(raw); err != nil {
+			writeError(w, http.StatusBadRequest, "to: "+err.Error())
+			return
+		}
+	}
+	if toMillis < fromMillis {
+		writeError(w, http.StatusBadRequest, "to must be >= from")
+		return
+	}
+
+	by := strings.TrimSpace(q.Get("by"))
+	matchers := []metricsengine.Matcher{metricsengine.MetricName(metric)}
+	for _, raw := range q["selector"] {
+		k, v, found := strings.Cut(raw, "=")
+		if !found || k == "" {
+			writeError(w, http.StatusBadRequest, "selector "+strconv.Quote(raw)+": want key=value")
+			return
+		}
+		matchers = append(matchers, metricsengine.LabelEqual(k, v))
+	}
+
+	rs := metricsengine.RangeSelector{
+		Selector: metricsengine.NewSelector(matchers...),
+		Window:   window,
+	}
+	steps, err := h.store.RateByLabelRangeSteps(rs, fromMillis, toMillis, step, by)
+	if err != nil {
+		if !errors.Is(err, metricsengine.ErrNoSamples) {
+			h.log.Warn("metrics rate-range query failed", "metric", metric, "err", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		steps = nil
+	}
+
+	out := make([]rateRangeStep, len(steps))
+	for i, s := range steps {
+		rates := s.Values
+		if rates == nil {
+			rates = map[string]float64{}
+		}
+		out[i] = rateRangeStep{TimestampMS: s.TimestampMillis, Rates: rates}
+	}
+	writeJSON(w, http.StatusOK, rateRangeResponse{
+		Metric:   metric,
+		WindowMS: window.Milliseconds(),
+		FromMS:   fromMillis,
+		ToMS:     toMillis,
+		StepMS:   step.Milliseconds(),
+		By:       by,
+		Steps:    out,
+	})
+	ok = true
+}
+
+// parsePositiveDuration parses a required positive time.Duration query param.
+func parsePositiveDuration(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, errors.New("required (e.g. 5m)")
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, errors.New("must be positive")
+	}
+	return d, nil
+}
+
 // MetricsQuantileHandler serves GET /api/v1/metrics/quantile.
 // It answers one quantile over matching exponential histograms.
 type MetricsQuantileHandler struct {

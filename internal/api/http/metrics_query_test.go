@@ -109,6 +109,129 @@ func TestMetricsRate_StoreDisabledReturns503(t *testing.T) {
 	}
 }
 
+// TestMetricsRateRange_RoundTrip seeds a counter growing 1/s, queries
+// GET /api/v1/metrics/rate_range over the last two minutes with a 1m step,
+// and asserts the step grid and per-step rates match the wire contract.
+func TestMetricsRateRange_RoundTrip(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := time.Now().UnixMilli()
+	labels := metricsengine.LabelSet{
+		{Name: metricsengine.MetricNameLabel, Value: "http_requests_total"},
+		{Name: "job", Value: "api"},
+	}
+	var samples []metricsengine.Sample
+	for off := int64(300); off >= 0; off -= 30 {
+		samples = append(samples, metricsengine.Sample{
+			Labels: labels, Type: metricsengine.MetricTypeCounter,
+			Timestamp: now - off*1000, Value: 300 - off,
+		})
+	}
+	if _, err := h.metricStore.AppendBatch(samples); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	from := now - 120_000
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/rate_range?metric=http_requests_total&window=2m&step=1m&by=job"+
+			"&from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(now, 10), nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp rateRangeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Metric != "http_requests_total" || resp.By != "job" ||
+		resp.WindowMS != 120_000 || resp.StepMS != 60_000 ||
+		resp.FromMS != from || resp.ToMS != now {
+		t.Fatalf("envelope wrong: %+v", resp)
+	}
+	if len(resp.Steps) != 3 { // from, from+1m, to
+		t.Fatalf("steps = %d, want 3 (%+v)", len(resp.Steps), resp.Steps)
+	}
+	for i, s := range resp.Steps {
+		if want := from + int64(i)*60_000; s.TimestampMS != want {
+			t.Fatalf("step[%d] ts = %d, want %d", i, s.TimestampMS, want)
+		}
+		if got := s.Rates["api"]; got <= 0 {
+			t.Fatalf("step[%d] rates[api] = %v, want > 0", i, got)
+		}
+	}
+}
+
+// TestMetricsRateRange_NoMatchReturnsEmptySteps asserts a no-hit selector is
+// 200 with empty rate maps, mirroring /metrics/rate's empty-result contract.
+func TestMetricsRateRange_NoMatchReturnsEmptySteps(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := time.Now().UnixMilli()
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/rate_range?metric=does_not_exist&window=5m&step=1m"+
+			"&from="+strconv.FormatInt(now-120_000, 10)+"&to="+strconv.FormatInt(now, 10), nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp rateRangeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, s := range resp.Steps {
+		if len(s.Rates) != 0 {
+			t.Fatalf("expected empty rates, got %+v", resp.Steps)
+		}
+	}
+}
+
+// TestMetricsRateRange_BadParams covers the 400 paths.
+func TestMetricsRateRange_BadParams(t *testing.T) {
+	h := setupMetricsHarness(t)
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"missing metric", "/api/v1/metrics/rate_range?window=5m&step=1m&from=0"},
+		{"missing window", "/api/v1/metrics/rate_range?metric=x&step=1m&from=0"},
+		{"missing step", "/api/v1/metrics/rate_range?metric=x&window=5m&from=0"},
+		{"missing from", "/api/v1/metrics/rate_range?metric=x&window=5m&step=1m"},
+		{"bad window", "/api/v1/metrics/rate_range?metric=x&window=oops&step=1m&from=0"},
+		{"negative step", "/api/v1/metrics/rate_range?metric=x&window=5m&step=-1m&from=0"},
+		{"to before from", "/api/v1/metrics/rate_range?metric=x&window=5m&step=1m&from=1000&to=1"},
+		{"bad selector", "/api/v1/metrics/rate_range?metric=x&window=5m&step=1m&from=0&selector=novalue"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer secret")
+			rec := httptest.NewRecorder()
+			h.mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMetricsRateRange_StoreDisabledReturns503(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/v1/metrics/rate_range", NewMetricsRateRangeHandler(nil, nil))
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/metrics/rate_range?metric=x&window=5m&step=1m&from=0", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
 // TestMetricsList_ReturnsNames seeds two series with different __name__ values
 // and asserts both appear in GET /api/v1/metrics, sorted and deduplicated.
 func TestMetricsList_ReturnsNames(t *testing.T) {
