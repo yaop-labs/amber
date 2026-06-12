@@ -316,10 +316,7 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	registered := make([]struct {
-		id     uint64
-		labels model.LabelSet
-	}, 0, len(keys))
+	registered := make([]liveSeries, 0, len(keys))
 	for _, key := range keys {
 		id := s.catalog.NextID
 		if id == 0 {
@@ -330,22 +327,19 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		s.catalog.Series = append(s.catalog.Series, CatalogEntry{ID: id, Labels: labels})
 		s.catalogKeys[key] = id
 		s.engine.Registry().Import(index.SeriesID(id), labels)
-		registered = append(registered, struct {
-			id     uint64
-			labels model.LabelSet
-		}{id: id, labels: labels})
+		registered = append(registered, liveSeries{ID: id, Labels: labels})
 	}
 	// Persist to the append-only catalog log. INDEX_EVICTION_SPEC_v0
 	// §2: REGISTER per new series, O(1) per add. Replaces the legacy
 	// JSON saveCatalog rewrite (which was O(N) per add under s.mu —
 	// the catalog-mutex bottleneck identified in loadtest_v0 §4).
 	// loadCatalog (JSON) is still read at boot as a rollback-safety
-	// fallback for stores that pre-date 3a.
+	// fallback for stores that pre-date 3a. The whole batch rides one
+	// commit wait — per-series waits collapse ingest when a batch
+	// introduces thousands of series (metrics bench, 2026-06-12).
 	if s.catalogLog != nil {
-		for _, r := range registered {
-			if err := s.catalogLog.AppendRegister(r.id, r.labels); err != nil {
-				return fmt.Errorf("catalog log append: %w", err)
-			}
+		if err := s.catalogLog.AppendRegisterBatch(registered); err != nil {
+			return fmt.Errorf("catalog log append: %w", err)
 		}
 	}
 	return nil
