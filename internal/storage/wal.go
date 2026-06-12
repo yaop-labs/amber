@@ -173,17 +173,23 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 
 	for i, item := range items {
 		binary.LittleEndian.PutUint64(tsBuf[:], uint64(item.TS))
-		// Incremental CRC: ts then data. crc32.Update with IEEETable is
-		// the same poly as crc32.ChecksumIEEE — bytes hashed in order
-		// produce the same digest as one-shot over the concat.
-		crc := crc32.Update(0, crc32.IEEETable, tsBuf[:])
-		crc = crc32.Update(crc, crc32.IEEETable, item.Data)
 		length := uint32(8 + len(item.Data))
 
 		binary.LittleEndian.PutUint32(header[0:4], walMagic)
-		binary.LittleEndian.PutUint32(header[4:8], crc)
 		binary.LittleEndian.PutUint32(header[8:12], length)
 		binary.LittleEndian.PutUint64(header[12:20], firstSeq+uint64(i))
+
+		// Incremental CRC over length || seq || ts || data. Covering the
+		// header fields matters: an unprotected flipped bit in seq would
+		// make replay silently skip the record (seq <= synced watermark
+		// reads as "already in the segment") — undetected loss. crc32.Update
+		// with IEEETable is the same poly as crc32.ChecksumIEEE — bytes
+		// hashed in order produce the same digest as one-shot over the
+		// concat.
+		crc := crc32.Update(0, crc32.IEEETable, header[8:20])
+		crc = crc32.Update(crc, crc32.IEEETable, tsBuf[:])
+		crc = crc32.Update(crc, crc32.IEEETable, item.Data)
+		binary.LittleEndian.PutUint32(header[4:8], crc)
 
 		if _, err := w.buf.Write(header[:]); err != nil {
 			return 0, w.failStop(fmt.Errorf("wal: write header: %w", err))
@@ -243,14 +249,17 @@ func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
 
 func (w *WAL) writeRecord(payload []byte) (uint64, error) {
 	seq := w.nextSeq.Add(1) - 1
-	crc := crc32.ChecksumIEEE(payload)
 	length := uint32(len(payload))
 
 	var header [walHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], walMagic)
-	binary.LittleEndian.PutUint32(header[4:8], crc)
 	binary.LittleEndian.PutUint32(header[8:12], length)
 	binary.LittleEndian.PutUint64(header[12:20], seq)
+	// CRC covers length || seq || payload; see WriteBatchTS for why the
+	// header fields are included.
+	crc := crc32.Update(0, crc32.IEEETable, header[8:20])
+	crc = crc32.Update(crc, crc32.IEEETable, payload)
+	binary.LittleEndian.PutUint32(header[4:8], crc)
 
 	if _, err := w.buf.Write(header[:]); err != nil {
 		return 0, fmt.Errorf("wal: write header: %w", err)
@@ -321,7 +330,8 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 			return count, fmt.Errorf("wal: replay read payload: %w", err)
 		}
 
-		actualCRC := crc32.ChecksumIEEE(payload)
+		actualCRC := crc32.Update(0, crc32.IEEETable, header[8:20])
+		actualCRC = crc32.Update(actualCRC, crc32.IEEETable, payload)
 		if actualCRC != expectedCRC {
 			w.corruptCount.Add(1)
 			w.log.Warn("wal: crc mismatch, stopping replay", "offset_records", count)

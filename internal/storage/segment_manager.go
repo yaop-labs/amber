@@ -4,7 +4,9 @@ package storage
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -219,6 +221,23 @@ func (sm *SegmentManager) createNewSegment() error {
 	segPath := filepath.Join(sm.dir, fileName)
 
 	writer, err := OpenSegmentWriter(segPath)
+	if errors.Is(err, fs.ErrExist) {
+		// Crash window: the previous run died after creating this segment
+		// file but before saveMeta recorded it (found by the rotation-storm
+		// kill -9 test — recovery refused to open with "file exists").
+		// Such an orphan holds no acked data: rotate truncates the WAL
+		// before createNewSegment, and no Write is accepted until saveMeta
+		// below returns. Recreating it is safe. Anything larger than a bare
+		// header contradicts that invariant — fail stop instead of deleting
+		// what might be data.
+		if info, statErr := os.Stat(segPath); statErr == nil && info.Size() > segHeaderSize {
+			return fmt.Errorf("segmgr: segment file %s exists with %d bytes but is not in meta — refusing to overwrite", fileName, info.Size())
+		}
+		if rmErr := os.Remove(segPath); rmErr != nil {
+			return fmt.Errorf("segmgr: remove orphan segment %s: %w", fileName, rmErr)
+		}
+		writer, err = OpenSegmentWriter(segPath)
+	}
 	if err != nil {
 		return fmt.Errorf("segmgr: create segment %d: %w", id, err)
 	}

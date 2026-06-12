@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,11 @@ import (
 // crashWriterEnv is set in the subprocess that writes records until killed.
 // Its value is the data directory path.
 const crashWriterEnv = "AMBER_CRASH_WRITER_DIR"
+
+// crashWriterMaxRecEnv overrides the writer's rotation threshold. Small
+// values force a rotation every few hundred milliseconds, so a random kill
+// lands inside the seal/saveMeta/WAL-truncate window with high probability.
+const crashWriterMaxRecEnv = "AMBER_CRASH_WRITER_MAXREC"
 
 // markerFile is written atomically (write+rename) after every successful WAL
 // sync. It records how many records are guaranteed durable at subprocess death.
@@ -33,8 +39,17 @@ func TestMain(m *testing.M) {
 // After each successful Write(), it atomically updates markerFile with the
 // current durable count. The parent reads this file after SIGKILL.
 func runCrashWriter(dir string) {
+	maxRecords := uint64(10_000)
+	if v := os.Getenv(crashWriterMaxRecEnv); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "crash writer: bad %s=%q: %v\n", crashWriterMaxRecEnv, v, err)
+			os.Exit(1)
+		}
+		maxRecords = n
+	}
 	sm, err := OpenSegmentManager(dir, RotationPolicy{
-		MaxRecords: 10_000,
+		MaxRecords: maxRecords,
 		MaxBytes:   0,
 	})
 	if err != nil {
@@ -116,7 +131,15 @@ func TestSegmentManager_CrashDurability(t *testing.T) {
 	}
 	_ = cmd.Wait()
 
-	// How many records does the subprocess guarantee durable?
+	verifyCrashDurability(t, dir)
+}
+
+// verifyCrashDurability recovers the killed writer's data dir and checks the
+// core invariant: every record the subprocess confirmed durable (markerFile)
+// is present exactly once — no loss, no duplicates.
+func verifyCrashDurability(t *testing.T, dir string) {
+	t.Helper()
+
 	durableCount, err := readMarker(dir)
 	if err != nil {
 		t.Fatalf("read durable marker: %v (subprocess may not have written any records)", err)
@@ -203,4 +226,48 @@ func TestSegmentManager_CrashDurability(t *testing.T) {
 
 	t.Logf("result: %d durable, %d recovered, %d lost, %d duped",
 		durableCount, len(seen), lost, duped)
+}
+
+// TestSegmentManager_CrashDurability_RotationStorm kills the writer while it
+// rotates every 100 records, so SIGKILL lands inside the seal protocol —
+// footer write, saveMeta, WAL truncate, createNewSegment — instead of the
+// steady write loop. Several kills at randomized offsets sample different
+// points of that window; the invariant is the same: no loss, no duplicates.
+func TestSegmentManager_CrashDurability_RotationStorm(t *testing.T) {
+	if testing.Short() {
+		t.Skip("crash durability test skipped in short mode")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	for iter := range 3 {
+		t.Run(fmt.Sprintf("kill_%d", iter), func(t *testing.T) {
+			dir := t.TempDir()
+
+			cmd := exec.Command(exe, "-test.run=^TestSegmentManager_CrashDurability_RotationStorm$")
+			cmd.Env = append(os.Environ(),
+				crashWriterEnv+"="+dir,
+				crashWriterMaxRecEnv+"=100",
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start subprocess: %v", err)
+			}
+
+			sleep := time.Duration(150+rand.IntN(250)) * time.Millisecond
+			t.Logf("killing writer after %v", sleep)
+			time.Sleep(sleep)
+
+			if err := cmd.Process.Kill(); err != nil {
+				t.Fatalf("kill subprocess: %v", err)
+			}
+			_ = cmd.Wait()
+
+			verifyCrashDurability(t, dir)
+		})
+	}
 }
