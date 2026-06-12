@@ -30,8 +30,17 @@ import (
 // multilingual pipeline processes bodies at index time and queries at search
 // time; multi-token queries AND their posting lists.
 type FTSIndex struct {
-	// build-mode state: token -> sorted entry IDs. Nil after load.
-	building map[string]*postingBuilder
+	// Build-mode state, nil after seal or load. Unique tokens are
+	// deduplicated through a hash → entry-index map with byte-verified
+	// collision chains; token bytes live in one shared arena. The previous
+	// map[string]*postingBuilder cost four allocations per unique token
+	// (map key string, builder, its ids slice, map growth) — ~1M tokens per
+	// 100k-record segment made the build state the dominant transient heap
+	// during seals. byHash has pointer-free keys and values, so the GC never
+	// scans it.
+	arena   []byte
+	entries []ftsBuildEntry
+	byHash  map[uint64]int32
 
 	// sealed dictionary: tokens with df >= 2 (template words; tens of
 	// thousands per segment).
@@ -72,8 +81,15 @@ func tokenHash(tok string) uint64 {
 	return h
 }
 
-type postingBuilder struct {
-	ids      []uint64
+// ftsBuildEntry is one unique token's build state. The first entry ID is
+// inlined: ~80% of tokens are df==1 (UUID stems) and never allocate a rest
+// slice. next chains entries whose token hashes collide; -1 ends the chain.
+type ftsBuildEntry struct {
+	firstID  uint64
+	rest     []uint64
+	tokOff   uint32
+	tokLen   uint32
+	next     int32
 	unsorted bool
 }
 
@@ -84,74 +100,128 @@ func TokenizeFTS(text string) []string {
 }
 
 func NewFTSIndex() *FTSIndex {
-	return &FTSIndex{building: make(map[string]*postingBuilder)}
+	return &FTSIndex{byHash: make(map[uint64]int32)}
+}
+
+func (f *FTSIndex) tokenBytes(i int32) []byte {
+	e := &f.entries[i]
+	return f.arena[e.tokOff : e.tokOff+e.tokLen]
 }
 
 // Index adds one record's body. Entry IDs normally arrive in ascending order
 // (segment scan order); out-of-order IDs are tolerated and sorted at Save.
 func (f *FTSIndex) Index(_ context.Context, entryID uint64, body string) error {
-	if f.building == nil {
+	if f.byHash == nil {
 		return errors.New("fts: index is sealed")
 	}
 	for _, tok := range TokenizeFTS(body) {
 		if tok == "" {
 			continue
 		}
-		pb := f.building[tok]
-		if pb == nil {
-			pb = &postingBuilder{}
-			f.building[tok] = pb
-		}
-		if n := len(pb.ids); n > 0 {
-			last := pb.ids[n-1]
-			if last == entryID {
-				continue // repeated token within one body
-			}
-			if entryID < last {
-				pb.unsorted = true
+		h := tokenHash(tok)
+		ei := int32(-1)
+		head, ok := f.byHash[h]
+		if ok {
+			for i := head; i >= 0; i = f.entries[i].next {
+				if string(f.tokenBytes(i)) == tok {
+					ei = i
+					break
+				}
 			}
 		}
-		pb.ids = append(pb.ids, entryID)
+		if ei < 0 {
+			off := uint32(len(f.arena))
+			f.arena = append(f.arena, tok...)
+			next := int32(-1)
+			if ok {
+				next = head
+			}
+			f.entries = append(f.entries, ftsBuildEntry{
+				firstID: entryID,
+				tokOff:  off,
+				tokLen:  uint32(len(tok)),
+				next:    next,
+			})
+			f.byHash[h] = int32(len(f.entries) - 1)
+			continue
+		}
+		e := &f.entries[ei]
+		last := e.firstID
+		if n := len(e.rest); n > 0 {
+			last = e.rest[n-1]
+		}
+		if last == entryID {
+			continue // repeated token within one body
+		}
+		if entryID < last {
+			e.unsorted = true
+		}
+		e.rest = append(e.rest, entryID)
 	}
 	return nil
 }
 
-// seal converts build-mode maps into the flat sorted form: df>=2 tokens go
+// TokenKeys returns one key per unique token, for the FTS ribbon filter.
+// Build-mode only (empty after seal or load); keys alias the token arena
+// and stay valid as long as the caller holds them, even across seal.
+func (f *FTSIndex) TokenKeys() [][]byte {
+	keys := make([][]byte, len(f.entries))
+	for i := range f.entries {
+		keys[i] = f.tokenBytes(int32(i))
+	}
+	return keys
+}
+
+// seal converts build-mode state into the flat sorted form: df>=2 tokens go
 // to the dictionary, df==1 tokens to the unique hash section.
 func (f *FTSIndex) seal() {
-	if f.building == nil {
+	if f.byHash == nil {
 		return
 	}
 
 	type uniqPair struct{ hash, id uint64 }
 	var uniqs []uniqPair
-	tokens := make([]string, 0, len(f.building))
-	for tok, pb := range f.building {
-		if pb.unsorted {
-			sort.Slice(pb.ids, func(a, b int) bool { return pb.ids[a] < pb.ids[b] })
-			pb.ids = dedupSorted(pb.ids)
+	var dict []int32
+	for h, head := range f.byHash {
+		for i := head; i >= 0; i = f.entries[i].next {
+			e := &f.entries[i]
+			if e.rest == nil {
+				uniqs = append(uniqs, uniqPair{h, e.firstID})
+				continue
+			}
+			ids := make([]uint64, 0, len(e.rest)+1)
+			ids = append(ids, e.firstID)
+			ids = append(ids, e.rest...)
+			if e.unsorted {
+				slices.Sort(ids)
+				ids = dedupSorted(ids)
+			}
+			if len(ids) == 1 {
+				uniqs = append(uniqs, uniqPair{h, ids[0]})
+				continue
+			}
+			e.rest = ids
+			dict = append(dict, i)
 		}
-		if len(pb.ids) == 1 {
-			uniqs = append(uniqs, uniqPair{tokenHash(tok), pb.ids[0]})
-			continue
-		}
-		tokens = append(tokens, tok)
 	}
-	sort.Strings(tokens)
+	slices.SortFunc(dict, func(a, b int32) int {
+		return bytes.Compare(f.tokenBytes(a), f.tokenBytes(b))
+	})
 
-	f.tokens = tokens
-	f.postings = make([][]byte, len(tokens))
-	f.counts = make([]int, len(tokens))
-	for i, tok := range tokens {
-		pb := f.building[tok]
-		blob := make([]byte, 0, len(pb.ids)*2)
+	f.tokens = make([]string, len(dict))
+	f.postings = make([][]byte, len(dict))
+	f.counts = make([]int, len(dict))
+	for di, i := range dict {
+		e := &f.entries[i]
+		f.tokens[di] = string(f.tokenBytes(i))
+		blob := make([]byte, 0, len(e.rest)*2)
 		var prev uint64
-		for _, id := range pb.ids {
+		for _, id := range e.rest {
 			blob = binary.AppendUvarint(blob, id-prev)
 			prev = id
 		}
-		f.postings[i] = blob
-		f.counts[i] = len(pb.ids)
+		f.postings[di] = blob
+		f.counts[di] = len(e.rest)
 	}
 
 	sort.Slice(uniqs, func(a, b int) bool { return uniqs[a].hash < uniqs[b].hash })
@@ -161,7 +231,7 @@ func (f *FTSIndex) seal() {
 		binary.BigEndian.PutUint64(f.uniqHashes[i*8:], u.hash)
 		binary.BigEndian.PutUint64(f.uniqIDs[i*8:], u.id)
 	}
-	f.building = nil
+	f.arena, f.entries, f.byHash = nil, nil, nil
 }
 
 // lookupUnique returns the entry IDs of df==1 tokens matching the hash

@@ -37,7 +37,6 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	fts := NewFTSIndex()
 	posting := NewPostingListBuilder(16)
 	var traceKeys [][]byte
-	ftsTokens := make(map[string]struct{}, 4096)
 	ctx := context.Background()
 	var skipped int
 
@@ -63,11 +62,6 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 			if err := fts.Index(ctx, entryID, entry.Body); err != nil {
 				return err
 			}
-			for _, tok := range TokenizeFTS(entry.Body) {
-				if tok != "" {
-					ftsTokens[tok] = struct{}{}
-				}
-			}
 		}
 
 		if !model.IsZeroTraceID(entry.TraceID) {
@@ -88,6 +82,10 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	if err := bitmap.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
 	}
+	// The FTS ribbon's keys come straight from the FTS build state — one key
+	// per unique token, no second tokenize pass, no separate token set. Must
+	// be taken before Save seals the index and drops that state.
+	tokenKeys := fts.TokenKeys()
 	if err := fts.Save(segmentPath + ".fidx"); err != nil {
 		return nil, err
 	}
@@ -107,10 +105,6 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 		out.Ribbon = ribbon
 	}
 
-	tokenKeys := make([][]byte, 0, len(ftsTokens))
-	for tok := range ftsTokens {
-		tokenKeys = append(tokenKeys, []byte(tok))
-	}
 	if ftsRibbon, err := BuildRibbonFilter(tokenKeys, 8); err != nil {
 		if log != nil {
 			log.Warn("seal_builder: fts ribbon failed, queries fall back to scan", "path", segmentPath, "err", err)

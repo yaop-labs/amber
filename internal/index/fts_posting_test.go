@@ -74,6 +74,87 @@ func TestFTSIndex_BuildSpeed(t *testing.T) {
 	}
 }
 
+// BenchmarkFTSIndexBuild tracks the transient cost of building one segment's
+// FTS index: 100k UUID-bearing bodies, the shape that made the old
+// map[string]*postingBuilder build state the dominant seal-time allocation.
+func BenchmarkFTSIndexBuild(b *testing.B) {
+	bodies := make([]string, 100_000)
+	for i := range bodies {
+		bodies[i] = fmt.Sprintf("request completed method=GET status=200 duration_ms=%d req_id=%08x-dead-beef-cafe-%012x", i, i*7, i*13)
+	}
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		idx := NewFTSIndex()
+		for i, body := range bodies {
+			if err := idx.Index(ctx, uint64(i+1), body); err != nil {
+				b.Fatal(err)
+			}
+		}
+		idx.seal()
+	}
+}
+
+// TestFTSIndex_HashCollisionChain pins the build-state collision contract:
+// entries chained under one hash are resolved by comparing token bytes, and
+// df==1 tokens sharing a hash land adjacent in the unique section so lookup
+// returns all of them (a collision may add a foreign record, never lose one).
+func TestFTSIndex_HashCollisionChain(t *testing.T) {
+	idx := NewFTSIndex()
+	// Craft two distinct tokens chained under one hash, as a real fnv64
+	// collision would leave them (same map key, byte-verified chain).
+	idx.arena = []byte("aaaabbbb")
+	idx.entries = []ftsBuildEntry{
+		{firstID: 1, tokOff: 0, tokLen: 4, next: -1}, // "aaaa"
+		{firstID: 2, tokOff: 4, tokLen: 4, next: 0},  // "bbbb" → chains to "aaaa"
+	}
+	h := tokenHash("aaaa")
+	idx.byHash = map[uint64]int32{h: 1}
+
+	// Indexing "aaaa" again must walk the chain past "bbbb" and hit the
+	// existing entry instead of creating a duplicate.
+	if err := idx.Index(context.Background(), 7, "aaaa"); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if len(idx.entries) != 2 {
+		t.Fatalf("chain walk missed: %d entries, want 2", len(idx.entries))
+	}
+
+	idx.seal()
+	// "aaaa" is now df==2 → dictionary; "bbbb" stays unique under h.
+	if len(idx.tokens) != 1 || idx.tokens[0] != "aaaa" {
+		t.Fatalf("dict = %v, want [aaaa]", idx.tokens)
+	}
+	if got := idx.lookup("aaaa"); len(got) != 2 || got[0] != 1 || got[1] != 7 {
+		t.Fatalf("lookup(aaaa) = %v, want [1 7]", got)
+	}
+	if got := idx.lookupUnique("aaaa"); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("lookupUnique under collision hash = %v, want [2]", got)
+	}
+}
+
+func TestFTSIndex_TokenKeys(t *testing.T) {
+	idx := NewFTSIndex()
+	ctx := context.Background()
+	_ = idx.Index(ctx, 1, "payment timeout")
+	_ = idx.Index(ctx, 2, "payment authorized")
+
+	keys := idx.TokenKeys()
+	got := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		got[string(k)] = true
+	}
+	// "authorized" stems to "author" in the multilingual pipeline.
+	for _, want := range []string{"payment", "timeout", "author"} {
+		if !got[want] {
+			t.Fatalf("TokenKeys missing %q: %v", want, got)
+		}
+	}
+	if len(keys) != 3 {
+		t.Fatalf("TokenKeys = %d keys, want 3 unique", len(keys))
+	}
+}
+
 func TestFTSIndex_MultiTokenAND(t *testing.T) {
 	idx := NewFTSIndex()
 	ctx := context.Background()
