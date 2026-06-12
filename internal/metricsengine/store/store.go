@@ -369,6 +369,7 @@ func (s *Store) Flush() (string, error) {
 		MinTime:     minTime,
 		MaxTime:     maxTime,
 		SeriesCount: len(dir.Series),
+		SampleCount: directorySampleCount(dir),
 		LabelValues: labelValues(dir),
 	}
 
@@ -440,6 +441,12 @@ func (s *Store) Flush() (string, error) {
 		}
 	}
 	if meta.SeriesCount > 0 {
+		for key := range s.directoryCache {
+			if len(s.directoryCache) < maxCachedDirectories {
+				break
+			}
+			delete(s.directoryCache, key)
+		}
 		s.directoryCache[path] = dir
 	}
 	if meta.SeriesCount == 0 && histPath == "" {
@@ -541,6 +548,7 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 				MinTime:     minTime,
 				MaxTime:     maxTime,
 				SeriesCount: len(dirInfo.Series),
+				SampleCount: directorySampleCount(dirInfo),
 				LabelValues: labelValues(dirInfo),
 			}
 		}
@@ -720,6 +728,7 @@ func (s *Store) Compact() (string, error) {
 		MinTime:     minTime,
 		MaxTime:     maxTime,
 		SeriesCount: len(dir.Series),
+		SampleCount: directorySampleCount(dir),
 		LabelValues: labelValues(dir),
 	})
 	if err := saveManifest(s.dir, s.manifest); err != nil {
@@ -1265,13 +1274,19 @@ func (s *Store) Stats() (Stats, error) {
 		if meta.Kind != "" {
 			continue
 		}
+		if meta.SampleCount > 0 || meta.SeriesCount == 0 {
+			stats.Samples += meta.SampleCount
+			continue
+		}
+		// Legacy manifest entry without sample_count: one directory read.
+		// Loading every directory here is what Stats must never go back to —
+		// 100k-series directories × all blocks blew the heap through the
+		// soft memory limit and a stats call took minutes of GC assist.
 		dir, err := s.readDirectory(path)
 		if err != nil {
 			return Stats{}, err
 		}
-		for _, entry := range dir.Series {
-			stats.Samples += entry.ValueN
-		}
+		stats.Samples += directorySampleCount(dir)
 	}
 	return stats, nil
 }
@@ -1291,6 +1306,13 @@ func (s *Store) setBackgroundError(err error) {
 	s.backgroundErrMu.Unlock()
 }
 
+// maxCachedDirectories bounds the directory cache. A directory of a
+// 100k-series block holds every label set (~tens of MB); an unbounded cache
+// over a few dozen such blocks exceeds the soft memory limit and turns every
+// allocation into GC assist. Eviction is random (map order) — recency
+// tracking isn't worth the bookkeeping at this size.
+const maxCachedDirectories = 8
+
 func (s *Store) readDirectory(path string) (block.Directory, error) {
 	s.mu.RLock()
 	dir, ok := s.directoryCache[path]
@@ -1303,6 +1325,12 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 		return block.Directory{}, err
 	}
 	s.mu.Lock()
+	for key := range s.directoryCache {
+		if len(s.directoryCache) < maxCachedDirectories {
+			break
+		}
+		delete(s.directoryCache, key)
+	}
 	s.directoryCache[path] = dir
 	s.mu.Unlock()
 	return dir, nil

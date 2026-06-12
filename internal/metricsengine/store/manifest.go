@@ -21,12 +21,29 @@ type Manifest struct {
 const BlockKindHistogram = "hist"
 
 type BlockMeta struct {
-	Path        string              `json:"path"`
-	Kind        string              `json:"kind,omitempty"`
-	MinTime     int64               `json:"min_time"`
-	MaxTime     int64               `json:"max_time"`
-	SeriesCount int                 `json:"series_count"`
+	Path        string `json:"path"`
+	Kind        string `json:"kind,omitempty"`
+	MinTime     int64  `json:"min_time"`
+	MaxTime     int64  `json:"max_time"`
+	SeriesCount int    `json:"series_count"`
+	// SampleCount is the scalar sample total of the block, recorded at write
+	// time so Stats never has to load block directories (at 100k-series
+	// blocks the directory loads blew the heap straight through the soft
+	// memory limit — GC assist turned a stats call into minutes).
+	// 0 on manifests written before the field existed; Stats falls back to
+	// one directory read for those.
+	SampleCount int                 `json:"sample_count,omitempty"`
 	LabelValues map[string][]string `json:"label_values,omitempty"`
+}
+
+// directorySampleCount sums per-series sample counts of a scalar block
+// directory for BlockMeta.SampleCount.
+func directorySampleCount(dir block.Directory) int {
+	n := 0
+	for _, entry := range dir.Series {
+		n += entry.ValueN
+	}
+	return n
 }
 
 func loadManifest(dir string) (Manifest, error) {
@@ -112,6 +129,7 @@ func rebuildManifest(dir string) (Manifest, error) {
 			MinTime:     minTime,
 			MaxTime:     maxTime,
 			SeriesCount: len(directory.Series),
+			SampleCount: directorySampleCount(directory),
 			LabelValues: labelValues(directory),
 		})
 	}
