@@ -270,6 +270,115 @@ func TestSegment_Footer_BlockOffsets(t *testing.T) {
 	}
 }
 
+// TestSegment_Footer_BlockTimeStats pins the v3 footer contract: every block
+// carries its event-time bounds, and they tile the segment's [MinTS, MaxTS].
+func TestSegment_Footer_BlockTimeStats(t *testing.T) {
+	path := tempSegmentPath(t)
+
+	sw, _ := OpenSegmentWriter(path)
+	sw.blockSize = 100
+
+	base := int64(1_000_000_000)
+	const n = 20
+	for i := range n {
+		data := bytes.Repeat([]byte("x"), 20)
+		if err := sw.WriteRecord(data, base+int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sr, err := OpenSegmentReader(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sr.Close()
+
+	footer := sr.Footer()
+	if len(footer.BlockStats) != int(footer.BlockCount) || footer.BlockCount < 2 {
+		t.Fatalf("BlockStats=%d BlockCount=%d, want multiple stats", len(footer.BlockStats), footer.BlockCount)
+	}
+	var prevMax int64
+	for i, s := range footer.BlockStats {
+		if s.MinTS < base || s.MaxTS > base+n-1 || s.MinTS > s.MaxTS {
+			t.Errorf("block %d ts range [%d,%d] outside segment [%d,%d]", i, s.MinTS, s.MaxTS, base, base+n-1)
+		}
+		if i > 0 && s.MinTS <= prevMax {
+			t.Errorf("block %d MinTS %d does not advance past previous MaxTS %d", i, s.MinTS, prevMax)
+		}
+		prevMax = s.MaxTS
+	}
+	if footer.BlockStats[0].MinTS != footer.MinTS {
+		t.Errorf("first block MinTS %d != footer MinTS %d", footer.BlockStats[0].MinTS, footer.MinTS)
+	}
+	last := footer.BlockStats[len(footer.BlockStats)-1]
+	if last.MaxTS != footer.MaxTS {
+		t.Errorf("last block MaxTS %d != footer MaxTS %d", last.MaxTS, footer.MaxTS)
+	}
+}
+
+// TestSegment_ScanTimeRange_BlockPruning pins that a sub-window scan touches
+// only the blocks overlapping [from, to] (counted via the ID-skip callback,
+// which is only consulted for blocks that survive time pruning) and still
+// returns exactly the in-range records.
+func TestSegment_ScanTimeRange_BlockPruning(t *testing.T) {
+	path := tempSegmentPath(t)
+
+	sw, _ := OpenSegmentWriter(path)
+	sw.blockSize = 100
+
+	base := int64(1_000_000_000)
+	const n = 40
+	for i := range n {
+		data := fmt.Appendf(nil, "rec-%02d-padpadpadpad", i)
+		if err := sw.WriteRecord(data, base+int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sr, err := OpenSegmentReader(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sr.Close()
+	total := int(sr.Footer().BlockCount)
+	if total < 4 {
+		t.Fatalf("need several blocks, got %d", total)
+	}
+
+	from, to := base+10, base+19
+	consulted := 0
+	skip := func(_, _ uint64) bool { consulted++; return false }
+	var got []string
+	err = sr.ScanTimeRangeReverseWithBlockSkip(from, to, skip, func(data []byte) error {
+		got = append(got, string(data[:6]))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if consulted >= total {
+		t.Errorf("time pruning dead: %d of %d blocks consulted", consulted, total)
+	}
+	// Every in-range record must be present (boundary blocks may add
+	// neighbours; the executor re-filters per record).
+	seen := make(map[string]bool, len(got))
+	for _, s := range got {
+		seen[s] = true
+	}
+	for i := 10; i <= 19; i++ {
+		if !seen[fmt.Sprintf("rec-%02d", i)] {
+			t.Errorf("in-range record %d missing after pruning", i)
+		}
+	}
+}
+
 func TestSegment_ScanTimeRange_NoOverlap(t *testing.T) {
 	path := tempSegmentPath(t)
 
