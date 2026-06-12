@@ -57,3 +57,11 @@ retention:
     max_age: 0s          # обычно короче чем у logs
     max_bytes: 0
     max_segments: 0
+
+runtime:
+  # Soft memory limit рантайма Go в байтах (debug.SetMemoryLimit,
+  # аналог GOMEMLIMIT; заданное здесь значение перекрывает env).
+  # GC начинает работать агрессивнее при приближении к лимиту —
+  # это потолок для пиков RSS ценой чуть большей нагрузки на CPU.
+  # 0 = отключено.
+  memory_limit: 0       # пример: 838860800 (800 MiB)

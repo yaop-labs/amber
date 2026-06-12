@@ -17,7 +17,15 @@ type Config struct {
 	Log       LogConfig       `yaml:"log"`
 	Retention RetentionConfig `yaml:"retention"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
+	Runtime   RuntimeConfig   `yaml:"runtime"`
 	Debug     DebugConfig     `yaml:"debug"`
+}
+
+// RuntimeConfig tunes the Go runtime for the standalone server.
+type RuntimeConfig struct {
+	// MemoryLimit sets the Go runtime soft memory limit in bytes
+	// (debug.SetMemoryLimit; overrides GOMEMLIMIT). Zero disables it.
+	MemoryLimit int64 `yaml:"memory_limit"`
 }
 
 // MetricsConfig configures the embedded metrics store.
@@ -260,6 +268,9 @@ func (c *Config) Validate() error {
 	}
 	if c.API.HTTPAddr == "" {
 		return fmt.Errorf("api.http_addr is required")
+	}
+	if c.Runtime.MemoryLimit < 0 {
+		return fmt.Errorf("runtime.memory_limit must be positive when set")
 	}
 	return nil
 }

@@ -89,6 +89,12 @@ type Options struct {
 	S3                S3Storage
 	Metrics           Metrics
 	Logger            *slog.Logger
+
+	// MemoryLimit sets the Go runtime soft memory limit in bytes via
+	// debug.SetMemoryLimit. The limit is process-wide: it affects the host
+	// application too, overrides GOMEMLIMIT, and stays in effect after
+	// Close. Zero (default) leaves the runtime setting untouched.
+	MemoryLimit int64
 }
 
 type IngestLane struct {
@@ -117,6 +123,7 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 		DataDir:        dataDir,
 		Logger:         o.Logger,
 		IndexCacheSize: o.IndexCacheSize,
+		MemoryLimit:    o.MemoryLimit,
 		Storage: runtime.StorageOptions{
 			SegmentMaxRecords:  o.SegmentMaxRecords,
 			SegmentMaxBytes:    o.SegmentMaxBytes,

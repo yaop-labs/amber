@@ -53,6 +53,7 @@ func run() error {
 		DataDir:        cfg.Storage.DataDir,
 		Logger:         log,
 		IndexCacheSize: cfg.Storage.IndexCacheSize,
+		MemoryLimit:    cfg.Runtime.MemoryLimit,
 		Storage: runtime.StorageOptions{
 			SegmentMaxRecords:  cfg.Storage.SegmentMaxRecords,
 			SegmentMaxBytes:    cfg.Storage.SegmentMaxBytes,

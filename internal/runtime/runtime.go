@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,11 @@ type Options struct {
 	Cardinality    CardinalityOptions
 	Metrics        MetricsOptions
 	IndexCacheSize int
+	// MemoryLimit sets the Go runtime soft memory limit in bytes
+	// (debug.SetMemoryLimit). Process-wide and sticky: it overrides
+	// GOMEMLIMIT and stays in effect after Close. Zero leaves the
+	// runtime (or GOMEMLIMIT) setting untouched.
+	MemoryLimit int64
 }
 
 // MetricsOptions configures the embedded metrics store.
@@ -163,6 +169,11 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		return nil, errors.New("runtime: DataDir required")
 	}
 	cfg := opts.withDefaults()
+
+	if cfg.MemoryLimit > 0 {
+		debug.SetMemoryLimit(cfg.MemoryLimit)
+		cfg.Logger.Info("go runtime memory limit set", "bytes", cfg.MemoryLimit)
+	}
 
 	// Exclusive lock on the data dir: a second writer (another amber process
 	// or another embedded Open) would silently corrupt WAL/segments/meta.

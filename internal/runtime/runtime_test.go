@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"testing"
 	"time"
 
@@ -36,6 +37,34 @@ func TestNewReturnsMetricStoreOpenErrorWithoutHanging(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("New hung after metric store open failure")
+	}
+}
+
+func TestNewSetsMemoryLimit(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	defer debug.SetMemoryLimit(prev)
+
+	const limit = 8 << 30 // high enough to never throttle the test binary
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stack, err := New(ctx, Options{
+		DataDir:     t.TempDir(),
+		MemoryLimit: limit,
+		Metrics:     MetricsOptions{Disabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		_ = stack.Close(closeCtx)
+	}()
+
+	if got := debug.SetMemoryLimit(-1); got != limit {
+		t.Fatalf("memory limit = %d, want %d", got, limit)
 	}
 }
 

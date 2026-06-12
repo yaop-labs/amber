@@ -72,6 +72,8 @@ retention:
     max_segments: 10
   spans:
     max_age: 72h
+runtime:
+  memory_limit: 838860800
 `
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
@@ -120,6 +122,9 @@ retention:
 	}
 	if cfg.Retention.Spans.MaxAge != 72*time.Hour {
 		t.Errorf("Spans.MaxAge: got %v", cfg.Retention.Spans.MaxAge)
+	}
+	if cfg.Runtime.MemoryLimit != 838860800 {
+		t.Errorf("Runtime.MemoryLimit: got %d", cfg.Runtime.MemoryLimit)
 	}
 }
 
@@ -197,6 +202,14 @@ func TestValidate_InvalidLaneQueueSize(t *testing.T) {
 	cfg.Ingest.Logs.QueueSize = -1
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for negative logs queue_size")
+	}
+}
+
+func TestValidate_NegativeMemoryLimit(t *testing.T) {
+	cfg := Default()
+	cfg.Runtime.MemoryLimit = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for negative memory_limit")
 	}
 }
 
