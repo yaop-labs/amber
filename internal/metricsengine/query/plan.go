@@ -278,8 +278,18 @@ func rateExecutionPath(stats CandidateStats) ExecutionPath {
 	return PathCoalescedSummaries
 }
 
+// SummaryStepCeiling bounds the streaming range-step summary path. That path
+// keeps one RateSummary per step per matching series, so its footprint grows
+// with steps × series; past this many steps the exact materialization path is
+// the cheaper of the two. 32 covers typical coarse dashboard grids (the
+// metrics campaign's QM2 uses ~20 steps over ~15 blocks) while rejecting fine
+// pixel-resolution grids whose summary map would dwarf the sample set it
+// replaces. The store execution gate (preferRangeStepSummaries) shares this
+// bound so Explain matches what runs.
+const SummaryStepCeiling = 32
+
 func rateRangeStepSummaryViable(plan Plan, stats CandidateStats) bool {
-	return stats.StepCount <= 2 && stats.BlockCount > 1 && stats.HeadSeries == 0 && plan.RangeSelector.MaxSampleGap <= 0
+	return stats.StepCount <= SummaryStepCeiling && stats.BlockCount > 1 && stats.HeadSeries == 0 && plan.RangeSelector.MaxSampleGap <= 0
 }
 
 func maxInt(a int, b int) int {

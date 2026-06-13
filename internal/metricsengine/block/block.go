@@ -172,10 +172,7 @@ func WriteFile(path string, series []Series) error {
 	}
 
 	dirOff := int64(buf.Len())
-	dirPayload, err := json.Marshal(dir)
-	if err != nil {
-		return err
-	}
+	dirPayload := encodeDirectoryBinary(dir)
 	if _, err := buf.Write(dirPayload); err != nil {
 		return err
 	}
@@ -606,6 +603,11 @@ func BuildAggregateBuckets(timestamps []int64, values []int64, bucketSize int) [
 func decodeDirectoryPayload(dirPayload []byte, expectedCRC uint32) (Directory, error) {
 	if crc32.ChecksumIEEE(dirPayload) != expectedCRC {
 		return Directory{}, errors.New("block: directory checksum mismatch")
+	}
+	// New blocks write the MDB2 binary directory; legacy blocks wrote JSON,
+	// which always begins with '{'. Read both so old data dirs still load.
+	if hasBinaryDirectoryMagic(dirPayload) {
+		return decodeDirectoryBinary(dirPayload)
 	}
 	var dir Directory
 	if err := json.Unmarshal(dirPayload, &dir); err != nil {

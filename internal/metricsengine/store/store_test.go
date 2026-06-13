@@ -1138,6 +1138,71 @@ func TestStoreExplainShortRateRangeStepsUsesSummaryPath(t *testing.T) {
 	}
 }
 
+// TestStoreRateByLabelRangeStepsManyStepsStreamingMatches checks that a
+// multi-step (>2, within the summary ceiling) range query across several
+// blocks routes through the streaming summary path and still returns the
+// correct per-step rates. This guards the widened preferRangeStepSummaries
+// gate (was stepCount<=2) against a streaming/exact divergence.
+func TestStoreRateByLabelRangeStepsManyStepsStreamingMatches(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	labels := model.LabelSet{{Name: model.MetricNameLabel, Value: "http_requests_total"}, {Name: "job", Value: "api"}}
+	// Counter rising by 10 every second across three sealed blocks.
+	value := int64(0)
+	for blk := 0; blk < 3; blk++ {
+		batch := make([]model.Sample, 0, 4)
+		for i := 0; i < 4; i++ {
+			ts := int64(blk*4+i) * 1000
+			batch = append(batch, model.Sample{Labels: labels, Type: model.MetricTypeCounter, Timestamp: ts, Value: value})
+			value += 10
+		}
+		if _, err := st.AppendBatch(batch); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rangeSelector := query.RangeSelector{
+		Selector: index.NewSelector(index.MetricName("http_requests_total")),
+		Window:   2 * time.Second,
+	}
+	// 10 steps over [2s, 11s] — exercises the widened summary path.
+	plan := query.Plan{
+		Operation:     query.OpRateByLabelRangeSteps,
+		RangeSelector: rangeSelector,
+		StartMillis:   2000,
+		EndMillis:     11000,
+		Step:          time.Second,
+		ByLabel:       "job",
+	}
+	execPlan, err := st.Explain(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execPlan.Path != query.PathCoalescedSummaries {
+		t.Fatalf("execPlan path = %v, want PathCoalescedSummaries (streaming summary)", execPlan.Path)
+	}
+
+	steps, err := st.RateByLabelRangeSteps(rangeSelector, 2000, 11000, time.Second, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 10 {
+		t.Fatalf("len(steps) = %d, want 10", len(steps))
+	}
+	for i, s := range steps {
+		if got := s.Values["api"]; got != 10 {
+			t.Fatalf("step[%d] rate = %v, want 10/s", i, got)
+		}
+	}
+}
+
 func TestStoreExplainBucketAggregatePlan(t *testing.T) {
 	st, err := Open(t.TempDir())
 	if err != nil {

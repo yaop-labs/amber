@@ -677,7 +677,7 @@ func addRateSteps(out []FloatStep, steps []int64, series block.DecodedSeries, la
 }
 
 func addRateStepsWithOptions(out []FloatStep, steps []int64, series block.DecodedSeries, label string, window time.Duration, opts Options) error {
-	summaries, err := rateSummariesForSteps(series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts, 2)
+	summaries, err := rateSummariesForSteps(nil, series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts, 2)
 	if err != nil {
 		return err
 	}
@@ -706,7 +706,7 @@ func addIncreaseSteps(out []IntStep, steps []int64, series block.DecodedSeries, 
 }
 
 func addIncreaseStepsWithOptions(out []IntStep, steps []int64, series block.DecodedSeries, label string, window time.Duration, opts Options) error {
-	summaries, err := rateSummariesForSteps(series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts, 2)
+	summaries, err := rateSummariesForSteps(nil, series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts, 2)
 	if err != nil {
 		return err
 	}
@@ -1003,14 +1003,104 @@ func RateSummaryForSamples(seriesID uint64, timestamps []int64, values []int64, 
 }
 
 func RateWindowSummariesForSteps(seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration) ([]RateSummary, error) {
-	return rateSummariesForSteps(seriesID, timestamps, values, steps, window, Options{}, 1)
+	return rateSummariesForSteps(nil, seriesID, timestamps, values, steps, window, Options{}, 1)
 }
 
 func RateWindowSummariesForStepsWithOptions(seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options) ([]RateSummary, error) {
-	return rateSummariesForSteps(seriesID, timestamps, values, steps, window, opts, 1)
+	return rateSummariesForSteps(nil, seriesID, timestamps, values, steps, window, opts, 1)
 }
 
-func rateSummariesForSteps(seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options, minCount int) ([]RateSummary, error) {
+// RateWindowSummariesForStepsReuse is RateWindowSummariesForStepsWithOptions
+// with a caller-supplied scratch buffer reused across series. The returned
+// slice aliases buf and is only valid until the next call with the same buf,
+// so callers must consume it before reusing — the range-step scan does.
+func RateWindowSummariesForStepsReuse(buf *RateStepBuf, seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options) ([]RateSummary, error) {
+	return rateSummariesForSteps(buf, seriesID, timestamps, values, steps, window, opts, 1)
+}
+
+// RateStepBuf holds reusable scratch buffers for rateSummariesForSteps so a
+// scan over many series allocates the summary slice and the counter/stale
+// prefix arrays once instead of per series. It is not safe for concurrent use;
+// the range-step scan calls into it sequentially. A nil *RateStepBuf means
+// "allocate fresh" — the behavior for one-shot callers.
+type RateStepBuf struct {
+	out         []RateSummary
+	incPrefix   []int64
+	resetPrefix []int
+	stalePrefix []int
+}
+
+func (b *RateStepBuf) summaries(n int) []RateSummary {
+	if b == nil || cap(b.out) < n {
+		out := make([]RateSummary, n)
+		if b != nil {
+			b.out = out
+		}
+		return out
+	}
+	b.out = b.out[:n]
+	clear(b.out)
+	return b.out
+}
+
+func (b *RateStepBuf) counterDeltaPrefixes(values []int64) ([]int64, []int) {
+	n := len(values)
+	var prefix []int64
+	var resets []int
+	if b == nil {
+		prefix = make([]int64, n)
+		resets = make([]int, n)
+	} else {
+		if cap(b.incPrefix) < n {
+			b.incPrefix = make([]int64, n)
+		}
+		if cap(b.resetPrefix) < n {
+			b.resetPrefix = make([]int, n)
+		}
+		prefix = b.incPrefix[:n]
+		resets = b.resetPrefix[:n]
+		if n > 0 {
+			prefix[0] = 0
+			resets[0] = 0
+		}
+	}
+	for i := 1; i < n; i++ {
+		prefix[i] = prefix[i-1]
+		resets[i] = resets[i-1]
+		if delta := values[i] - values[i-1]; delta > 0 {
+			prefix[i] += delta
+		} else if delta < 0 {
+			resets[i]++
+		}
+	}
+	return prefix, resets
+}
+
+func (b *RateStepBuf) staleGapPrefix(timestamps []int64, opts Options) []int {
+	n := len(timestamps)
+	var prefix []int
+	if b == nil || cap(b.stalePrefix) < n {
+		prefix = make([]int, n)
+		if b != nil {
+			b.stalePrefix = prefix
+		}
+	} else {
+		prefix = b.stalePrefix[:n]
+		clear(prefix)
+	}
+	if opts.MaxSampleGapMillis == nil {
+		return prefix
+	}
+	for i := 1; i < n; i++ {
+		prefix[i] = prefix[i-1]
+		if timestamps[i]-timestamps[i-1] > *opts.MaxSampleGapMillis {
+			prefix[i]++
+		}
+	}
+	return prefix
+}
+
+func rateSummariesForSteps(buf *RateStepBuf, seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options, minCount int) ([]RateSummary, error) {
 	if len(timestamps) != len(values) {
 		return nil, errors.New("query: timestamp/value length mismatch")
 	}
@@ -1024,12 +1114,12 @@ func rateSummariesForSteps(seriesID uint64, timestamps []int64, values []int64, 
 	if minCount < 1 {
 		minCount = 1
 	}
-	out := make([]RateSummary, len(steps))
+	out := buf.summaries(len(steps))
 	if len(timestamps) < minCount || len(steps) == 0 {
 		return out, nil
 	}
-	increasePrefix, resetPrefix := counterDeltaPrefixes(values)
-	stalePrefix := staleGapPrefix(timestamps, opts)
+	increasePrefix, resetPrefix := buf.counterDeltaPrefixes(values)
+	stalePrefix := buf.staleGapPrefix(timestamps, opts)
 	lo := 0
 	hi := -1
 	for stepIndex, stepMillis := range steps {
@@ -1102,20 +1192,6 @@ func hasStaleGap(timestamps []int64, opts Options) bool {
 		}
 	}
 	return false
-}
-
-func staleGapPrefix(timestamps []int64, opts Options) []int {
-	prefix := make([]int, len(timestamps))
-	if opts.MaxSampleGapMillis == nil {
-		return prefix
-	}
-	for i := 1; i < len(timestamps); i++ {
-		prefix[i] = prefix[i-1]
-		if timestamps[i]-timestamps[i-1] > *opts.MaxSampleGapMillis {
-			prefix[i]++
-		}
-	}
-	return prefix
 }
 
 func aggregateSummariesForSteps(timestamps []int64, values []int64, steps []int64, window time.Duration) ([]Aggregate, error) {

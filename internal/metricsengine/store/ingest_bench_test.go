@@ -25,6 +25,50 @@ func benchLabelSets(n int) []model.LabelSet {
 	return out
 }
 
+// BenchmarkStats_I1Shape measures Stats() over a store shaped like a metrics
+// campaign run: 100k-series blocks sealed every few ticks. The campaign's
+// verify step calls this through /api/v1/metrics/stats with a 120s client
+// timeout.
+func BenchmarkStats_I1Shape(b *testing.B) {
+	const (
+		seriesN = 100_000
+		ticks   = 12
+	)
+	st, err := OpenWithOptions(b.TempDir(), Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer st.Close()
+	labels := benchLabelSets(seriesN)
+	ts := time.Now().UnixMilli()
+	for tick := 0; tick < ticks; tick++ {
+		for lo := 0; lo < seriesN; lo += 2000 {
+			batch := make([]model.Sample, 0, 2000)
+			for j := lo; j < lo+2000 && j < seriesN; j++ {
+				batch = append(batch, model.Sample{
+					Labels: labels[j], Type: model.MetricTypeCounter,
+					Timestamp: ts + int64(tick)*10_000, Value: int64(tick),
+				})
+			}
+			if _, err := st.AppendBatch(batch); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if tick%3 == 2 {
+			if _, err := st.Flush(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := st.Stats(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkAppendBatch_I1Shape measures the OTLP ingest write path the way
 // the metrics benchmark drives it: 1000-sample batches over a fixed 100k
 // series population, 4 concurrent appenders. b.N counts samples.

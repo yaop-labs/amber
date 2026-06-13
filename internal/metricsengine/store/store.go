@@ -38,7 +38,7 @@ type Store struct {
 	// step with catalog.Series (register + evict) so ensureCatalog stays
 	// O(batch) instead of rebuilding an O(active series) map per append.
 	catalogKeys       map[string]uint64
-	directoryCache    map[string]block.Directory
+	directoryCache    *dirCache
 	allowGlobFallback bool
 	stopBackground    chan struct{}
 	backgroundDone    chan struct{}
@@ -208,7 +208,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		manifest:          manifest,
 		catalog:           catalog,
 		catalogKeys:       catalogKeyMap(catalog),
-		directoryCache:    make(map[string]block.Directory),
+		directoryCache:    newDirCache(0),
 		allowGlobFallback: allowGlobFallback,
 		catalogLog:        catLog,
 		dirLock:           dirLock,
@@ -441,13 +441,7 @@ func (s *Store) Flush() (string, error) {
 		}
 	}
 	if meta.SeriesCount > 0 {
-		for key := range s.directoryCache {
-			if len(s.directoryCache) < maxCachedDirectories {
-				break
-			}
-			delete(s.directoryCache, key)
-		}
-		s.directoryCache[path] = dir
+		s.directoryCache.put(path, dir)
 	}
 	if meta.SeriesCount == 0 && histPath == "" {
 		return "", ErrNoSamples
@@ -614,7 +608,7 @@ func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 		removePaths = append(removePaths, filepath.Join(s.dir, meta.Path))
 	}
 	s.manifest.Blocks = kept
-	s.directoryCache = make(map[string]block.Directory)
+	s.directoryCache.reset()
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return 0, err
 	}
@@ -701,7 +695,7 @@ func (s *Store) Compact() (string, error) {
 		for _, meta := range oldBlocks {
 			_ = os.Remove(filepath.Join(s.dir, meta.Path))
 		}
-		s.directoryCache = make(map[string]block.Directory)
+		s.directoryCache.reset()
 		return "", nil
 	}
 
@@ -737,7 +731,8 @@ func (s *Store) Compact() (string, error) {
 	for _, meta := range oldBlocks {
 		_ = os.Remove(filepath.Join(s.dir, meta.Path))
 	}
-	s.directoryCache = map[string]block.Directory{path: dir}
+	s.directoryCache.reset()
+	s.directoryCache.put(path, dir)
 	if _, err := s.compactHistLocked(); err != nil {
 		return path, err
 	}
@@ -1306,16 +1301,9 @@ func (s *Store) setBackgroundError(err error) {
 	s.backgroundErrMu.Unlock()
 }
 
-// maxCachedDirectories bounds the directory cache. A directory of a
-// 100k-series block holds every label set (~tens of MB); an unbounded cache
-// over a few dozen such blocks exceeds the soft memory limit and turns every
-// allocation into GC assist. Eviction is random (map order) — recency
-// tracking isn't worth the bookkeeping at this size.
-const maxCachedDirectories = 8
-
 func (s *Store) readDirectory(path string) (block.Directory, error) {
 	s.mu.RLock()
-	dir, ok := s.directoryCache[path]
+	dir, ok := s.directoryCache.get(path)
 	s.mu.RUnlock()
 	if ok {
 		return dir, nil
@@ -1325,13 +1313,7 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 		return block.Directory{}, err
 	}
 	s.mu.Lock()
-	for key := range s.directoryCache {
-		if len(s.directoryCache) < maxCachedDirectories {
-			break
-		}
-		delete(s.directoryCache, key)
-	}
-	s.directoryCache[path] = dir
+	s.directoryCache.put(path, dir)
 	s.mu.Unlock()
 	return dir, nil
 }
@@ -1645,35 +1627,21 @@ func coalesceDecodedSeries(chunks []block.DecodedSeries) []block.DecodedSeries {
 }
 
 func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, opts query.Options) (map[uint64]*exactRateSeries, error) {
-	type blockScanTarget struct {
-		path string
-		dir  block.Directory
-	}
-	targets := make([]blockScanTarget, 0, len(paths))
-	mapHint := 0
+	head := s.headSnapshot(selector)
+	// Stream one block at a time: decode its directory, scan it into the
+	// collector, then let it go before decoding the next. Holding every
+	// in-window directory at once (the old targets/capacityHints prepass)
+	// peaked at ~1.2GB of decoded directories for a 30-block campaign query
+	// and thrashed GC against the store's soft memory limit. Per-series sample
+	// slices grow as a series spans blocks instead of being pre-sized; that
+	// trades a few appends for keeping only one decoded directory live.
+	collector := newExactSeriesCollector(len(head), nil)
 	for _, path := range paths {
 		dir, err := s.readDirectory(path)
 		if err != nil {
 			return nil, err
 		}
-		targets = append(targets, blockScanTarget{path: path, dir: dir})
-		mapHint += len(dir.Series)
-	}
-	head := s.headSnapshot(selector)
-	mapHint += len(head)
-	capacityHints := make(map[uint64]int, mapHint)
-	for _, target := range targets {
-		for _, entry := range target.dir.Series {
-			capacityHints[entry.SeriesID] += entry.ValueN
-		}
-	}
-	for _, series := range head {
-		capacityHints[series.ID] += len(series.Values)
-	}
-
-	collector := newExactSeriesCollector(len(capacityHints), capacityHints)
-	for _, target := range targets {
-		if err := query.ScanBlockWithDirectoryShared(target.path, target.dir, selector, opts, func(series block.DecodedSeries) error {
+		if err := query.ScanBlockWithDirectoryShared(path, dir, selector, opts, func(series block.DecodedSeries) error {
 			return collector.addDecodedSamples(series, opts)
 		}); err != nil {
 			return nil, err
@@ -1689,14 +1657,12 @@ func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, 
 
 type exactSeriesCollector struct {
 	grouped       map[uint64]*exactRateSeries
-	arena         []exactRateSeries
 	capacityHints map[uint64]int
 }
 
 func newExactSeriesCollector(mapHint int, capacityHints map[uint64]int) *exactSeriesCollector {
 	return &exactSeriesCollector{
 		grouped:       make(map[uint64]*exactRateSeries, mapHint),
-		arena:         make([]exactRateSeries, 0, mapHint),
 		capacityHints: capacityHints,
 	}
 }
@@ -1810,11 +1776,10 @@ func (c *exactSeriesCollector) addDecodedSamples(chunk block.DecodedSeries, opts
 				if c.capacityHints != nil && c.capacityHints[chunk.Entry.SeriesID] > capacity {
 					capacity = c.capacityHints[chunk.Entry.SeriesID]
 				}
-				c.arena = append(c.arena, exactRateSeries{
+				current = &exactRateSeries{
 					labels:  chunk.Entry.Labels,
 					samples: make([]rateSample, 0, capacity),
-				})
-				current = &c.arena[len(c.arena)-1]
+				}
 				c.grouped[chunk.Entry.SeriesID] = current
 			}
 		}
@@ -1865,27 +1830,31 @@ func sampleMatchesOptions(timestamp int64, value int64, opts query.Options) bool
 
 func (s *Store) collectRangeStepSummaries(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration) (map[uint64]*rangeStepRateSeries, error) {
 	grouped := make(map[uint64]*rangeStepRateSeries)
+	// One scratch buffer reused across every series of every block — the scan
+	// callbacks run sequentially, so rateSummariesForSteps stops allocating a
+	// fresh summary/prefix set per series (the qm2 hotspot).
+	buf := &query.RateStepBuf{}
 	for _, path := range paths {
 		dir, err := s.readDirectory(path)
 		if err != nil {
 			return nil, err
 		}
 		if err := query.ScanBlockWithDirectoryShared(path, dir, selector, opts, func(series block.DecodedSeries) error {
-			return addRangeStepSummaries(grouped, series, steps, window, opts)
+			return addRangeStepSummaries(grouped, buf, series, steps, window, opts)
 		}); err != nil {
 			return nil, err
 		}
 	}
 	if err := query.ScanSeries(s.headSnapshot(selector), selector, opts, func(series block.DecodedSeries) error {
-		return addRangeStepSummaries(grouped, series, steps, window, opts)
+		return addRangeStepSummaries(grouped, buf, series, steps, window, opts)
 	}); err != nil {
 		return nil, err
 	}
 	return grouped, nil
 }
 
-func addRangeStepSummaries(grouped map[uint64]*rangeStepRateSeries, series block.DecodedSeries, steps []int64, window time.Duration, opts query.Options) error {
-	summaries, err := query.RateWindowSummariesForStepsWithOptions(series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts)
+func addRangeStepSummaries(grouped map[uint64]*rangeStepRateSeries, buf *query.RateStepBuf, series block.DecodedSeries, steps []int64, window time.Duration, opts query.Options) error {
+	summaries, err := query.RateWindowSummariesForStepsReuse(buf, series.Entry.SeriesID, series.Timestamps, series.Values, steps, window, opts)
 	if err != nil {
 		return err
 	}
@@ -1953,7 +1922,10 @@ func addIncreaseSummarySteps(out []query.IntStep, series *rangeStepRateSeries, g
 }
 
 func preferRangeStepSummaries(stepCount int, blockCount int, headSeries int) bool {
-	return stepCount <= 2 && blockCount > 1 && headSeries == 0
+	// Shares query.SummaryStepCeiling with the planner so Explain matches the
+	// path that actually runs. Beyond the ceiling the steps × series summary
+	// map outgrows the exact materialization it would replace.
+	return stepCount <= query.SummaryStepCeiling && blockCount > 1 && headSeries == 0
 }
 
 func addExactRateSampleSteps(out []query.FloatStep, steps []int64, series *exactRateSeries, groupLabel string, window time.Duration, opts query.Options) error {
