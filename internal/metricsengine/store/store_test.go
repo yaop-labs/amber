@@ -871,6 +871,61 @@ func TestStoreRateByLabelRangeStepsHonorsMaxSampleGap(t *testing.T) {
 	}
 }
 
+// TestStoreRateByLabelRangeStepsParallelMergeAcrossSeries exercises the
+// series-partitioned parallel exact path: two groups, each with two series that
+// hash to different workers, ingested continuously across two blocks. The
+// per-group result must equal the sum of its series' rates regardless of how the
+// workers partition them. MaxSampleGap forces the exact (non-summary) path.
+func TestStoreRateByLabelRangeStepsParallelMergeAcrossSeries(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	series := []model.LabelSet{
+		{{Name: model.MetricNameLabel, Value: "http_requests_total"}, {Name: "service", Value: "api"}, {Name: "instance", Value: "a"}},
+		{{Name: model.MetricNameLabel, Value: "http_requests_total"}, {Name: "service", Value: "api"}, {Name: "instance", Value: "b"}},
+		{{Name: model.MetricNameLabel, Value: "http_requests_total"}, {Name: "service", Value: "web"}, {Name: "instance", Value: "a"}},
+		{{Name: model.MetricNameLabel, Value: "http_requests_total"}, {Name: "service", Value: "web"}, {Name: "instance", Value: "b"}},
+	}
+	// 0-3s in block 1, 4-6s in block 2; counter rising 10 per second.
+	for _, bounds := range [][2]int64{{0, 3}, {4, 6}} {
+		batch := make([]model.Sample, 0)
+		for ts := bounds[0]; ts <= bounds[1]; ts++ {
+			for _, ls := range series {
+				batch = append(batch, model.Sample{Labels: ls, Type: model.MetricTypeCounter, Timestamp: ts * 1000, Value: ts * 10})
+			}
+		}
+		if _, err := st.AppendBatch(batch); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rangeSelector := query.RangeSelector{
+		Selector:     index.NewSelector(index.MetricName("http_requests_total")),
+		Window:       6 * time.Second,
+		MaxSampleGap: 2 * time.Second,
+	}
+	steps, err := st.RateByLabelRangeSteps(rangeSelector, 6000, 6000, time.Second, "service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("len(steps) = %d, want 1", len(steps))
+	}
+	// Each series rises 10/s; two series per group → 20/s per group.
+	if got := steps[0].Values["api"]; got != 20 {
+		t.Fatalf("api rate = %v, want 20", got)
+	}
+	if got := steps[0].Values["web"]; got != 20 {
+		t.Fatalf("web rate = %v, want 20", got)
+	}
+}
+
 func TestStoreRateByLabelRangeHonorsMaxSampleGapAcrossBlocks(t *testing.T) {
 	st, err := Open(t.TempDir())
 	if err != nil {

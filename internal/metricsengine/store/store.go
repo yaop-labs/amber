@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1763,6 +1764,187 @@ func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Sel
 	return grouped, nil
 }
 
+// maxRangeStepWorkers caps the series-partitioned parallel range-step fan-out.
+// Bounded so the partial-result memory (one grouped map per worker) stays small
+// under the store's soft memory limit; 8 saturates the typical core count
+// without over-subscribing.
+const maxRangeStepWorkers = 8
+
+func rangeStepWorkerCount() int {
+	w := runtime.GOMAXPROCS(0)
+	if w > maxRangeStepWorkers {
+		w = maxRangeStepWorkers
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+type preparedResidentScan struct {
+	scan    *query.ResidentScan
+	section []byte
+}
+
+type headRangeStepMatch struct {
+	id         uint64
+	groupKey   string
+	timestamps []int64
+	values     []int64
+}
+
+// parallelRangeStepReduce runs the resident range-step exact path partitioned by
+// seriesID. Each worker owns a hash partition of series, assembles each of its
+// series once from every in-window block's shared read-only chunk section, and
+// reduces them into a thread-local accumulator; the accumulators merge at the
+// end. This parallelises the residual cost Phase 2 left CPU-bound (chunk decode +
+// per-series rate math) without the per-block sample duplication that made the
+// earlier block-parallel attempt GC-bound — a series lives in exactly one worker,
+// so total sample memory matches the sequential path. ok=false signals the caller
+// to use the sequential path (a block too large for an in-memory section).
+func parallelRangeStepReduce[A any](
+	s *Store,
+	paths []string,
+	selector index.Selector,
+	opts query.Options,
+	groupLabel string,
+	newAcc func() A,
+	newReducer func() func(A, *groupedRateSeries) error,
+	mergeAcc func(dst, src A),
+) (A, bool, error) {
+	var zero A
+	head := s.headSnapshot(selector)
+	workers := rangeStepWorkerCount()
+
+	// Phase A (sequential, cheap): prepare each block's resident scan and read its
+	// chunk section once (shared read-only across workers); pre-filter the head so
+	// selector matching runs once, not per worker. Bail to the sequential path if
+	// any block is too large for an in-memory section.
+	prepared := make([]preparedResidentScan, 0, len(paths))
+	for _, path := range paths {
+		rb, err := s.readResidentBlock(path)
+		if err != nil {
+			return zero, false, err
+		}
+		scan, err := query.PrepareResidentScan(rb, selector, opts, groupLabel)
+		if err != nil {
+			return zero, false, err
+		}
+		if !scan.Possible() {
+			continue
+		}
+		section, err := scan.ReadChunkSection(path)
+		if err != nil {
+			return zero, false, err
+		}
+		if section == nil {
+			return zero, false, nil
+		}
+		prepared = append(prepared, preparedResidentScan{scan: scan, section: section})
+	}
+
+	var headMatches []headRangeStepMatch
+	if err := query.ScanSeries(head, selector, opts, func(series block.DecodedSeries) error {
+		key, ok := series.Entry.Labels.Get(groupLabel)
+		if !ok {
+			key = ""
+		}
+		headMatches = append(headMatches, headRangeStepMatch{
+			id:         series.Entry.SeriesID,
+			groupKey:   key,
+			timestamps: series.Timestamps,
+			values:     series.Values,
+		})
+		return nil
+	}); err != nil {
+		return zero, false, err
+	}
+
+	accs := make([]A, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			acc := newAcc()
+			accs[w] = acc
+			reduce := newReducer()
+			grouped := make(map[uint64]*groupedRateSeries)
+			own := func(id uint64) bool { return int(id%uint64(workers)) == w }
+			add := func(seriesID uint64, groupKey string, timestamps, values []int64) {
+				current := grouped[seriesID]
+				if current == nil {
+					current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values))}
+					grouped[seriesID] = current
+				}
+				for i, timestamp := range timestamps {
+					value := values[i]
+					if !sampleMatchesOptions(timestamp, value, opts) {
+						continue
+					}
+					current.samples = append(current.samples, rateSample{timestamp: timestamp, value: value})
+				}
+			}
+			for _, p := range prepared {
+				if err := p.scan.ScanSection(p.section, own, func(seriesID uint64, _ model.MetricType, groupValue string, timestamps, values []int64) error {
+					add(seriesID, groupValue, timestamps, values)
+					return nil
+				}); err != nil {
+					errs[w] = err
+					return
+				}
+			}
+			for _, hm := range headMatches {
+				if own(hm.id) {
+					add(hm.id, hm.groupKey, hm.timestamps, hm.values)
+				}
+			}
+			for _, gr := range grouped {
+				if err := reduce(acc, gr); err != nil {
+					errs[w] = err
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return zero, false, err
+		}
+	}
+	result := newAcc()
+	for _, acc := range accs {
+		mergeAcc(result, acc)
+	}
+	return result, true, nil
+}
+
+func mergeFloatSteps(dst, src []query.FloatStep) {
+	n := len(dst)
+	if len(src) < n {
+		n = len(src)
+	}
+	for i := 0; i < n; i++ {
+		for key, value := range src[i].Values {
+			dst[i].Values[key] += value
+		}
+	}
+}
+
+func mergeIntSteps(dst, src []query.IntStep) {
+	n := len(dst)
+	if len(src) < n {
+		n = len(src)
+	}
+	for i := 0; i < n; i++ {
+		for key, value := range src[i].Values {
+			dst[i].Values[key] += value
+		}
+	}
+}
+
 type exactSeriesCollector struct {
 	grouped       map[uint64]*exactRateSeries
 	capacityHints map[uint64]int
@@ -2250,11 +2432,25 @@ func stalePrefixHasGap(prefix []int, lo int, hi int) bool {
 }
 
 func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.FloatStep, error) {
+	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
+		func() []query.FloatStep { return makeFloatSteps(steps) },
+		func() func([]query.FloatStep, *groupedRateSeries) error {
+			return func(acc []query.FloatStep, gr *groupedRateSeries) error {
+				return addExactRateSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts)
+			}
+		},
+		mergeFloatSteps)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return out, nil
+	}
 	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
-	out := makeFloatSteps(steps)
+	out = makeFloatSteps(steps)
 	for _, series := range grouped {
 		if err := addExactRateSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
 			return nil, err
@@ -2264,11 +2460,25 @@ func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Select
 }
 
 func (s *Store) increaseByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.IntStep, error) {
+	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
+		func() []query.IntStep { return makeIntSteps(steps) },
+		func() func([]query.IntStep, *groupedRateSeries) error {
+			return func(acc []query.IntStep, gr *groupedRateSeries) error {
+				return addExactIncreaseSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts)
+			}
+		},
+		mergeIntSteps)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return out, nil
+	}
 	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
-	out := makeIntSteps(steps)
+	out = makeIntSteps(steps)
 	for _, series := range grouped {
 		if err := addExactIncreaseSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
 			return nil, err
@@ -2332,11 +2542,26 @@ func (s *Store) increaseByLabelExact(selector index.Selector, opts query.Options
 }
 
 func (s *Store) aggregateByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.AggregateStep, error) {
+	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
+		func() []query.AggregateStep { return makeAggregateSteps(steps) },
+		func() func([]query.AggregateStep, *groupedRateSeries) error {
+			workspace := &aggregateStepWorkspace{}
+			return func(acc []query.AggregateStep, gr *groupedRateSeries) error {
+				return addExactAggregateSampleSteps(acc, steps, gr.samples, gr.groupKey, window, workspace)
+			}
+		},
+		mergeAggregateSteps)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return out, nil
+	}
 	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
-	out := makeAggregateSteps(steps)
+	out = makeAggregateSteps(steps)
 	workspace := &aggregateStepWorkspace{}
 	for _, series := range grouped {
 		if err := addExactAggregateSampleSteps(out, steps, series.samples, series.groupKey, window, workspace); err != nil {

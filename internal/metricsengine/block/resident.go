@@ -230,9 +230,29 @@ func (rb *ResidentBlock) matchSeries(i int, preds []ResidentPredicate) bool {
 	return true
 }
 
+// passesFilter applies the entry-level time/zone prune (mirrors matchTimeRange
+// and matchZoneMap) to series i.
+func (rb *ResidentBlock) passesFilter(i int, filter ResidentFilter) bool {
+	if filter.StartMillis != nil && rb.timeMax[i] < *filter.StartMillis {
+		return false
+	}
+	if filter.EndMillis != nil && rb.timeMin[i] > *filter.EndMillis {
+		return false
+	}
+	if filter.MinValue != nil && rb.zoneMax[i] < *filter.MinValue {
+		return false
+	}
+	if filter.MaxValue != nil && rb.zoneMin[i] > *filter.MaxValue {
+		return false
+	}
+	return true
+}
+
 // Scan walks the block, applying predicates and the time/value filter, decoding
 // the chunk of each matching series and invoking fn with its resolved group
-// value. groupNameIdx is the dict column of the group label (-1 ⇒ "").
+// value. groupNameIdx is the dict column of the group label (-1 ⇒ ""). It reads
+// the chunk section once and delegates to ScanSection, falling back to per-series
+// reads only for an oversized block.
 func (rb *ResidentBlock) Scan(path string, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, fn ResidentSeriesFunc) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -244,65 +264,107 @@ func (rb *ResidentBlock) Scan(path string, preds []ResidentPredicate, filter Res
 	if err != nil {
 		return err
 	}
+	if section != nil {
+		return rb.scanSection(section, preds, filter, groupNameIdx, nil, fn)
+	}
+	return rb.scanFileFallback(file, preds, filter, groupNameIdx, fn)
+}
+
+// ReadChunkSection bulk-reads the block's contiguous timestamp+value region so a
+// caller can scan it in memory (the parallel range-step path reads each block's
+// section once and shares it read-only across series-partitioned workers).
+// Returns nil when the region is empty or exceeds the bulk cap — the caller then
+// uses the sequential file-backed Scan.
+func (rb *ResidentBlock) ReadChunkSection(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readResidentChunkSection(file, rb.dataEnd)
+}
+
+// ScanSection scans an already-read chunk section in memory. own, when non-nil,
+// restricts the scan to series whose ID it accepts — the parallel path passes a
+// hash partition so each series is assembled by exactly one worker.
+func (rb *ResidentBlock) ScanSection(section []byte, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, own func(uint64) bool, fn ResidentSeriesFunc) error {
+	return rb.scanSection(section, preds, filter, groupNameIdx, own, fn)
+}
+
+func (rb *ResidentBlock) scanSection(section []byte, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, own func(uint64) bool, fn ResidentSeriesFunc) error {
 	timestampCache := make(map[timestampCacheKey][]int64)
 	var valueBuffer []int64
-	var valueScratch []byte // per-series fallback when section == nil
-
 	for i := 0; i < rb.n; i++ {
 		if !rb.matchSeries(i, preds) {
 			continue
 		}
-		if filter.StartMillis != nil && rb.timeMax[i] < *filter.StartMillis {
+		if own != nil && !own(rb.seriesID[i]) {
 			continue
 		}
-		if filter.EndMillis != nil && rb.timeMin[i] > *filter.EndMillis {
+		if !rb.passesFilter(i, filter) {
 			continue
 		}
-		if filter.MinValue != nil && rb.zoneMax[i] < *filter.MinValue {
-			continue
+		if rb.valOff[i] < 0 || rb.valOff[i]+rb.valLen[i] > int64(len(section)) ||
+			rb.tsOff[i] < 0 || rb.tsOff[i]+rb.tsLen[i] > int64(len(section)) {
+			return errors.New("block: resident offset outside chunk section")
 		}
-		if filter.MaxValue != nil && rb.zoneMin[i] > *filter.MaxValue {
-			continue
-		}
-
-		var valPayload []byte
-		var timestamps []int64
-		if section != nil {
-			if rb.valOff[i] < 0 || rb.valOff[i]+rb.valLen[i] > int64(len(section)) ||
-				rb.tsOff[i] < 0 || rb.tsOff[i]+rb.tsLen[i] > int64(len(section)) {
-				return errors.New("block: resident offset outside chunk section")
-			}
-			valPayload = section[rb.valOff[i] : rb.valOff[i]+rb.valLen[i]]
-			tsPayload := section[rb.tsOff[i] : rb.tsOff[i]+rb.tsLen[i]]
-			timestamps, err = rb.decodeTimestamps(i, timestampCache, tsPayload)
-		} else {
-			valueScratch, err = readAtReuse(file, valueScratch, rb.valOff[i], rb.valLen[i])
-			if err != nil {
-				return err
-			}
-			valPayload = valueScratch
-			var tsPayload []byte
-			tsPayload, err = readAt(file, rb.tsOff[i], rb.tsLen[i])
-			if err != nil {
-				return err
-			}
-			timestamps, err = rb.decodeTimestamps(i, timestampCache, tsPayload)
-		}
+		valPayload := section[rb.valOff[i] : rb.valOff[i]+rb.valLen[i]]
+		tsPayload := section[rb.tsOff[i] : rb.tsOff[i]+rb.tsLen[i]]
+		timestamps, err := rb.decodeTimestamps(i, timestampCache, tsPayload)
 		if err != nil {
 			return err
 		}
-
-		enc := codec.ValueEncoding{
+		values, buf, err := codec.DecodeIntegerValuesInto(codec.ValueEncoding{
 			Strategy: rb.valStrategy[i],
 			Count:    int(rb.valN[i]),
 			Base:     rb.valBase[i],
 			Payload:  valPayload,
-		}
-		var values []int64
-		values, valueBuffer, err = codec.DecodeIntegerValuesInto(enc, valueBuffer)
+		}, valueBuffer)
 		if err != nil {
 			return err
 		}
+		valueBuffer = buf
+		if err := fn(rb.seriesID[i], rb.typ[i], rb.groupValue(groupNameIdx, i), timestamps, values); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (rb *ResidentBlock) scanFileFallback(file *os.File, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, fn ResidentSeriesFunc) error {
+	timestampCache := make(map[timestampCacheKey][]int64)
+	var valueBuffer []int64
+	var valueScratch []byte
+	for i := 0; i < rb.n; i++ {
+		if !rb.matchSeries(i, preds) {
+			continue
+		}
+		if !rb.passesFilter(i, filter) {
+			continue
+		}
+		var err error
+		valueScratch, err = readAtReuse(file, valueScratch, rb.valOff[i], rb.valLen[i])
+		if err != nil {
+			return err
+		}
+		tsPayload, err := readAt(file, rb.tsOff[i], rb.tsLen[i])
+		if err != nil {
+			return err
+		}
+		timestamps, err := rb.decodeTimestamps(i, timestampCache, tsPayload)
+		if err != nil {
+			return err
+		}
+		values, buf, err := codec.DecodeIntegerValuesInto(codec.ValueEncoding{
+			Strategy: rb.valStrategy[i],
+			Count:    int(rb.valN[i]),
+			Base:     rb.valBase[i],
+			Payload:  valueScratch,
+		}, valueBuffer)
+		if err != nil {
+			return err
+		}
+		valueBuffer = buf
 		if err := fn(rb.seriesID[i], rb.typ[i], rb.groupValue(groupNameIdx, i), timestamps, values); err != nil {
 			return err
 		}

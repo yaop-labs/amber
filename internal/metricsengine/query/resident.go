@@ -15,24 +15,69 @@ import (
 // ResidentGroupFunc receives one matching series with its group value resolved.
 type ResidentGroupFunc func(seriesID uint64, typ model.MetricType, groupValue string, timestamps, values []int64) error
 
+// ResidentScan is a selector resolved against one block's dict — reusable across
+// the block's chunk section so the parallel range-step path can scan a
+// pre-read section once per series-partitioned worker without re-resolving.
+type ResidentScan struct {
+	rb       *block.ResidentBlock
+	preds    []block.ResidentPredicate
+	filter   block.ResidentFilter
+	groupIdx int
+	// possible is false when the block provably matches nothing.
+	possible bool
+}
+
+// PrepareResidentScan resolves selector/opts against rb's dict once. When the
+// block cannot match (a positive matcher whose name or value is absent),
+// Possible() reports false and the caller skips the block.
+func PrepareResidentScan(rb *block.ResidentBlock, selector index.Selector, opts Options, groupLabel string) (*ResidentScan, error) {
+	if err := selector.Validate(); err != nil {
+		return nil, err
+	}
+	preds, possible := buildResidentPredicates(rb, selector)
+	return &ResidentScan{
+		rb:    rb,
+		preds: preds,
+		filter: block.ResidentFilter{
+			StartMillis: opts.StartMillis,
+			EndMillis:   opts.EndMillis,
+			MinValue:    opts.MinValue,
+			MaxValue:    opts.MaxValue,
+		},
+		groupIdx: rb.NameIndex(groupLabel),
+		possible: possible,
+	}, nil
+}
+
+// Possible reports whether the block can contribute any series.
+func (rs *ResidentScan) Possible() bool { return rs.possible }
+
+// ReadChunkSection bulk-reads the block's chunk section (nil ⇒ oversized, use the
+// sequential path).
+func (rs *ResidentScan) ReadChunkSection(path string) ([]byte, error) {
+	return rs.rb.ReadChunkSection(path)
+}
+
+// ScanSection scans a pre-read section, restricted to series own accepts (nil ⇒
+// all). Safe to call concurrently with the same read-only section.
+func (rs *ResidentScan) ScanSection(section []byte, own func(uint64) bool, fn ResidentGroupFunc) error {
+	if !rs.possible {
+		return nil
+	}
+	return rs.rb.ScanSection(section, rs.preds, rs.filter, rs.groupIdx, own, block.ResidentSeriesFunc(fn))
+}
+
 // ScanResidentBlock scans rb with selector/opts, invoking fn for each matching
 // series with the value of groupLabel already resolved from the block dict.
 func ScanResidentBlock(path string, rb *block.ResidentBlock, selector index.Selector, opts Options, groupLabel string, fn ResidentGroupFunc) error {
-	if err := selector.Validate(); err != nil {
+	rs, err := PrepareResidentScan(rb, selector, opts, groupLabel)
+	if err != nil {
 		return err
 	}
-	preds, possible := buildResidentPredicates(rb, selector)
-	if !possible {
+	if !rs.possible {
 		return nil
 	}
-	filter := block.ResidentFilter{
-		StartMillis: opts.StartMillis,
-		EndMillis:   opts.EndMillis,
-		MinValue:    opts.MinValue,
-		MaxValue:    opts.MaxValue,
-	}
-	groupIdx := rb.NameIndex(groupLabel)
-	return rb.Scan(path, preds, filter, groupIdx, block.ResidentSeriesFunc(fn))
+	return rb.Scan(path, rs.preds, rs.filter, rs.groupIdx, block.ResidentSeriesFunc(fn))
 }
 
 // buildResidentPredicates resolves a selector into per-block predicates. The
