@@ -393,18 +393,43 @@ func scanFileFilteredWithDirectoryPath(path string, dir Directory, filter EntryF
 
 func scanFileFilteredWithDirectory(file *os.File, dir Directory, filter EntryFilter, copyTimestamps bool, copyValues bool, fn SeriesFunc) error {
 	timestampCache := make(map[timestampCacheKey][]int64)
-	valuePayload := make([]byte, 0)
 	valueBuffer := make([]int64, 0)
+
+	// Bulk-read the contiguous chunk section once instead of one ReadAt per
+	// matching series. Every series' timestamp and value payloads live in one
+	// region [0, dirOff) before the directory (WriteFile writes them
+	// sequentially), so a single read replaces ~one syscall per matching series
+	// — at campaign scale (100k series/block) the per-series ReadAt was ~21% of
+	// the range-step query (see metrics-query-redesign.md, phase 1b). section is
+	// nil for pathologically large blocks, where we fall back to per-series reads.
+	section, err := readChunkSection(file, dir)
+	if err != nil {
+		return err
+	}
+	var valuePayload []byte // fallback scratch, only used when section == nil
+
 	for _, entry := range dir.Series {
 		if filter != nil && !filter(entry) {
 			continue
 		}
-		var err error
-		valuePayload, err = readAtReuse(file, valuePayload, entry.ValueOff, entry.ValueLen)
-		if err != nil {
-			return err
+		var valPayload []byte
+		var timestamps []int64
+		if section != nil {
+			if entry.ValueOff < 0 || entry.ValueOff+entry.ValueLen > int64(len(section)) ||
+				entry.TimestampOff < 0 || entry.TimestampOff+entry.TimestampLen > int64(len(section)) {
+				return errors.New("block: directory offset outside chunk section")
+			}
+			valPayload = section[entry.ValueOff : entry.ValueOff+entry.ValueLen]
+			tsPayload := section[entry.TimestampOff : entry.TimestampOff+entry.TimestampLen]
+			timestamps, err = decodeEntryTimestampsFromPayload(entry, timestampCache, copyTimestamps, tsPayload)
+		} else {
+			valuePayload, err = readAtReuse(file, valuePayload, entry.ValueOff, entry.ValueLen)
+			if err != nil {
+				return err
+			}
+			valPayload = valuePayload
+			timestamps, err = decodeEntryTimestampsFromFileCopy(file, entry, timestampCache, copyTimestamps)
 		}
-		timestamps, err := decodeEntryTimestampsFromFileCopy(file, entry, timestampCache, copyTimestamps)
 		if err != nil {
 			return err
 		}
@@ -412,7 +437,7 @@ func scanFileFilteredWithDirectory(file *os.File, dir Directory, filter EntryFil
 			Strategy: entry.ValueStrategy,
 			Count:    entry.ValueN,
 			Base:     entry.ValueBase,
-			Payload:  valuePayload,
+			Payload:  valPayload,
 		}
 		var values []int64
 		if copyValues {
@@ -496,6 +521,40 @@ func readAtReuse(file *os.File, buf []byte, off int64, n int64) ([]byte, error) 
 	return payload, nil
 }
 
+// maxBulkSectionBytes caps the one-shot chunk-section read. Metrics blocks are
+// small (timestamps dedup heavily, values compress), so this fires for every
+// normal block; an oversized block falls back to per-series reads rather than
+// allocating an unbounded buffer.
+const maxBulkSectionBytes = 128 << 20
+
+// readChunkSection reads the contiguous timestamp+value region of a block in one
+// syscall so the scan can slice each series' payload from memory. The region is
+// [0, dirOff): WriteFile writes the header then every chunk sequentially, the
+// directory last. dirOff is derived as the max chunk end over all entries (==
+// dirOff because chunks are contiguous and directory-preceding). Returns nil
+// (not an error) when the region is empty or exceeds the cap, signalling the
+// caller to use the per-series fallback.
+func readChunkSection(file *os.File, dir Directory) ([]byte, error) {
+	var dataEnd int64
+	for i := range dir.Series {
+		e := &dir.Series[i]
+		if end := e.ValueOff + e.ValueLen; end > dataEnd {
+			dataEnd = end
+		}
+		if end := e.TimestampOff + e.TimestampLen; end > dataEnd {
+			dataEnd = end
+		}
+	}
+	if dataEnd <= 0 || dataEnd > maxBulkSectionBytes {
+		return nil, nil
+	}
+	buf := make([]byte, dataEnd)
+	if _, err := file.ReadAt(buf, 0); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 type timestampCacheKey struct {
 	off      int64
 	n        int64
@@ -503,6 +562,39 @@ type timestampCacheKey struct {
 	base     int64
 	step     int64
 	strategy codec.TimestampStrategy
+}
+
+// decodeEntryTimestampsFromPayload decodes (and caches) a series' timestamps from
+// an in-memory payload slice — the bulk-section path's counterpart to
+// decodeEntryTimestampsFromFileCopy. copyResult is honoured on cache hits so
+// callers that retain the slice past the section's lifetime get an independent copy.
+func decodeEntryTimestampsFromPayload(entry DirectoryEntry, cache map[timestampCacheKey][]int64, copyResult bool, payload []byte) ([]int64, error) {
+	key := timestampCacheKey{
+		off:      entry.TimestampOff,
+		n:        entry.TimestampLen,
+		count:    entry.TimestampN,
+		base:     entry.TimestampBase,
+		step:     entry.TimestampStep,
+		strategy: entry.TimestampKind,
+	}
+	if timestamps, ok := cache[key]; ok {
+		if !copyResult {
+			return timestamps, nil
+		}
+		return append([]int64(nil), timestamps...), nil
+	}
+	timestamps, err := codec.DecodeTimestamps(codec.TimestampEncoding{
+		Strategy: entry.TimestampKind,
+		Count:    entry.TimestampN,
+		Base:     entry.TimestampBase,
+		Step:     entry.TimestampStep,
+		Payload:  payload,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cache[key] = append([]int64(nil), timestamps...)
+	return timestamps, nil
 }
 
 func decodeEntryTimestampsFromFileCopy(file *os.File, entry DirectoryEntry, cache map[timestampCacheKey][]int64, copyResult bool) ([]int64, error) {
