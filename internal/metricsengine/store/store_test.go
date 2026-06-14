@@ -793,6 +793,43 @@ func TestStoreRateByLabelRangeStepsAcrossBlocks(t *testing.T) {
 	}
 }
 
+func TestBlockWindowsCanStraddle(t *testing.T) {
+	cases := []struct {
+		name   string
+		ranges []blockTimeRange
+		window time.Duration
+		want   bool
+	}{
+		{"single block", []blockTimeRange{{0, 1000}}, time.Second, false},
+		{"empty", nil, time.Second, false},
+		{
+			// Adjacent blocks 10s apart, window 60s: a step window can cover
+			// the boundary (the continuous-ingest campaign shape) -> exact.
+			"dense within window", []blockTimeRange{{0, 50_000}, {60_000, 110_000}}, time.Minute, true,
+		},
+		{
+			// Blocks separated by more than the window: no step window can
+			// touch both -> the summary path is safe.
+			"disjoint beyond window", []blockTimeRange{{0, 50_000}, {200_000, 260_000}}, time.Minute, false,
+		},
+		{
+			"overlapping blocks", []blockTimeRange{{0, 100_000}, {50_000, 150_000}}, time.Second, true,
+		},
+		{
+			// Unsorted input must be handled (manifest order is not time order
+			// after compaction).
+			"unsorted dense", []blockTimeRange{{60_000, 110_000}, {0, 50_000}}, time.Minute, true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := blockWindowsCanStraddle(tc.ranges, tc.window); got != tc.want {
+				t.Fatalf("blockWindowsCanStraddle(%v, %v) = %v, want %v", tc.ranges, tc.window, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStoreRateByLabelRangeStepsHonorsMaxSampleGap(t *testing.T) {
 	st, err := Open(t.TempDir())
 	if err != nil {

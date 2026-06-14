@@ -790,11 +790,30 @@ func (s *Store) ActiveSeries() int {
 }
 
 func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options) ([]string, error) {
+	paths, _, err := s.blocksAndRangesForQueryLocked(selector, opts)
+	return paths, err
+}
+
+// blockTimeRange is a block's stored [min,max] event-time span, read from the
+// manifest without decoding the block directory.
+type blockTimeRange struct {
+	min int64
+	max int64
+}
+
+// blocksAndRangesForQueryLocked returns the matched block paths and, when the
+// manifest drives the query, each block's stored time range (aligned with
+// paths). The ranges let range-step queries decide from metadata alone whether
+// a step window can straddle a block boundary — i.e. whether to run the streamed
+// exact path instead of the per-step summary pass. ranges is nil for the glob
+// fallback (no manifest), where callers keep the summary path's own check.
+func (s *Store) blocksAndRangesForQueryLocked(selector index.Selector, opts query.Options) ([]string, []blockTimeRange, error) {
 	if err := selector.Validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(s.manifest.Blocks) > 0 {
 		paths := make([]string, 0, len(s.manifest.Blocks))
+		ranges := make([]blockTimeRange, 0, len(s.manifest.Blocks))
 		for _, meta := range s.manifest.Blocks {
 			if meta.Kind != "" {
 				// Histogram blocks have their own query path.
@@ -804,25 +823,59 @@ func (s *Store) blocksForQueryLocked(selector index.Selector, opts query.Options
 				continue
 			}
 			paths = append(paths, filepath.Join(s.dir, meta.Path))
+			ranges = append(ranges, blockTimeRange{min: meta.MinTime, max: meta.MaxTime})
 		}
-		return paths, nil
+		return paths, ranges, nil
 	}
 	if !s.allowGlobFallback {
-		return nil, nil
+		return nil, nil, nil
 	}
 	blockPaths, err := filepath.Glob(filepath.Join(s.dir, "block-*.meb"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	compactPaths, err := filepath.Glob(filepath.Join(s.dir, "compact-*.meb"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	paths := make([]string, 0, len(blockPaths)+len(compactPaths))
 	paths = append(paths, blockPaths...)
 	paths = append(paths, compactPaths...)
 	sort.Strings(paths)
-	return paths, nil
+	return paths, nil, nil
+}
+
+// blockWindowsCanStraddle reports whether a range-step window of the given
+// length can span two of these blocks. When it can, a continuous series'
+// per-step summaries from adjacent blocks would have to be merged across the
+// boundary — which the speculative summary pass detects only after decoding
+// every in-window block to compute per-step windows, then discards for the
+// exact path. At campaign scale (100k series, ~15 in-window blocks) that summary
+// pass is slower than going straight to the streamed exact path. This predicate
+// is decode-free (manifest time ranges only) and conservative: a false positive
+// only routes to the always-correct exact path, never changes results.
+func blockWindowsCanStraddle(ranges []blockTimeRange, window time.Duration) bool {
+	if len(ranges) < 2 {
+		return false
+	}
+	windowMillis := window.Milliseconds()
+	ordered := append([]blockTimeRange(nil), ranges...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].min == ordered[j].min {
+			return ordered[i].max < ordered[j].max
+		}
+		return ordered[i].min < ordered[j].min
+	})
+	runningMax := ordered[0].max
+	for _, r := range ordered[1:] {
+		if r.min <= runningMax+windowMillis {
+			return true
+		}
+		if r.max > runningMax {
+			runningMax = r.max
+		}
+	}
+	return false
 }
 
 func (s *Store) Select(selector index.Selector, opts query.Options) ([]block.DecodedSeries, error) {
@@ -1114,7 +1167,7 @@ func (s *Store) RateByLabelRangeSteps(rangeSelector query.RangeSelector, startMi
 		readOpts = readOpts.WithMaxSampleGap(rangeSelector.MaxSampleGap)
 	}
 	s.mu.RLock()
-	paths, err := s.blocksForQueryLocked(rangeSelector.Selector, readOpts)
+	paths, ranges, err := s.blocksAndRangesForQueryLocked(rangeSelector.Selector, readOpts)
 	s.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -1130,7 +1183,7 @@ func (s *Store) RateByLabelRangeSteps(rangeSelector query.RangeSelector, startMi
 	if err != nil {
 		return nil, err
 	}
-	if rangeSelector.MaxSampleGap <= 0 && preferRangeStepSummaries(len(steps), len(paths), s.engine.BufferedSeries()) {
+	if rangeSelector.MaxSampleGap <= 0 && s.shouldTryRangeStepSummaries(len(steps), len(paths), ranges, rangeSelector.Window) {
 		seriesSummaries, err := s.collectRangeStepSummaries(paths, rangeSelector.Selector, readOpts, steps, rangeSelector.Window)
 		if err != nil {
 			return nil, err
@@ -1153,7 +1206,7 @@ func (s *Store) IncreaseByLabelRangeSteps(rangeSelector query.RangeSelector, sta
 		readOpts = readOpts.WithMaxSampleGap(rangeSelector.MaxSampleGap)
 	}
 	s.mu.RLock()
-	paths, err := s.blocksForQueryLocked(rangeSelector.Selector, readOpts)
+	paths, ranges, err := s.blocksAndRangesForQueryLocked(rangeSelector.Selector, readOpts)
 	s.mu.RUnlock()
 	if err != nil {
 		return nil, err
@@ -1169,7 +1222,7 @@ func (s *Store) IncreaseByLabelRangeSteps(rangeSelector query.RangeSelector, sta
 	if err != nil {
 		return nil, err
 	}
-	if rangeSelector.MaxSampleGap <= 0 && preferRangeStepSummaries(len(steps), len(paths), s.engine.BufferedSeries()) {
+	if rangeSelector.MaxSampleGap <= 0 && s.shouldTryRangeStepSummaries(len(steps), len(paths), ranges, rangeSelector.Window) {
 		seriesSummaries, err := s.collectRangeStepSummaries(paths, rangeSelector.Selector, readOpts, steps, rangeSelector.Window)
 		if err != nil {
 			return nil, err
@@ -1635,6 +1688,11 @@ func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, 
 	// and thrashed GC against the store's soft memory limit. Per-series sample
 	// slices grow as a series spans blocks instead of being pre-sized; that
 	// trades a few appends for keeping only one decoded directory live.
+	//
+	// (Block-parallel fan-out was tried and reverted: under the soft memory
+	// limit the per-block materialisation + merge allocates enough extra that GC
+	// reclaims the parallel cores — net wash. Series-partitioned parallelism on
+	// top of a resident block index is the path; see metrics-query-redesign.md.)
 	collector := newExactSeriesCollector(len(head), nil)
 	for _, path := range paths {
 		dir, err := s.readDirectory(path)
@@ -1926,6 +1984,25 @@ func preferRangeStepSummaries(stepCount int, blockCount int, headSeries int) boo
 	// path that actually runs. Beyond the ceiling the steps × series summary
 	// map outgrows the exact materialization it would replace.
 	return stepCount <= query.SummaryStepCeiling && blockCount > 1 && headSeries == 0
+}
+
+// shouldTryRangeStepSummaries decides whether to run the per-step summary pass
+// before the exact path. The summary pass decodes every in-window block and
+// computes a windowed rate summary per series per step; at campaign scale
+// (100k series, ~15 blocks) that per-step windowing is slower than the streamed
+// exact path, and when step windows straddle block boundaries it is discarded
+// for the exact path anyway. So when block metadata proves a window can straddle
+// (the continuous-ingest shape), skip the summary pass and go straight to exact.
+// ranges is nil under the glob fallback, where we keep the summary path's own
+// post-hoc overlap check.
+func (s *Store) shouldTryRangeStepSummaries(stepCount, blockCount int, ranges []blockTimeRange, window time.Duration) bool {
+	if !preferRangeStepSummaries(stepCount, blockCount, s.engine.BufferedSeries()) {
+		return false
+	}
+	if ranges != nil && blockWindowsCanStraddle(ranges, window) {
+		return false
+	}
+	return true
 }
 
 func addExactRateSampleSteps(out []query.FloatStep, steps []int64, series *exactRateSeries, groupLabel string, window time.Duration, opts query.Options) error {
