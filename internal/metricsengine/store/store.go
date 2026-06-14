@@ -39,6 +39,7 @@ type Store struct {
 	// O(batch) instead of rebuilding an O(active series) map per append.
 	catalogKeys       map[string]uint64
 	directoryCache    *dirCache
+	residentCache     *residentCache
 	allowGlobFallback bool
 	stopBackground    chan struct{}
 	backgroundDone    chan struct{}
@@ -209,6 +210,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		catalog:           catalog,
 		catalogKeys:       catalogKeyMap(catalog),
 		directoryCache:    newDirCache(0),
+		residentCache:     newResidentCache(0),
 		allowGlobFallback: allowGlobFallback,
 		catalogLog:        catLog,
 		dirLock:           dirLock,
@@ -609,6 +611,7 @@ func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 	}
 	s.manifest.Blocks = kept
 	s.directoryCache.reset()
+	s.residentCache.reset()
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return 0, err
 	}
@@ -696,6 +699,7 @@ func (s *Store) Compact() (string, error) {
 			_ = os.Remove(filepath.Join(s.dir, meta.Path))
 		}
 		s.directoryCache.reset()
+		s.residentCache.reset()
 		return "", nil
 	}
 
@@ -732,6 +736,7 @@ func (s *Store) Compact() (string, error) {
 		_ = os.Remove(filepath.Join(s.dir, meta.Path))
 	}
 	s.directoryCache.reset()
+	s.residentCache.reset()
 	s.directoryCache.put(path, dir)
 	if _, err := s.compactHistLocked(); err != nil {
 		return path, err
@@ -1371,6 +1376,29 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 	return dir, nil
 }
 
+// readResidentBlock returns the compact resident index for a block, building it
+// once from the directory on a cache miss. The transient decoded Directory is
+// released after the build, so the resident path neither pollutes nor depends on
+// the dirCache; subsequent range-step queries reuse the resident form with no
+// directory decode (the campaign query's dominant cost).
+func (s *Store) readResidentBlock(path string) (*block.ResidentBlock, error) {
+	s.mu.RLock()
+	rb, ok := s.residentCache.get(path)
+	s.mu.RUnlock()
+	if ok {
+		return rb, nil
+	}
+	dir, err := block.ReadDirectory(path)
+	if err != nil {
+		return nil, err
+	}
+	rb = block.BuildResidentFromDirectory(dir)
+	s.mu.Lock()
+	s.residentCache.put(path, rb)
+	s.mu.Unlock()
+	return rb, nil
+}
+
 func metaMatchesTime(meta BlockMeta, opts query.Options) bool {
 	if opts.StartMillis != nil && meta.MaxTime < *opts.StartMillis {
 		return false
@@ -1679,38 +1707,60 @@ func coalesceDecodedSeries(chunks []block.DecodedSeries) []block.DecodedSeries {
 	return out
 }
 
-func (s *Store) collectRangeStepSeries(paths []string, selector index.Selector, opts query.Options) (map[uint64]*exactRateSeries, error) {
+// groupedRateSeries is the resident-path counterpart of exactRateSeries: it
+// carries the resolved group-label value instead of a full LabelSet, so the scan
+// never materialises model.Label strings for the four non-group labels of every
+// series (the campaign metric matches all 100k series of one metric name).
+type groupedRateSeries struct {
+	groupKey string
+	samples  []rateSample
+}
+
+// collectRangeStepSeriesGrouped is the resident-index range-step collector. It
+// reads each in-window block's compact resident index (built once, cached) and
+// scans matching series by dict code, resolving the group value from the dict —
+// eliminating the per-query directory decode and the per-series label-string
+// allocation that dominated the campaign range-step query.
+func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Selector, opts query.Options, groupLabel string) (map[uint64]*groupedRateSeries, error) {
 	head := s.headSnapshot(selector)
-	// Stream one block at a time: decode its directory, scan it into the
-	// collector, then let it go before decoding the next. Holding every
-	// in-window directory at once (the old targets/capacityHints prepass)
-	// peaked at ~1.2GB of decoded directories for a 30-block campaign query
-	// and thrashed GC against the store's soft memory limit. Per-series sample
-	// slices grow as a series spans blocks instead of being pre-sized; that
-	// trades a few appends for keeping only one decoded directory live.
-	//
-	// (Block-parallel fan-out was tried and reverted: under the soft memory
-	// limit the per-block materialisation + merge allocates enough extra that GC
-	// reclaims the parallel cores — net wash. Series-partitioned parallelism on
-	// top of a resident block index is the path; see metrics-query-redesign.md.)
-	collector := newExactSeriesCollector(len(head), nil)
+	grouped := make(map[uint64]*groupedRateSeries, len(head))
+	add := func(seriesID uint64, groupKey string, timestamps, values []int64) {
+		current := grouped[seriesID]
+		if current == nil {
+			current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values))}
+			grouped[seriesID] = current
+		}
+		for i, timestamp := range timestamps {
+			value := values[i]
+			if !sampleMatchesOptions(timestamp, value, opts) {
+				continue
+			}
+			current.samples = append(current.samples, rateSample{timestamp: timestamp, value: value})
+		}
+	}
 	for _, path := range paths {
-		dir, err := s.readDirectory(path)
+		rb, err := s.readResidentBlock(path)
 		if err != nil {
 			return nil, err
 		}
-		if err := query.ScanBlockWithDirectoryShared(path, dir, selector, opts, func(series block.DecodedSeries) error {
-			return collector.addDecodedSamples(series, opts)
+		if err := query.ScanResidentBlock(path, rb, selector, opts, groupLabel, func(seriesID uint64, _ model.MetricType, groupValue string, timestamps, values []int64) error {
+			add(seriesID, groupValue, timestamps, values)
+			return nil
 		}); err != nil {
 			return nil, err
 		}
 	}
 	if err := query.ScanSeries(head, selector, opts, func(series block.DecodedSeries) error {
-		return collector.addDecodedSamples(series, opts)
+		key, ok := series.Entry.Labels.Get(groupLabel)
+		if !ok {
+			key = ""
+		}
+		add(series.Entry.SeriesID, key, series.Timestamps, series.Values)
+		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return collector.grouped, nil
+	return grouped, nil
 }
 
 type exactSeriesCollector struct {
@@ -2005,18 +2055,14 @@ func (s *Store) shouldTryRangeStepSummaries(stepCount, blockCount int, ranges []
 	return true
 }
 
-func addExactRateSampleSteps(out []query.FloatStep, steps []int64, series *exactRateSeries, groupLabel string, window time.Duration, opts query.Options) error {
+func addExactRateSampleSteps(out []query.FloatStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options) error {
 	windowMillis := window.Milliseconds()
 	if windowMillis <= 0 {
 		return errors.New("store: window must be at least 1ms")
 	}
-	samples := compactExactRateSamples(series)
+	samples := compactExactRateSamples(rawSamples)
 	if len(samples) < 2 {
 		return nil
-	}
-	key, ok := series.labels.Get(groupLabel)
-	if !ok {
-		key = ""
 	}
 	increasePrefix := counterIncreasePrefix(samples)
 	stalePrefix := staleGapPrefix(samples, opts)
@@ -2048,18 +2094,14 @@ func addExactRateSampleSteps(out []query.FloatStep, steps []int64, series *exact
 	return nil
 }
 
-func addExactIncreaseSampleSteps(out []query.IntStep, steps []int64, series *exactRateSeries, groupLabel string, window time.Duration, opts query.Options) error {
+func addExactIncreaseSampleSteps(out []query.IntStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options) error {
 	windowMillis := window.Milliseconds()
 	if windowMillis <= 0 {
 		return errors.New("store: window must be at least 1ms")
 	}
-	samples := compactExactRateSamples(series)
+	samples := compactExactRateSamples(rawSamples)
 	if len(samples) < 2 {
 		return nil
-	}
-	key, ok := series.labels.Get(groupLabel)
-	if !ok {
-		key = ""
 	}
 	increasePrefix := counterIncreasePrefix(samples)
 	stalePrefix := staleGapPrefix(samples, opts)
@@ -2093,18 +2135,14 @@ type aggregateStepWorkspace struct {
 	maxDeque []int
 }
 
-func addExactAggregateSampleSteps(out []query.AggregateStep, steps []int64, series *exactRateSeries, groupLabel string, window time.Duration, workspace *aggregateStepWorkspace) error {
+func addExactAggregateSampleSteps(out []query.AggregateStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, workspace *aggregateStepWorkspace) error {
 	windowMillis := window.Milliseconds()
 	if windowMillis <= 0 {
 		return errors.New("store: window must be at least 1ms")
 	}
-	samples := compactExactRateSamples(series)
+	samples := compactExactRateSamples(rawSamples)
 	if len(samples) == 0 {
 		return nil
-	}
-	key, ok := series.labels.Get(groupLabel)
-	if !ok {
-		key = ""
 	}
 	if workspace == nil {
 		workspace = &aggregateStepWorkspace{}
@@ -2163,23 +2201,23 @@ func addExactAggregateSampleSteps(out []query.AggregateStep, steps []int64, seri
 	return nil
 }
 
-func compactExactRateSamples(series *exactRateSeries) []rateSample {
-	if len(series.samples) == 0 {
+func compactExactRateSamples(samples []rateSample) []rateSample {
+	if len(samples) == 0 {
 		return nil
 	}
-	sort.SliceStable(series.samples, func(i, j int) bool {
-		return series.samples[i].timestamp < series.samples[j].timestamp
+	sort.SliceStable(samples, func(i, j int) bool {
+		return samples[i].timestamp < samples[j].timestamp
 	})
 	write := 0
-	for _, sample := range series.samples {
-		if write > 0 && series.samples[write-1].timestamp == sample.timestamp {
-			series.samples[write-1].value = sample.value
+	for _, sample := range samples {
+		if write > 0 && samples[write-1].timestamp == sample.timestamp {
+			samples[write-1].value = sample.value
 			continue
 		}
-		series.samples[write] = sample
+		samples[write] = sample
 		write++
 	}
-	return series.samples[:write]
+	return samples[:write]
 }
 
 func counterIncreasePrefix(samples []rateSample) []int64 {
@@ -2212,13 +2250,13 @@ func stalePrefixHasGap(prefix []int, lo int, hi int) bool {
 }
 
 func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.FloatStep, error) {
-	grouped, err := s.collectRangeStepSeries(paths, selector, opts)
+	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
 	out := makeFloatSteps(steps)
 	for _, series := range grouped {
-		if err := addExactRateSampleSteps(out, steps, series, label, window, opts); err != nil {
+		if err := addExactRateSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
 			return nil, err
 		}
 	}
@@ -2226,13 +2264,13 @@ func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Select
 }
 
 func (s *Store) increaseByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.IntStep, error) {
-	grouped, err := s.collectRangeStepSeries(paths, selector, opts)
+	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
 	out := makeIntSteps(steps)
 	for _, series := range grouped {
-		if err := addExactIncreaseSampleSteps(out, steps, series, label, window, opts); err != nil {
+		if err := addExactIncreaseSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
 			return nil, err
 		}
 	}
@@ -2294,14 +2332,14 @@ func (s *Store) increaseByLabelExact(selector index.Selector, opts query.Options
 }
 
 func (s *Store) aggregateByLabelRangeStepsExact(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration, label string) ([]query.AggregateStep, error) {
-	grouped, err := s.collectRangeStepSeries(paths, selector, opts)
+	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
 	if err != nil {
 		return nil, err
 	}
 	out := makeAggregateSteps(steps)
 	workspace := &aggregateStepWorkspace{}
 	for _, series := range grouped {
-		if err := addExactAggregateSampleSteps(out, steps, series, label, window, workspace); err != nil {
+		if err := addExactAggregateSampleSteps(out, steps, series.samples, series.groupKey, window, workspace); err != nil {
 			return nil, err
 		}
 	}
