@@ -6,6 +6,8 @@ import (
 	"io"
 )
 
+// ZigZagEncode maps a signed integer to an unsigned one so that small-magnitude
+// negatives encode as small varints. ZigZagDecode reverses it.
 func ZigZagEncode(v int64) uint64 {
 	return uint64(v<<1) ^ uint64(v>>63)
 }
@@ -14,6 +16,8 @@ func ZigZagDecode(v uint64) int64 {
 	return int64(v>>1) ^ -int64(v&1)
 }
 
+// EncodeSignedVarints zig-zag encodes each value as a base-128 varint and
+// concatenates them.
 func EncodeSignedVarints(values []int64) []byte {
 	buf := make([]byte, 0, len(values))
 	var tmp [binary.MaxVarintLen64]byte
@@ -24,10 +28,14 @@ func EncodeSignedVarints(values []int64) []byte {
 	return buf
 }
 
+// DecodeSignedVarints decodes exactly count values from payload, allocating the
+// result.
 func DecodeSignedVarints(payload []byte, count int) ([]int64, error) {
 	return DecodeSignedVarintsInto(payload, count, nil)
 }
 
+// DecodeSignedVarintsInto decodes count values into out, reusing it when its
+// capacity allows. It errors if payload holds fewer or more values than count.
 func DecodeSignedVarintsInto(payload []byte, count int, out []int64) ([]int64, error) {
 	if cap(out) < count {
 		out = make([]int64, 0, count)

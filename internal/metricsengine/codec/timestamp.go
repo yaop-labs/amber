@@ -2,6 +2,8 @@ package codec
 
 import "errors"
 
+// TimestampStrategy identifies how a series' timestamps were encoded.
+// EncodeTimestamps picks the one that yields the smallest payload.
 type TimestampStrategy uint8
 
 const (
@@ -26,6 +28,10 @@ func (s TimestampStrategy) String() string {
 	}
 }
 
+// TimestampEncoding is the encoded form of one series' timestamps. For the
+// regular strategy Base is the first timestamp and Step the fixed interval; for
+// the packed delta-of-delta strategy Base is the first timestamp and Step the
+// first delta, with Payload holding the remaining residuals.
 type TimestampEncoding struct {
 	Strategy TimestampStrategy
 	Count    int
@@ -34,6 +40,9 @@ type TimestampEncoding struct {
 	Payload  []byte
 }
 
+// EncodeTimestamps takes a fixed-interval fast path (Base+Step, no payload) for
+// regularly spaced timestamps, and otherwise delta-of-delta encodes them as
+// varints or, when smaller, a bit-packed residual stream.
 func EncodeTimestamps(timestamps []int64) TimestampEncoding {
 	if isRegular(timestamps) {
 		var step int64
@@ -89,6 +98,7 @@ func EncodeTimestamps(timestamps []int64) TimestampEncoding {
 	}
 }
 
+// DecodeTimestamps reverses EncodeTimestamps.
 func DecodeTimestamps(enc TimestampEncoding) ([]int64, error) {
 	if enc.Strategy == TimestampStrategyRegular {
 		out := make([]int64, enc.Count)

@@ -2,15 +2,19 @@ package codec
 
 import "errors"
 
+// ValueStrategy identifies how a series' integer values were transformed and
+// encoded. EncodeIntegerValues picks the strategy that yields the smallest
+// payload.
 type ValueStrategy uint8
 
+// The unpacked strategies name the transform applied before signed-varint
+// encoding; each *Packed variant carries the same transformed stream as a
+// fixed-width bit-packed payload instead (bitpack.go).
 const (
 	ValueStrategyDirectResidual ValueStrategy = iota + 1
 	ValueStrategyDelta
 	ValueStrategyDeltaOfDelta
 	ValueStrategyConstant
-	// Packed variants carry the same transformed stream as their varint
-	// counterparts but with a fixed-width bit-packed payload (bitpack.go).
 	ValueStrategyDirectResidualPacked
 	ValueStrategyDeltaPacked
 	ValueStrategyDeltaOfDeltaPacked
@@ -52,6 +56,9 @@ func valueBaseStrategy(s ValueStrategy) (ValueStrategy, bool) {
 	}
 }
 
+// ValueEncoding is the encoded form of one series' integer values. Base holds
+// the residual mean, the constant value, or — for packed delta strategies —
+// the stream's absolute first element; Payload holds the transformed remainder.
 type ValueEncoding struct {
 	Strategy ValueStrategy
 	Count    int
@@ -59,6 +66,9 @@ type ValueEncoding struct {
 	Payload  []byte
 }
 
+// EncodeIntegerValues returns the smallest encoding of values found by trying
+// each transform against both payload codecs. A constant stream takes the
+// Base-only fast path and carries no payload.
 func EncodeIntegerValues(values []int64) ValueEncoding {
 	if isConstant(values) {
 		var base int64
@@ -122,6 +132,8 @@ func encodePackedTransform(t valueTransform, count int) ValueEncoding {
 	return enc
 }
 
+// valueTransform is one candidate transform of a value stream: its varint and
+// bit-packed strategy tags, the transform's Base, and the transformed data.
 type valueTransform struct {
 	strategy ValueStrategy
 	packed   ValueStrategy
@@ -129,11 +141,15 @@ type valueTransform struct {
 	data     []int64
 }
 
+// DecodeIntegerValues reverses EncodeIntegerValues, allocating the result.
 func DecodeIntegerValues(enc ValueEncoding) ([]int64, error) {
 	values, _, err := DecodeIntegerValuesInto(enc, nil)
 	return values, err
 }
 
+// DecodeIntegerValuesInto decodes enc into out, growing out only when its
+// capacity is too small. It returns the decoded values and the slice that owns
+// their backing array, so a caller pooling out can retain it.
 func DecodeIntegerValuesInto(enc ValueEncoding, out []int64) ([]int64, []int64, error) {
 	if cap(out) < enc.Count {
 		out = make([]int64, enc.Count)
@@ -206,6 +222,7 @@ func isConstant(values []int64) bool {
 	return true
 }
 
+// residualTransform centers values on their integer mean, which is kept in base.
 func residualTransform(values []int64) valueTransform {
 	var sum int64
 	for _, value := range values {
@@ -227,6 +244,8 @@ func residualTransform(values []int64) valueTransform {
 	}
 }
 
+// deltaTransform keeps values[0] verbatim, then the difference between each
+// element and its predecessor.
 func deltaTransform(values []int64) valueTransform {
 	transformed := make([]int64, len(values))
 	if len(values) > 0 {
@@ -242,6 +261,8 @@ func deltaTransform(values []int64) valueTransform {
 	}
 }
 
+// deltaOfDeltaTransform keeps values[0] and the first delta verbatim, then the
+// difference between each consecutive delta — near-zero for evenly spaced data.
 func deltaOfDeltaTransform(values []int64) valueTransform {
 	transformed := make([]int64, len(values))
 	switch len(values) {
@@ -265,6 +286,7 @@ func deltaOfDeltaTransform(values []int64) valueTransform {
 	}
 }
 
+// restoreDeltaInPlace inverts deltaTransform with a running sum over out.
 func restoreDeltaInPlace(out []int64) {
 	var current int64
 	for i, value := range out {
@@ -277,6 +299,7 @@ func restoreDeltaInPlace(out []int64) {
 	}
 }
 
+// restoreDeltaOfDeltaInPlace inverts deltaOfDeltaTransform.
 func restoreDeltaOfDeltaInPlace(out []int64) {
 	switch len(out) {
 	case 0:
