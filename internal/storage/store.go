@@ -51,6 +51,7 @@ type LocalStore struct {
 	dir string
 }
 
+// NewLocalStore returns a SegmentStore backed by the directory dir.
 func NewLocalStore(dir string) *LocalStore {
 	return &LocalStore{dir: dir}
 }

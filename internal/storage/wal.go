@@ -38,10 +38,14 @@ var (
 	ErrWALBadCRC    = errors.New("wal: crc32 mismatch")
 )
 
+// WALRecord is one replayed log/span record's opaque payload.
 type WALRecord struct {
 	Payload []byte
 }
 
+// WAL is the log/span write-ahead log: a buffered, CRC- and seq-framed
+// append-only file (see walMagic). It is safe for concurrent use and
+// fail-stops after a write or fsync error.
 type WAL struct {
 	mu           sync.Mutex
 	file         *os.File
@@ -84,6 +88,9 @@ func (w *WAL) CorruptRecords() uint64 {
 	return w.corruptCount.Load()
 }
 
+// OpenWAL opens (creating if needed) the log/span WAL in dir for appending.
+// The caller replays the existing contents and seeds the sequence counter
+// before writing.
 func OpenWAL(dir string) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("wal: mkdir %s: %w", dir, err)
@@ -359,6 +366,9 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 	return count, nil
 }
 
+// Truncate empties the WAL after its records are durably checkpointed into a
+// segment. It refuses to run on a failed writer to avoid destroying the only
+// copy of acknowledged-but-unsynced records.
 func (w *WAL) Truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -386,6 +396,7 @@ func (w *WAL) Truncate() error {
 	return nil
 }
 
+// Size returns the current on-disk size of the WAL file in bytes.
 func (w *WAL) Size() (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -397,6 +408,7 @@ func (w *WAL) Size() (int64, error) {
 	return info.Size(), nil
 }
 
+// Close flushes the buffer, fsyncs, and closes the file.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

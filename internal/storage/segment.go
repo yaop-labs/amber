@@ -66,6 +66,9 @@ type BlockStat struct {
 	MaxTS int64
 }
 
+// SegmentFooter is the trailer of a sealed segment: the file-wide time span and
+// record count plus per-block offsets and stats that let scans seek and prune
+// blocks without decompressing them.
 type SegmentFooter struct {
 	MinTS        int64
 	MaxTS        int64
@@ -75,6 +78,9 @@ type SegmentFooter struct {
 	BlockStats   []BlockStat
 }
 
+// SegmentWriter appends records into a segment file as a sequence of
+// zstd-compressed blocks, tracking per-block id/time bounds for the footer. It
+// is safe for concurrent use and fail-stops after a write or fsync error.
 type SegmentWriter struct {
 	mu              sync.Mutex
 	file            *os.File
@@ -116,6 +122,8 @@ func (sw *SegmentWriter) failStop(err error) error {
 	return err
 }
 
+// OpenSegmentWriter creates a new segment file at path (failing if it exists)
+// and returns a writer positioned at its start.
 func OpenSegmentWriter(path string) (*SegmentWriter, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644) //nolint:gosec
 	if err != nil {
@@ -157,6 +165,8 @@ func (sw *SegmentWriter) writeHeader() error {
 	return err
 }
 
+// WriteRecord appends one record with event time ts, flushing the current
+// block to the file once it reaches the block size.
 func (sw *SegmentWriter) WriteRecord(data []byte, ts int64) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -264,6 +274,8 @@ func (sw *SegmentWriter) flushBlock() error {
 	return nil
 }
 
+// Flush compresses and writes any buffered block and flushes the file buffer,
+// so the bytes reach the OS. Callers fsync separately via the manager.
 func (sw *SegmentWriter) Flush() error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -284,6 +296,9 @@ func (sw *SegmentWriter) Flush() error {
 	return nil
 }
 
+// Close seals the segment: it flushes the last block, writes the footer,
+// fsyncs, and closes the file. It refuses to write a footer over an unknown
+// state on a failed writer.
 func (sw *SegmentWriter) Close() error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -353,12 +368,14 @@ func (sw *SegmentWriter) writeFooter() error {
 	return err
 }
 
+// RecordCount returns the number of records written so far.
 func (sw *SegmentWriter) RecordCount() uint64 {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	return sw.recordCount
 }
 
+// TimeRange returns the min and max event time written so far.
 func (sw *SegmentWriter) TimeRange() (int64, int64) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -394,6 +411,9 @@ func (sw *SegmentWriter) Sync() (int64, error) {
 	return sw.fileOffset, nil
 }
 
+// BlockIndexHint is a snapshot of an active (unsealed) segment's block layout,
+// passed to OpenSegmentReader so reads of the still-being-written segment can
+// seek and prune blocks without a footer (which only sealed segments have).
 type BlockIndexHint struct {
 	Offsets     []int64
 	Stats       []BlockStat
@@ -402,6 +422,8 @@ type BlockIndexHint struct {
 	RecordCount uint64
 }
 
+// SnapshotBlockIndex returns the current block index of the active segment for
+// warm reads, or false when no block has been flushed yet.
 func (sw *SegmentWriter) SnapshotBlockIndex() (*BlockIndexHint, bool) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -434,6 +456,9 @@ type SegmentReader struct {
 	version uint16
 }
 
+// OpenSegmentReader opens a segment for reading. For a sealed segment pass a
+// nil hint and the footer is read; for the active segment pass the writer's
+// SnapshotBlockIndex so reads work before a footer exists.
 func OpenSegmentReader(path string, hint *BlockIndexHint) (*SegmentReader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -656,14 +681,18 @@ func (sr *SegmentReader) readFooter() error {
 	return nil
 }
 
+// Footer returns the segment's footer (or the hint-derived equivalent).
 func (sr *SegmentReader) Footer() SegmentFooter {
 	return sr.footer
 }
 
+// Scan visits every record in the segment in write order.
 func (sr *SegmentReader) Scan(fn func(data []byte) error) error {
 	return sr.scanBlocks(sr.footer.BlockOffsets, fn)
 }
 
+// ScanWithBlockSkip scans forward, skipping any block whose ID range the skip
+// predicate rejects (e.g. the top-k heap threshold).
 func (sr *SegmentReader) ScanWithBlockSkip(
 	skip func(minID, maxID uint64) bool,
 	fn func(data []byte) error,
@@ -671,6 +700,8 @@ func (sr *SegmentReader) ScanWithBlockSkip(
 	return sr.scanWithBlockSkip(false, nil, skip, fn)
 }
 
+// ScanReverseWithBlockSkip is ScanWithBlockSkip in reverse (newest first), the
+// order used for reverse-paginated top-k log queries.
 func (sr *SegmentReader) ScanReverseWithBlockSkip(
 	skip func(minID, maxID uint64) bool,
 	fn func(data []byte) error,
@@ -688,6 +719,8 @@ func blockOutsideRange(s BlockStat, from, to int64) bool {
 	return s.MaxTS < from || s.MinTS > to
 }
 
+// ScanTimeRangeWithBlockSkip scans forward over [from, to], pruning blocks
+// outside the range by their footer time bounds in addition to the ID skip.
 func (sr *SegmentReader) ScanTimeRangeWithBlockSkip(
 	from, to int64,
 	skip func(minID, maxID uint64) bool,
@@ -703,6 +736,7 @@ func (sr *SegmentReader) ScanTimeRangeWithBlockSkip(
 	return sr.scanWithBlockSkip(false, timeSkip, skip, fn)
 }
 
+// ScanTimeRangeReverseWithBlockSkip is ScanTimeRangeWithBlockSkip in reverse.
 func (sr *SegmentReader) ScanTimeRangeReverseWithBlockSkip(
 	from, to int64,
 	skip func(minID, maxID uint64) bool,
@@ -718,6 +752,8 @@ func (sr *SegmentReader) ScanTimeRangeReverseWithBlockSkip(
 	return sr.scanWithBlockSkip(true, timeSkip, skip, fn)
 }
 
+// ScanTimeRange visits records in blocks overlapping [from, to] in write order,
+// pruning by footer time bounds with no ID skip.
 func (sr *SegmentReader) ScanTimeRange(from, to int64, fn func(data []byte) error) error {
 	if sr.footer.MaxTS < from || sr.footer.MinTS > to {
 		return nil
@@ -865,6 +901,7 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 	return nil
 }
 
+// Close releases the reader's file handle and decoder.
 func (sr *SegmentReader) Close() error {
 	if sr.decoder != nil {
 		sr.decoder.Close()

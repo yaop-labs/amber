@@ -20,6 +20,9 @@ const (
 	UploadStateUploaded UploadState = 1
 )
 
+// SegmentMeta is the persisted metadata for one segment: its identity, time
+// span, size and record count, seal state, the fsync watermark used for crash
+// recovery, and the remote-upload bookkeeping.
 type SegmentMeta struct {
 	ID          uint32 `json:"id"`
 	FileName    string `json:"file_name"`
@@ -60,6 +63,8 @@ func (s SegmentMeta) HasLocalCopy() bool {
 	return *s.LocalPresent
 }
 
+// StoreMeta is the on-disk store manifest: the next segment ID and the metadata
+// for every segment. It is written atomically (tmp + fsync + rename).
 type StoreMeta struct {
 	NextSegmentID uint32        `json:"next_segment_id"`
 	Segments      []SegmentMeta `json:"segments"`

@@ -17,6 +17,8 @@ import (
 	"github.com/yaop-labs/amber/internal/selfobs"
 )
 
+// RotationPolicy decides when the active segment is sealed and a new one
+// started: whichever of the record-count or byte-size limit is hit first.
 type RotationPolicy struct {
 	MaxRecords uint64
 	MaxBytes   int64
@@ -30,6 +32,10 @@ var DefaultRotationPolicy = RotationPolicy{
 // SegmentSidecarExts lists the files belonging to a sealed segment.
 var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".pidx"}
 
+// SegmentManager owns the active segment and WAL and drives the durability
+// protocol: it appends to the WAL, writes to the active segment, rotates and
+// seals full segments (building their index sidecars on one background worker),
+// and checkpoints/truncates the WAL. It is safe for concurrent use.
 type SegmentManager struct {
 	mu             sync.RWMutex
 	dir            string
@@ -71,12 +77,17 @@ func (sm *SegmentManager) SetOnSealComplete(fn func(meta SegmentMeta)) {
 	sm.onSealComplete = fn
 }
 
+// SetOnSeal registers the callback that builds a sealed segment's index
+// sidecars; it runs on the seal worker in seal order.
 func (sm *SegmentManager) SetOnSeal(fn func(meta SegmentMeta)) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.onSeal = fn
 }
 
+// OpenSegmentManager opens the store at dir: it loads the metadata, recovers
+// the active segment by truncating it to the last fsynced size and replaying
+// the WAL tail, and starts the seal worker.
 func OpenSegmentManager(dir string, policy RotationPolicy) (*SegmentManager, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("segmgr: mkdir %s: %w", dir, err)
@@ -261,6 +272,8 @@ func (sm *SegmentManager) createNewSegment() error {
 	return nil
 }
 
+// Write appends one record: WAL append (durable) then active-segment write,
+// rotating first if the policy limit is reached.
 func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -297,6 +310,8 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	return nil
 }
 
+// WriteBatch appends many records under one WAL fsync (group commit), rotating
+// mid-batch as the policy requires.
 func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	if len(items) == 0 {
 		return nil
@@ -376,6 +391,7 @@ func (sm *SegmentManager) checkpoint(lastSyncedSeq uint64) error {
 	return saveMeta(sm.dir, sm.meta)
 }
 
+// BatchItem is one record for WriteBatch: its serialized data and event time.
 type BatchItem struct {
 	Data []byte
 	TS   int64
@@ -526,6 +542,8 @@ func (sm *SegmentManager) stopSealWorker() {
 	<-done
 }
 
+// Rotate seals the active segment and starts a fresh one, even if the policy
+// limit has not been reached.
 func (sm *SegmentManager) Rotate() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -536,6 +554,7 @@ func (sm *SegmentManager) Rotate() error {
 	return sm.rotate()
 }
 
+// Segments returns a snapshot of all segment metadata, sealed and active.
 func (sm *SegmentManager) Segments() []SegmentMeta {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -715,6 +734,8 @@ func (sm *SegmentManager) RecordUploadFailure(id uint32, errMsg string) error {
 	return fmt.Errorf("segmgr: record upload failure: unknown segment id %d", id)
 }
 
+// WALCorruptRecords returns how many malformed records the last WAL replay
+// skipped, for surfacing as a health metric.
 func (sm *SegmentManager) WALCorruptRecords() uint64 {
 	if sm.wal == nil {
 		return 0
@@ -722,12 +743,15 @@ func (sm *SegmentManager) WALCorruptRecords() uint64 {
 	return sm.wal.CorruptRecords()
 }
 
+// SegmentCount returns the number of segments tracked.
 func (sm *SegmentManager) SegmentCount() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.meta.Segments)
 }
 
+// RemoveSegment deletes a sealed segment and its sidecars and drops it from the
+// metadata, the terminal step of retention.
 func (sm *SegmentManager) RemoveSegment(id uint32) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -745,6 +769,8 @@ func (sm *SegmentManager) RemoveSegment(id uint32) error {
 	return nil
 }
 
+// Flush flushes and checkpoints the active segment (fsync + record the synced
+// size/seq in metadata), the durability barrier behind db.Flush.
 func (sm *SegmentManager) Flush() error {
 	sm.mu.RLock()
 	active := sm.active
@@ -755,6 +781,7 @@ func (sm *SegmentManager) Flush() error {
 	return active.Flush()
 }
 
+// ActiveRecordCount returns the record count of the current active segment.
 func (sm *SegmentManager) ActiveRecordCount() uint64 {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -764,6 +791,8 @@ func (sm *SegmentManager) ActiveRecordCount() uint64 {
 	return sm.active.RecordCount()
 }
 
+// ActiveBlockIndex returns the active segment's block index hint for warm
+// reads, or false if fileName is not the current active segment.
 func (sm *SegmentManager) ActiveBlockIndex(fileName string) (*BlockIndexHint, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -784,6 +813,8 @@ func (sm *SegmentManager) ActiveBlockIndex(fileName string) (*BlockIndexHint, bo
 	return sm.active.SnapshotBlockIndex()
 }
 
+// ActiveSegmentMeta returns the metadata of the current active segment, or
+// false when there is none.
 func (sm *SegmentManager) ActiveSegmentMeta() (SegmentMeta, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -796,6 +827,7 @@ func (sm *SegmentManager) ActiveSegmentMeta() (SegmentMeta, bool) {
 	return SegmentMeta{}, false
 }
 
+// SegmentPath returns the on-disk path of a segment's data file.
 func (sm *SegmentManager) SegmentPath(meta SegmentMeta) string {
 	return filepath.Join(sm.dir, meta.FileName)
 }
@@ -827,6 +859,8 @@ func (sm *SegmentManager) DeleteSegmentFilesLocal(meta SegmentMeta) error {
 	return first
 }
 
+// Close stops the seal worker (draining the queue), flushes and closes the
+// active segment and WAL.
 func (sm *SegmentManager) Close() error {
 	// Stop the seal worker before taking sm.mu: an in-flight seal callback
 	// reads hooks under sm.mu.RLock, so waiting for it while holding the
