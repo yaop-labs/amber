@@ -27,6 +27,10 @@ var ErrInvalidLabels = errors.New("store: invalid labels")
 var ErrLabelLimitExceeded = errors.New("store: label limit exceeded")
 var ErrActiveSeriesLimitExceeded = errors.New("store: active series limit exceeded")
 
+// Store is the durable metrics store: it wraps the append engine with the
+// on-disk catalog, block manifest, directory and resident caches, retention,
+// compaction, and index eviction. It is safe for concurrent use, and a process
+// holds an exclusive lock on its directory.
 type Store struct {
 	dir      string
 	engine   *engine.Engine
@@ -61,6 +65,8 @@ type Store struct {
 	dirLock *fslock.Lock
 }
 
+// Stats summarizes a store for the admin/stats endpoint: sealed block totals
+// (counts, on-disk bytes, time span) plus the unflushed head buffers.
 type Stats struct {
 	Blocks  int
 	Series  int
@@ -74,14 +80,19 @@ type Stats struct {
 	BufferedSamples int
 }
 
+// Open opens (creating if needed) a store at dir with default options.
 func Open(dir string) (*Store, error) {
 	return OpenWithOptions(dir, Options{})
 }
 
+// OpenConfigured opens a store from a Config.
 func OpenConfigured(cfg Config) (*Store, error) {
 	return OpenWithOptions(cfg.Dir, cfg.Options)
 }
 
+// OpenWithOptions opens a store at dir, taking the directory lock, recovering
+// the WAL, catalog log, and manifest, and starting background flush, retention,
+// and eviction as configured by opts.
 func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: dir is required")
@@ -222,6 +233,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	return st, nil
 }
 
+// Append is AppendBatch for a single sample.
 func (s *Store) Append(labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) (index.SeriesID, error) {
 	if err := s.ensureCatalog([]model.LabelSet{labels}); err != nil {
 		return 0, err
@@ -236,6 +248,9 @@ func (s *Store) Append(labels model.LabelSet, typ model.MetricType, timestamp in
 	return id, nil
 }
 
+// AppendBatch registers any new series in the catalog and appends the samples
+// through the engine (durable on return). It enforces the cardinality and
+// label limits from Options.
 func (s *Store) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 	labelSets := make([]model.LabelSet, 0, len(samples))
 	for _, sample := range samples {
@@ -254,6 +269,8 @@ func (s *Store) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 	return ids, nil
 }
 
+// AppendScaledFloat appends a float64 as round(value*scale) in the int64 value
+// model, rejecting NaN, ±Inf, and values that overflow at the given scale.
 func (s *Store) AppendScaledFloat(labels model.LabelSet, typ model.MetricType, timestamp int64, value float64, scale int64) (index.SeriesID, error) {
 	if err := s.ensureCatalog([]model.LabelSet{labels}); err != nil {
 		return 0, err
@@ -348,6 +365,9 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 	return nil
 }
 
+// Flush writes the buffered head (scalars and sketches) to a new block under
+// the prepare/commit flush protocol and records it in the manifest. It returns
+// the block path, or "" when the head was empty.
 func (s *Store) Flush() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -567,10 +587,14 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 	return syncDir(dir)
 }
 
+// FlushIfNeeded flushes only when the head holds at least maxBufferedSeries
+// series, reporting whether a flush happened.
 func (s *Store) FlushIfNeeded(maxBufferedSeries int) (string, bool, error) {
 	return s.FlushIfNeededBy(maxBufferedSeries, 0)
 }
 
+// FlushIfNeededBy flushes when either the buffered series or sample count
+// reaches its threshold (a zero threshold disables that trigger).
 func (s *Store) FlushIfNeededBy(maxBufferedSeries int, maxBufferedSamples int) (string, bool, error) {
 	if !s.flushThresholdExceeded(maxBufferedSeries, maxBufferedSamples) {
 		return "", false, nil
@@ -597,6 +621,8 @@ func (s *Store) flushThresholdExceeded(maxBufferedSeries int, maxBufferedSamples
 	return false
 }
 
+// DeleteBefore drops whole blocks whose newest sample predates cutoffMillis and
+// returns how many were removed. It is the retention primitive.
 func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -745,6 +771,8 @@ func (s *Store) Compact() (string, error) {
 	return path, nil
 }
 
+// CompactIfNeeded merges blocks into one when at least minBlocks exist,
+// reporting whether a compaction ran and the resulting block path.
 func (s *Store) CompactIfNeeded(minBlocks int) (string, bool, error) {
 	if minBlocks <= 1 {
 		minBlocks = 2
@@ -763,6 +791,7 @@ func (s *Store) CompactIfNeeded(minBlocks int) (string, bool, error) {
 	return path, true, nil
 }
 
+// Blocks returns the paths of the sealed scalar blocks in the manifest.
 func (s *Store) Blocks() ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -884,6 +913,7 @@ func blockWindowsCanStraddle(ranges []blockTimeRange, window time.Duration) bool
 	return false
 }
 
+// Select returns the matching series across all blocks and the head, merged.
 func (s *Store) Select(selector index.Selector, opts query.Options) ([]block.DecodedSeries, error) {
 	s.mu.RLock()
 	paths, err := s.blocksForQueryLocked(selector, opts)
@@ -911,10 +941,13 @@ func (s *Store) Select(selector index.Selector, opts query.Options) ([]block.Dec
 	return out, nil
 }
 
+// SelectRange is Select over the range selector's window ending at endMillis.
 func (s *Store) SelectRange(rangeSelector query.RangeSelector, endMillis int64) ([]block.DecodedSeries, error) {
 	return s.Select(rangeSelector.Selector, rangeSelector.Options(endMillis))
 }
 
+// Explain plans the query against current block/head cardinality and returns
+// the chosen execution path and candidates without running it.
 func (s *Store) Explain(plan query.Plan) (query.ExecutionPlan, error) {
 	selector, opts, err := plan.StorageSelectorOptions()
 	if err != nil {
@@ -975,6 +1008,8 @@ func (s *Store) Explain(plan query.Plan) (query.ExecutionPlan, error) {
 	return query.PlanExecution(plan, stats)
 }
 
+// Execute runs a planned query and returns the result for the operation's
+// shape. It is the generic entry point behind the typed helpers below.
 func (s *Store) Execute(plan query.Plan) (query.Result, error) {
 	if err := plan.Validate(); err != nil {
 		return query.Result{}, err
@@ -1018,6 +1053,7 @@ func (s *Store) Execute(plan query.Plan) (query.Result, error) {
 	}
 }
 
+// SumByLabel returns the per-group sum of matching samples, grouped by label.
 func (s *Store) SumByLabel(selector index.Selector, opts query.Options, label string) (map[string]int64, error) {
 	aggs, err := s.AggregateByLabel(selector, opts, label)
 	if err != nil {
@@ -1030,6 +1066,7 @@ func (s *Store) SumByLabel(selector index.Selector, opts query.Options, label st
 	return out, nil
 }
 
+// SumByLabelRangeSteps returns the per-group sum in each step's window.
 func (s *Store) SumByLabelRangeSteps(rangeSelector query.RangeSelector, startMillis int64, endMillis int64, step time.Duration, label string) ([]query.IntStep, error) {
 	aggregateSteps, err := s.AggregateByLabelRangeSteps(rangeSelector, startMillis, endMillis, step, label)
 	if err != nil {
@@ -1046,6 +1083,7 @@ func (s *Store) SumByLabelRangeSteps(rangeSelector query.RangeSelector, startMil
 	return out, nil
 }
 
+// AggregateByLabel returns the per-group sum/count/min/max of matching samples.
 func (s *Store) AggregateByLabel(selector index.Selector, opts query.Options, label string) (map[string]query.Aggregate, error) {
 	s.mu.RLock()
 	paths, err := s.blocksForQueryLocked(selector, opts)
@@ -1082,6 +1120,7 @@ func (s *Store) AggregateByLabel(selector index.Selector, opts query.Options, la
 	return out, nil
 }
 
+// AggregateByLabelRangeSteps returns the per-group aggregate in each step's window.
 func (s *Store) AggregateByLabelRangeSteps(rangeSelector query.RangeSelector, startMillis int64, endMillis int64, step time.Duration, label string) ([]query.AggregateStep, error) {
 	readStart := startMillis - rangeSelector.Window.Milliseconds()
 	readOpts := query.TimeRange(readStart, endMillis)
@@ -1114,6 +1153,7 @@ func (s *Store) AggregateByLabelRangeSteps(rangeSelector query.RangeSelector, st
 	return s.aggregateByLabelRangeStepsExact(paths, rangeSelector.Selector, readOpts, steps, rangeSelector.Window, label)
 }
 
+// RateByLabel returns the per-group counter rate over the window in opts.
 func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label string) (map[string]float64, error) {
 	s.mu.RLock()
 	paths, err := s.blocksForQueryLocked(selector, opts)
@@ -1162,10 +1202,15 @@ func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label s
 	return finalizeRateByLabel(seriesRates, label), nil
 }
 
+// RateByLabelRange returns the per-group counter rate over the range selector's
+// window ending at endMillis.
 func (s *Store) RateByLabelRange(rangeSelector query.RangeSelector, endMillis int64, label string) (map[string]float64, error) {
 	return s.RateByLabel(rangeSelector.Selector, rangeSelector.Options(endMillis), label)
 }
 
+// RateByLabelRangeSteps returns the per-group counter rate at each range step.
+// This is the hot path: it routes between the summary and the streamed,
+// series-partitioned exact paths (see the resident index and Explain).
 func (s *Store) RateByLabelRangeSteps(rangeSelector query.RangeSelector, startMillis int64, endMillis int64, step time.Duration, label string) ([]query.FloatStep, error) {
 	readStart := startMillis - rangeSelector.Window.Milliseconds()
 	readOpts := query.TimeRange(readStart, endMillis)
@@ -1205,6 +1250,7 @@ func (s *Store) RateByLabelRangeSteps(rangeSelector query.RangeSelector, startMi
 	return s.rateByLabelRangeStepsExact(paths, rangeSelector.Selector, readOpts, steps, rangeSelector.Window, label)
 }
 
+// IncreaseByLabelRangeSteps returns the per-group counter increase at each step.
 func (s *Store) IncreaseByLabelRangeSteps(rangeSelector query.RangeSelector, startMillis int64, endMillis int64, step time.Duration, label string) ([]query.IntStep, error) {
 	readStart := startMillis - rangeSelector.Window.Milliseconds()
 	readOpts := query.TimeRange(readStart, endMillis)
@@ -1244,6 +1290,7 @@ func (s *Store) IncreaseByLabelRangeSteps(rangeSelector query.RangeSelector, sta
 	return s.increaseByLabelRangeStepsExact(paths, rangeSelector.Selector, readOpts, steps, rangeSelector.Window, label)
 }
 
+// IncreaseByLabel returns the per-group counter increase over the window in opts.
 func (s *Store) IncreaseByLabel(selector index.Selector, opts query.Options, label string) (map[string]int64, error) {
 	s.mu.RLock()
 	paths, err := s.blocksForQueryLocked(selector, opts)
@@ -1291,10 +1338,14 @@ func (s *Store) IncreaseByLabel(selector index.Selector, opts query.Options, lab
 	return finalizeIncreaseByLabel(seriesRates, label), nil
 }
 
+// IncreaseByLabelRange returns the per-group counter increase over the range
+// selector's window ending at endMillis.
 func (s *Store) IncreaseByLabelRange(rangeSelector query.RangeSelector, endMillis int64, label string) (map[string]int64, error) {
 	return s.IncreaseByLabel(rangeSelector.Selector, rangeSelector.Options(endMillis), label)
 }
 
+// Stats returns block totals and head buffer counts. Block sample counts come
+// from the manifest (recorded at write time), so this is O(blocks), not a scan.
 func (s *Store) Stats() (Stats, error) {
 	s.mu.RLock()
 	blocks := append([]BlockMeta(nil), s.manifest.Blocks...)
@@ -1345,6 +1396,8 @@ func (s *Store) Stats() (Stats, error) {
 	return stats, nil
 }
 
+// LastBackgroundError returns the most recent error from the background flush,
+// retention, or eviction loops, or nil.
 func (s *Store) LastBackgroundError() error {
 	s.backgroundErrMu.RLock()
 	defer s.backgroundErrMu.RUnlock()
@@ -2620,6 +2673,9 @@ func (s *Store) maintenance() error {
 	return nil
 }
 
+// Close stops the background loops, drains and closes the engine (preserving
+// durability of acknowledged appends), and releases the directory lock. It is
+// idempotent.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		if s.stopBackground != nil {

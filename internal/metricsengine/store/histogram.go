@@ -259,6 +259,8 @@ type HistogramStats struct {
 	BufferedSamples int
 }
 
+// HistStats returns histogram-block totals and the buffered sketch counts, the
+// histogram counterpart of Stats.
 func (s *Store) HistStats() (HistogramStats, error) {
 	s.mu.RLock()
 	metas := make([]BlockMeta, 0)

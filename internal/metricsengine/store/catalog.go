@@ -12,11 +12,14 @@ import (
 
 const catalogFileName = "catalog.json"
 
+// Catalog is the persisted series directory: the id→labels assignments and the
+// next ID to hand out. It is the durable form of the in-memory index.Registry.
 type Catalog struct {
 	NextID uint64         `json:"next_id"`
 	Series []CatalogEntry `json:"series"`
 }
 
+// CatalogEntry is one persisted series assignment.
 type CatalogEntry struct {
 	ID     uint64         `json:"id"`
 	Labels model.LabelSet `json:"labels"`
@@ -69,6 +72,8 @@ func saveCatalog(dir string, catalog Catalog) error {
 	return syncDir(dir)
 }
 
+// Registry builds an in-memory registry from the catalog, importing every
+// series at its persisted ID.
 func (c Catalog) Registry() *index.Registry {
 	registry := index.NewRegistry()
 	for _, entry := range c.Series {
@@ -77,6 +82,8 @@ func (c Catalog) Registry() *index.Registry {
 	return registry
 }
 
+// Ensure returns the ID for labels, assigning the next one if the series is
+// new. It scans linearly and is used only on recovery paths, not hot ingest.
 func (c *Catalog) Ensure(labels model.LabelSet) uint64 {
 	canonical := labels.Canonical()
 	for _, entry := range c.Series {

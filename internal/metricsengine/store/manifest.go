@@ -11,6 +11,8 @@ import (
 
 const manifestFileName = "manifest.json"
 
+// Manifest is the persisted list of sealed blocks (scalar and histogram) that
+// make up the store, the source of truth for which block files are live.
 type Manifest struct {
 	Version int         `json:"version"`
 	Blocks  []BlockMeta `json:"blocks"`
@@ -20,6 +22,9 @@ type Manifest struct {
 // the empty kind is a scalar block.
 const BlockKindHistogram = "hist"
 
+// BlockMeta is a manifest entry: a block's path and kind, its event-time span,
+// and series/sample counts recorded at write time so common reads (pruning,
+// Stats) need not open the block.
 type BlockMeta struct {
 	Path        string `json:"path"`
 	Kind        string `json:"kind,omitempty"`
