@@ -97,6 +97,8 @@ type Options struct {
 	MemoryLimit int64
 }
 
+// IngestLane overrides the batching and breaker settings for one ingest lane
+// (logs or spans); zero fields fall back to the top-level Options values.
 type IngestLane struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
@@ -104,6 +106,8 @@ type IngestLane struct {
 	BreakerThreshold int
 }
 
+// DB is an embedded amber database: logs, spans, and metrics in one process.
+// It is safe for concurrent use. Create it with Open and release it with Close.
 type DB struct {
 	stack  *runtime.Stack
 	cancel context.CancelFunc
@@ -208,10 +212,12 @@ func (db *DB) Flush(ctx context.Context) error {
 	return db.stack.Batcher.Flush(ctx)
 }
 
+// QueryLogs runs a log query and returns one page of results.
 func (db *DB) QueryLogs(ctx context.Context, q *LogQuery) (*LogResult, error) {
 	return db.stack.Executor.ExecLog(ctx, q)
 }
 
+// QuerySpans runs a span query and returns one page of results.
 func (db *DB) QuerySpans(ctx context.Context, q *SpanQuery) (*SpanResult, error) {
 	return db.stack.Executor.ExecSpan(ctx, q)
 }
@@ -244,6 +250,8 @@ func (db *DB) IsReady() bool { return db.stack.IsReady() }
 
 const shutdownTimeout = 30 * time.Second
 
+// Close shuts the database down cleanly: it drains the ingest queue, flushes,
+// and releases resources, bounded by an internal timeout.
 func (db *DB) Close() error {
 	db.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
