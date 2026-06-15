@@ -1,3 +1,7 @@
+// Package engine ties the metrics WAL, the in-memory head, and the flush
+// protocol together. Appends are durable on return (WAL fsync precedes the head
+// update); a flush snapshots the head into a block and truncates the WAL under
+// a gate that excludes concurrent appends so no acknowledged sample is lost.
 package engine
 
 import (
@@ -14,12 +18,16 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/wal"
 )
 
+// Options configures a metrics engine. A zero WALPath runs the engine purely
+// in memory with no durability.
 type Options struct {
 	WALPath string
 	// WALFlushInterval bounds how long AppendBatch waits for a batched fsync.
 	WALFlushInterval time.Duration
 }
 
+// Engine is the durable metrics writer: it owns the registry, the head, the
+// WAL, and the flush coordination. It is safe for concurrent appends.
 type Engine struct {
 	mu        sync.Mutex
 	registry  *index.Registry
@@ -60,6 +68,8 @@ type Engine struct {
 	walUnknownSeries int
 }
 
+// New returns an in-memory engine (no WAL). It panics only on an error that
+// cannot occur without a WAL path.
 func New() *Engine {
 	e, err := Open(Options{})
 	if err != nil {
@@ -68,10 +78,14 @@ func New() *Engine {
 	return e
 }
 
+// Open creates an engine with a fresh registry, recovering opts.WALPath if set.
 func Open(opts Options) (*Engine, error) {
 	return OpenWithRegistry(index.NewRegistry(), opts)
 }
 
+// OpenWithRegistry is Open using a caller-supplied registry (shared with the
+// store catalog). When opts.WALPath is set it replays and repairs the WAL,
+// rebuilding the head before returning.
 func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 	if registry == nil {
 		registry = index.NewRegistry()
@@ -131,6 +145,7 @@ func (e *Engine) replayRecord(record wal.Record) error {
 	}
 }
 
+// Append is AppendBatch for a single sample.
 func (e *Engine) Append(labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) (index.SeriesID, error) {
 	ids, err := e.AppendBatch([]model.Sample{{
 		Labels: labels, Type: typ, Timestamp: timestamp, Value: value,
