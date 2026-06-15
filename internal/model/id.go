@@ -61,10 +61,6 @@ func EntryIDTime(id EntryID) time.Time {
 	return time.UnixMilli(int64(ms))
 }
 
-func ZeroTraceID() TraceID {
-	return TraceID{}
-}
-
 func ZeroSpanID() SpanID {
 	return SpanID{}
 }
