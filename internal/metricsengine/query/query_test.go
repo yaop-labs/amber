@@ -42,11 +42,6 @@ func TestSelectBlockSumAndRate(t *testing.T) {
 		t.Fatalf("len(series) = %d, want 1", len(series))
 	}
 
-	sum := SumByLabel(series, "job")
-	if sum["api"] != 60 {
-		t.Fatalf("sum[api] = %d, want 60", sum["api"])
-	}
-
 	rates, err := Rate(series)
 	if err != nil {
 		t.Fatal(err)
@@ -187,114 +182,6 @@ func TestRateSummaryHonorsMaxSampleGap(t *testing.T) {
 	}
 }
 
-func TestRateByLabel(t *testing.T) {
-	rates, err := RateByLabel([]block.DecodedSeries{
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{1, 3},
-		},
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 2, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{10, 13},
-		},
-	}, "job")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rates["api"] != 5 {
-		t.Fatalf("rates[api] = %f, want 5", rates["api"])
-	}
-	increases, err := IncreaseByLabel([]block.DecodedSeries{
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{1, 3},
-		},
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 2, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{10, 13},
-		},
-	}, "job")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if increases["api"] != 5 {
-		t.Fatalf("increases[api] = %d, want 5", increases["api"])
-	}
-}
-
-func TestRateByLabelSteps(t *testing.T) {
-	steps, err := RateByLabelSteps([]block.DecodedSeries{{
-		Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-		Timestamps: []int64{0, 1000, 2000, 3000},
-		Values:     []int64{1, 2, 4, 5},
-	}}, "job", 2000, 3000, time.Second, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 2 {
-		t.Fatalf("len(steps) = %d, want 2", len(steps))
-	}
-	if steps[0].TimestampMillis != 2000 || steps[0].Values["api"] != 1.5 {
-		t.Fatalf("steps[0] = %+v, want ts=2000 api=1.5", steps[0])
-	}
-	if steps[1].TimestampMillis != 3000 || steps[1].Values["api"] != 1.5 {
-		t.Fatalf("steps[1] = %+v, want ts=3000 api=1.5", steps[1])
-	}
-	increaseSteps, err := IncreaseByLabelSteps([]block.DecodedSeries{{
-		Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-		Timestamps: []int64{0, 1000, 2000, 3000},
-		Values:     []int64{1, 2, 4, 5},
-	}}, "job", 2000, 3000, time.Second, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(increaseSteps) != 2 {
-		t.Fatalf("len(increaseSteps) = %d, want 2", len(increaseSteps))
-	}
-	if increaseSteps[0].Values["api"] != 3 || increaseSteps[1].Values["api"] != 3 {
-		t.Fatalf("increaseSteps = %+v, want api=3 at both steps", increaseSteps)
-	}
-}
-
-func TestAggregateByLabelSteps(t *testing.T) {
-	series := []block.DecodedSeries{
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000, 2000, 3000},
-			Values:     []int64{1, 5, 2, 4},
-		},
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 2, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{1000, 2000, 3000},
-			Values:     []int64{10, 20, 30},
-		},
-	}
-	steps, err := AggregateByLabelSteps(series, "job", 2000, 3000, time.Second, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 2 {
-		t.Fatalf("len(steps) = %d, want 2", len(steps))
-	}
-	if got := steps[0].Values["api"]; got.Sum != 38 || got.Count != 5 || got.Min != 1 || got.Max != 20 || got.Avg() != 7.6 {
-		t.Fatalf("steps[0].api = %+v, want sum=38 count=5 min=1 max=20 avg=7.6", got)
-	}
-	if got := steps[1].Values["api"]; got.Sum != 71 || got.Count != 6 || got.Min != 2 || got.Max != 30 {
-		t.Fatalf("steps[1].api = %+v, want sum=71 count=6 min=2 max=30", got)
-	}
-	sumSteps, err := SumByLabelSteps(series, "job", 2000, 3000, time.Second, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sumSteps[0].Values["api"] != 38 || sumSteps[1].Values["api"] != 71 {
-		t.Fatalf("sumSteps = %+v, want 38 and 71", sumSteps)
-	}
-}
-
 func TestAggregateByLabelStepsInDirectoryBuckets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "steps.meb")
 	timestamps := make([]int64, 128)
@@ -385,42 +272,6 @@ func TestAggregateByLabelStepsInBlockUsesBucketsAndDecodesPartialSeries(t *testi
 	}
 }
 
-func TestRateByLabelStepsHandlesCounterReset(t *testing.T) {
-	series := []block.DecodedSeries{{
-		Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-		Timestamps: []int64{0, 1000, 2000, 3000},
-		Values:     []int64{10, 20, 5, 8},
-	}}
-	steps, err := RateByLabelSteps(series, "job", 2000, 3000, time.Second, 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if steps[0].Values["api"] != 5 {
-		t.Fatalf("steps[0] = %+v, want api=5", steps[0])
-	}
-	if steps[1].Values["api"] != float64(13)/3 {
-		t.Fatalf("steps[1] = %+v, want api=%f", steps[1], float64(13)/3)
-	}
-	increaseSteps, err := IncreaseByLabelSteps(series, "job", 2000, 3000, time.Second, 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if increaseSteps[0].Values["api"] != 10 || increaseSteps[1].Values["api"] != 13 {
-		t.Fatalf("increaseSteps = %+v, want 10 then 13", increaseSteps)
-	}
-}
-
-func TestRateByLabelStepsRejectsInvalidWindow(t *testing.T) {
-	_, err := RateByLabelSteps(nil, "job", 0, 1000, time.Second, 0)
-	if err == nil {
-		t.Fatal("expected invalid window error")
-	}
-	_, err = IncreaseByLabelSteps(nil, "job", 0, 1000, time.Second, 0)
-	if err == nil {
-		t.Fatal("expected invalid window error")
-	}
-}
-
 func TestRateByLabelStepsInBlockWithDirectory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "steps.meb")
 	if err := block.WriteFile(path, []block.Series{{
@@ -449,27 +300,6 @@ func TestRateByLabelStepsInBlockWithDirectory(t *testing.T) {
 	}
 	if len(increaseSteps) != 2 || increaseSteps[0].Values["api"] != 3 || increaseSteps[1].Values["api"] != 3 {
 		t.Fatalf("increaseSteps = %+v, want api=3 at both steps", increaseSteps)
-	}
-}
-
-func TestRateByLabelDoesNotCoalesceDuplicateSeriesIDs(t *testing.T) {
-	rates, err := RateByLabel([]block.DecodedSeries{
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{1, 2},
-		},
-		{
-			Entry:      block.DirectoryEntry{SeriesID: 1, Labels: model.LabelSet{{Name: "job", Value: "api"}}},
-			Timestamps: []int64{0, 1000},
-			Values:     []int64{10, 12},
-		},
-	}, "job")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rates["api"] != 3 {
-		t.Fatalf("rates[api] = %f, want 3", rates["api"])
 	}
 }
 
@@ -557,7 +387,7 @@ func TestSelectBlockTrimsToTimeRange(t *testing.T) {
 	}
 }
 
-func TestSumByLabelInBlockUsesDirectorySummary(t *testing.T) {
+func TestAggregateByLabelInBlockUsesDirectorySummary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "query.meb")
 	if err := block.WriteFile(path, []block.Series{
 		{
@@ -577,54 +407,19 @@ func TestSumByLabelInBlockUsesDirectorySummary(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sum, err := SumByLabelInBlock(path, index.Selector{}, Options{}, "job")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sum["api"] != 10 {
-		t.Fatalf("sum[api] = %d, want 10", sum["api"])
-	}
-	agg, err := AggregateByLabelInBlock(path, index.Selector{}, Options{}, "job")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if agg["api"].Count != 4 || agg["api"].Min != 1 || agg["api"].Max != 4 || agg["api"].Avg() != 2.5 {
-		t.Fatalf("agg[api] = %+v, want count=4 min=1 max=4 avg=2.5", agg["api"])
-	}
-}
-
-func TestAggregateByLabelInDirectoryBuckets(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "query.meb")
-	timestamps := make([]int64, 65)
-	values := make([]int64, 65)
-	for i := range values {
-		timestamps[i] = int64(i) * 1000
-		values[i] = int64(i + 1)
-	}
-	if err := block.WriteFile(path, []block.Series{{
-		ID:         1,
-		Type:       model.MetricTypeGauge,
-		Labels:     model.LabelSet{{Name: "job", Value: "api"}},
-		Timestamps: timestamps,
-		Values:     values,
-	}}); err != nil {
-		t.Fatal(err)
-	}
 	dir, err := block.ReadDirectory(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	start, end := int64(0), int64(63_000)
-	agg, ok := AggregateByLabelInDirectoryBuckets(dir, index.Selector{}, Options{StartMillis: &start, EndMillis: &end}, "job")
-	if !ok {
-		t.Fatal("expected bucket aggregate to cover aligned range")
+	agg, err := AggregateByLabelInBlockWithDirectory(path, dir, index.Selector{}, Options{}, "job")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := agg["api"]; got.Sum != 2080 || got.Count != 64 || got.Min != 1 || got.Max != 64 {
-		t.Fatalf("agg[api] = %+v, want first bucket summary", got)
+	if agg["api"].Sum != 10 {
+		t.Fatalf("agg[api].Sum = %d, want 10", agg["api"].Sum)
 	}
-	start, end = 1000, 63_000
-	if _, ok := AggregateByLabelInDirectoryBuckets(dir, index.Selector{}, Options{StartMillis: &start, EndMillis: &end}, "job"); ok {
-		t.Fatal("expected partial bucket range to require payload scan")
+	if agg["api"].Count != 4 || agg["api"].Min != 1 || agg["api"].Max != 4 || agg["api"].Avg() != 2.5 {
+		t.Fatalf("agg[api] = %+v, want count=4 min=1 max=4 avg=2.5", agg["api"])
 	}
 }
 

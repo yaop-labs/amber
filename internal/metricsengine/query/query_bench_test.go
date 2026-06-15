@@ -10,31 +10,6 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-func BenchmarkSumByLabelInBlockDirectory(b *testing.B) {
-	path := filepath.Join(b.TempDir(), "bench.meb")
-	var series []block.Series
-	for i := 0; i < 1000; i++ {
-		series = append(series, block.Series{
-			ID:         uint64(i + 1),
-			Type:       model.MetricTypeGauge,
-			Labels:     model.LabelSet{{Name: "job", Value: "api"}},
-			Timestamps: []int64{0, 1000, 2000, 3000},
-			Values:     []int64{1, 2, 3, 4},
-		})
-	}
-	if err := block.WriteFile(path, series); err != nil {
-		b.Fatal(err)
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := SumByLabelInBlock(path, index.Selector{}, Options{}, "job"); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func BenchmarkAggregateByLabelInBlockBucketTimeRange(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "bench.meb")
 	var series []block.Series

@@ -22,11 +22,6 @@ type RateResult struct {
 	Rate     float64
 }
 
-type IncreaseResult struct {
-	SeriesID uint64
-	Increase int64
-}
-
 type RateSummary struct {
 	SeriesID    uint64
 	Labels      model.LabelSet
@@ -139,20 +134,6 @@ func ScanSeries(input []block.Series, selector index.Selector, opts Options, fn 
 	return nil
 }
 
-func SumByLabel(series []block.DecodedSeries, label string) map[string]int64 {
-	out := make(map[string]int64)
-	for _, s := range series {
-		key, ok := s.Entry.Labels.Get(label)
-		if !ok {
-			key = ""
-		}
-		for _, value := range s.Values {
-			out[key] += value
-		}
-	}
-	return out
-}
-
 func AggregateByLabel(series []block.DecodedSeries, label string) map[string]Aggregate {
 	out := make(map[string]Aggregate)
 	for _, s := range series {
@@ -167,35 +148,6 @@ func AggregateByLabel(series []block.DecodedSeries, label string) map[string]Agg
 		}
 	}
 	return out
-}
-
-func AggregateByLabelSteps(series []block.DecodedSeries, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]AggregateStep, error) {
-	steps, err := StepMillis(startMillis, endMillis, step)
-	if err != nil {
-		return nil, err
-	}
-	if window.Milliseconds() <= 0 {
-		return nil, errors.New("query: window must be at least 1ms")
-	}
-	out := makeAggregateSteps(steps)
-	for _, s := range series {
-		aggregates, err := aggregateSummariesForSteps(s.Timestamps, s.Values, steps, window)
-		if err != nil {
-			return nil, err
-		}
-		key, ok := s.Entry.Labels.Get(label)
-		if !ok {
-			key = ""
-		}
-		for i, agg := range aggregates {
-			if agg.Count == 0 {
-				continue
-			}
-			current := out[i].Values[key]
-			out[i].Values[key] = mergeAggregate(current, agg)
-		}
-	}
-	return out, nil
 }
 
 func AggregateByLabelStepsInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]AggregateStep, error) {
@@ -310,45 +262,6 @@ func AggregateByLabelStepsInDirectoryBuckets(dir block.Directory, selector index
 		}
 	}
 	return out, true
-}
-
-func SumByLabelSteps(series []block.DecodedSeries, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]IntStep, error) {
-	aggregateSteps, err := AggregateByLabelSteps(series, label, startMillis, endMillis, step, window)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]IntStep, len(aggregateSteps))
-	for i, aggregateStep := range aggregateSteps {
-		values := make(map[string]int64, len(aggregateStep.Values))
-		for key, agg := range aggregateStep.Values {
-			values[key] = agg.Sum
-		}
-		out[i] = IntStep{TimestampMillis: aggregateStep.TimestampMillis, Values: values}
-	}
-	return out, nil
-}
-
-func SumByLabelInBlock(path string, selector index.Selector, opts Options, label string) (map[string]int64, error) {
-	aggs, err := AggregateByLabelInBlock(path, selector, opts, label)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(aggs))
-	for key, agg := range aggs {
-		out[key] = agg.Sum
-	}
-	return out, nil
-}
-
-func AggregateByLabelInBlock(path string, selector index.Selector, opts Options, label string) (map[string]Aggregate, error) {
-	if err := selector.Validate(); err != nil {
-		return nil, err
-	}
-	dir, err := block.ReadDirectory(path)
-	if err != nil {
-		return nil, err
-	}
-	return AggregateByLabelInBlockWithDirectory(path, dir, selector, opts, label)
 }
 
 func AggregateByLabelInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options, label string) (map[string]Aggregate, error) {
@@ -476,28 +389,6 @@ func AggregateByLabelInDirectory(dir block.Directory, selector index.Selector, o
 	return out
 }
 
-func AggregateByLabelInDirectoryBuckets(dir block.Directory, selector index.Selector, opts Options, label string) (map[string]Aggregate, bool) {
-	out := make(map[string]Aggregate)
-	for _, entry := range dir.Series {
-		if !matchLabels(entry, selector) || !matchTimeRange(entry, opts) || !matchZoneMap(entry.ZoneMap, opts) {
-			continue
-		}
-		if len(entry.AggregateBuckets) == 0 {
-			return nil, false
-		}
-		key, ok := entry.Labels.Get(label)
-		if !ok {
-			key = ""
-		}
-		agg, covered := aggregateEntryBuckets(entry, opts)
-		if !covered {
-			return nil, false
-		}
-		out[key] = mergeAggregate(out[key], agg)
-	}
-	return out, true
-}
-
 func Rate(series []block.DecodedSeries) ([]RateResult, error) {
 	out := make([]RateResult, 0, len(series))
 	for _, s := range series {
@@ -509,57 +400,6 @@ func Rate(series []block.DecodedSeries) ([]RateResult, error) {
 			continue
 		}
 		out = append(out, RateResult{SeriesID: s.Entry.SeriesID, Rate: rate})
-	}
-	return out, nil
-}
-
-func Increase(series []block.DecodedSeries) ([]IncreaseResult, error) {
-	out := make([]IncreaseResult, 0, len(series))
-	for _, s := range series {
-		summary, ok, err := RateSummaryForSamples(s.Entry.SeriesID, s.Timestamps, s.Values, Options{})
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			continue
-		}
-		out = append(out, IncreaseResult{SeriesID: s.Entry.SeriesID, Increase: summary.Increase})
-	}
-	return out, nil
-}
-
-func RateByLabel(series []block.DecodedSeries, label string) (map[string]float64, error) {
-	out := make(map[string]float64)
-	for _, s := range series {
-		rate, ok, err := rateOneSamples(s.Timestamps, s.Values, Options{})
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			continue
-		}
-		key, ok := s.Entry.Labels.Get(label)
-		if !ok {
-			key = ""
-		}
-		out[key] += rate
-	}
-	return out, nil
-}
-
-func RateByLabelSteps(series []block.DecodedSeries, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]FloatStep, error) {
-	steps, err := StepMillis(startMillis, endMillis, step)
-	if err != nil {
-		return nil, err
-	}
-	if window.Milliseconds() <= 0 {
-		return nil, errors.New("query: window must be at least 1ms")
-	}
-	out := makeFloatSteps(steps)
-	for _, s := range series {
-		if err := addRateSteps(out, steps, s, label, window); err != nil {
-			return nil, err
-		}
 	}
 	return out, nil
 }
@@ -588,23 +428,6 @@ func RateByLabelStepsInBlockWithDirectory(path string, dir block.Directory, sele
 	return out, nil
 }
 
-func IncreaseByLabelSteps(series []block.DecodedSeries, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]IntStep, error) {
-	steps, err := StepMillis(startMillis, endMillis, step)
-	if err != nil {
-		return nil, err
-	}
-	if window.Milliseconds() <= 0 {
-		return nil, errors.New("query: window must be at least 1ms")
-	}
-	out := makeIntSteps(steps)
-	for _, s := range series {
-		if err := addIncreaseSteps(out, steps, s, label, window); err != nil {
-			return nil, err
-		}
-	}
-	return out, nil
-}
-
 func IncreaseByLabelStepsInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]IntStep, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -625,25 +448,6 @@ func IncreaseByLabelStepsInBlockWithDirectory(path string, dir block.Directory, 
 	})
 	if err != nil {
 		return nil, err
-	}
-	return out, nil
-}
-
-func IncreaseByLabel(series []block.DecodedSeries, label string) (map[string]int64, error) {
-	out := make(map[string]int64)
-	for _, s := range series {
-		summary, ok, err := RateSummaryForSamples(s.Entry.SeriesID, s.Timestamps, s.Values, Options{})
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			continue
-		}
-		key, ok := s.Entry.Labels.Get(label)
-		if !ok {
-			key = ""
-		}
-		out[key] += summary.Increase
 	}
 	return out, nil
 }
@@ -723,27 +527,6 @@ func addIncreaseStepsWithOptions(out []IntStep, steps []int64, series block.Deco
 	return nil
 }
 
-func AccumulateRateByLabelSteps(out []FloatStep, steps []int64, series block.DecodedSeries, label string, window time.Duration) error {
-	if len(out) != len(steps) {
-		return errors.New("query: step output length mismatch")
-	}
-	return addRateSteps(out, steps, series, label, window)
-}
-
-func AccumulateIncreaseByLabelSteps(out []IntStep, steps []int64, series block.DecodedSeries, label string, window time.Duration) error {
-	if len(out) != len(steps) {
-		return errors.New("query: step output length mismatch")
-	}
-	return addIncreaseSteps(out, steps, series, label, window)
-}
-
-func AccumulateAggregateByLabelSteps(out []AggregateStep, steps []int64, series block.DecodedSeries, label string, window time.Duration) error {
-	if len(out) != len(steps) {
-		return errors.New("query: step output length mismatch")
-	}
-	return accumulateAggregateByLabelSelectedSteps(out, steps, series, label, window, nil)
-}
-
 func accumulateAggregateByLabelSelectedSteps(out []AggregateStep, steps []int64, series block.DecodedSeries, label string, window time.Duration, selected []bool) error {
 	if len(out) != len(steps) {
 		return errors.New("query: step output length mismatch")
@@ -769,17 +552,6 @@ func accumulateAggregateByLabelSelectedSteps(out []AggregateStep, steps []int64,
 		out[i].Values[key] = mergeAggregate(out[i].Values[key], agg)
 	}
 	return nil
-}
-
-func RateByLabelInBlock(path string, selector index.Selector, opts Options, label string) (map[string]float64, error) {
-	if err := selector.Validate(); err != nil {
-		return nil, err
-	}
-	dir, err := block.ReadDirectory(path)
-	if err != nil {
-		return nil, err
-	}
-	return RateByLabelInBlockWithDirectory(path, dir, selector, opts, label)
 }
 
 func RateByLabelInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options, label string) (map[string]float64, error) {
@@ -1002,18 +774,12 @@ func RateSummaryForSamples(seriesID uint64, timestamps []int64, values []int64, 
 	return summary, true, nil
 }
 
-func RateWindowSummariesForSteps(seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration) ([]RateSummary, error) {
-	return rateSummariesForSteps(nil, seriesID, timestamps, values, steps, window, Options{}, 1)
-}
-
-func RateWindowSummariesForStepsWithOptions(seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options) ([]RateSummary, error) {
-	return rateSummariesForSteps(nil, seriesID, timestamps, values, steps, window, opts, 1)
-}
-
-// RateWindowSummariesForStepsReuse is RateWindowSummariesForStepsWithOptions
-// with a caller-supplied scratch buffer reused across series. The returned
-// slice aliases buf and is only valid until the next call with the same buf,
-// so callers must consume it before reusing — the range-step scan does.
+// RateWindowSummariesForStepsReuse computes a windowed rate summary at each
+// step for one series, reusing buf's scratch across calls so a scan over many
+// series allocates the summary slice and prefix arrays once. The returned
+// slice aliases buf and is only valid until the next call with the same buf;
+// callers must consume it before reusing — the range-step scan does. A nil buf
+// allocates fresh.
 func RateWindowSummariesForStepsReuse(buf *RateStepBuf, seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options) ([]RateSummary, error) {
 	return rateSummariesForSteps(buf, seriesID, timestamps, values, steps, window, opts, 1)
 }
@@ -1152,27 +918,6 @@ func rateSummariesForSteps(buf *RateStepBuf, seriesID uint64, timestamps []int64
 		}
 	}
 	return out, nil
-}
-
-//nolint:unused // reserved for v1 histogram query execution
-func counterIncreasePrefix(values []int64) []int64 {
-	increasePrefix, _ := counterDeltaPrefixes(values)
-	return increasePrefix
-}
-
-func counterDeltaPrefixes(values []int64) ([]int64, []int) {
-	prefix := make([]int64, len(values))
-	resets := make([]int, len(values))
-	for i := 1; i < len(values); i++ {
-		prefix[i] = prefix[i-1]
-		resets[i] = resets[i-1]
-		if delta := values[i] - values[i-1]; delta > 0 {
-			prefix[i] += delta
-		} else if delta < 0 {
-			resets[i]++
-		}
-	}
-	return prefix, resets
 }
 
 func validateMaxSampleGap(opts Options) error {
