@@ -20,6 +20,8 @@ type CardinalityGuard struct {
 	keysPerService map[string]map[string]struct{}
 }
 
+// NewCardinalityGuard returns a guard with the given limits; a zero limit
+// disables that check.
 func NewCardinalityGuard(maxAttrsPerEntry, maxValueBytes, maxKeysPerSvc int) *CardinalityGuard {
 	return &CardinalityGuard{
 		maxAttrsPerEntry: maxAttrsPerEntry,

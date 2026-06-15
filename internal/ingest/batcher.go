@@ -25,12 +25,17 @@ type item struct {
 	barrier chan struct{}
 }
 
+// Errors returned by the Send methods when an entry is rejected on the hot path.
 var (
 	ErrQueueFull   = errors.New("ingest queue full")
 	ErrBreakerOpen = errors.New("ingest circuit breaker open")
 	ErrCardinality = errors.New("ingest cardinality limit exceeded")
 )
 
+// Batcher is the asynchronous ingest path: SendLog/SendSpan enqueue entries
+// that per-kind background workers batch and write through to storage,
+// applying the cardinality guard and a per-lane circuit breaker. It is the
+// production ingest entry point. Safe for concurrent use.
 type Batcher struct {
 	logManager       *storage.SegmentManager
 	spanManager      *storage.SegmentManager
@@ -99,6 +104,8 @@ func (m *kindMetrics) dropCardinality(reason string) *selfobs.Counter {
 	return nil
 }
 
+// Deps are the collaborators a Batcher writes through to: the segment managers,
+// sparse indexes, active indexer, cardinality guard, cache invalidator, and logger.
 type Deps struct {
 	LogManager  *storage.SegmentManager
 	SpanManager *storage.SegmentManager
@@ -110,6 +117,8 @@ type Deps struct {
 	Logger      *slog.Logger
 }
 
+// Config tunes the batcher. The top-level fields are defaults; Logs and Spans
+// override them per lane (a zero lane field falls back to the top-level value).
 type Config struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
@@ -119,6 +128,7 @@ type Config struct {
 	Spans            LaneConfig
 }
 
+// LaneConfig overrides batching and breaker settings for one lane (logs or spans).
 type LaneConfig struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
@@ -133,6 +143,8 @@ type laneConfig struct {
 	breakerThreshold uint64
 }
 
+// NewBatcher builds a batcher from its dependencies and config. Call Start to
+// launch the workers.
 func NewBatcher(deps Deps, cfg Config) *Batcher {
 	logCfg := resolveLaneConfig(cfg, cfg.Logs)
 	spanCfg := resolveLaneConfig(cfg, cfg.Spans)
@@ -187,28 +199,37 @@ func resolveLaneConfig(base Config, lane LaneConfig) laneConfig {
 	}
 }
 
+// IsBreakerOpen reports whether either lane's circuit breaker is open.
 func (b *Batcher) IsBreakerOpen() bool {
 	return b.IsLogBreakerOpen() || b.IsSpanBreakerOpen()
 }
 
+// IsLogBreakerOpen reports whether the log lane's breaker is open.
 func (b *Batcher) IsLogBreakerOpen() bool {
 	return b.logBreaker > 0 && b.logFailures.Load() >= b.logBreaker
 }
 
+// IsSpanBreakerOpen reports whether the span lane's breaker is open.
 func (b *Batcher) IsSpanBreakerOpen() bool {
 	return b.spanBreaker > 0 && b.spanFailures.Load() >= b.spanBreaker
 }
 
+// Start launches the per-lane worker goroutines; they stop when ctx is
+// cancelled. Wait blocks until they finish.
 func (b *Batcher) Start(ctx context.Context) {
 	b.wg.Add(2)
 	go b.run(ctx, b.logQueue, b.logBatchSize, b.logBatchTimeout, b.processLogBatch)
 	go b.run(ctx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, b.processSpanBatch)
 }
 
+// Wait blocks until the worker goroutines have drained and exited.
 func (b *Batcher) Wait() {
 	b.wg.Wait()
 }
 
+// SendLog enqueues a log entry. It returns ErrBreakerOpen, ErrQueueFull, or
+// ErrCardinality when the entry is rejected; a nil return means queued, not yet
+// durable (the worker writes and fsyncs it).
 func (b *Batcher) SendLog(entry model.LogEntry) error {
 	if b.IsLogBreakerOpen() {
 		b.logM.breakerOpen.Inc()
@@ -233,6 +254,7 @@ func (b *Batcher) SendLog(entry model.LogEntry) error {
 	}
 }
 
+// SendSpan enqueues a span, mirroring SendLog's reject errors and async semantics.
 func (b *Batcher) SendSpan(span model.SpanEntry) error {
 	if b.IsSpanBreakerOpen() {
 		b.spanM.breakerOpen.Inc()
@@ -258,12 +280,18 @@ func (b *Batcher) SendSpan(span model.SpanEntry) error {
 	}
 }
 
+// QueueLen returns the combined depth of the log and span queues.
 func (b *Batcher) QueueLen() int { return b.LogQueueLen() + b.SpanQueueLen() }
 
+// LogQueueLen returns the current depth of the log queue.
 func (b *Batcher) LogQueueLen() int { return len(b.logQueue) }
 
+// SpanQueueLen returns the current depth of the span queue.
 func (b *Batcher) SpanQueueLen() int { return len(b.spanQueue) }
 
+// TrySendLog enqueues a log entry without blocking, returning false if the
+// queue is full. Used by self-observation to avoid feedback when ingesting its
+// own metrics.
 func (b *Batcher) TrySendLog(entry model.LogEntry) bool {
 	return b.SendLog(entry) == nil
 }

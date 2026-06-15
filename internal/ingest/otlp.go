@@ -13,6 +13,7 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
+// ExtractResource pulls service.name and host.name from OTLP resource attributes.
 func ExtractResource(attrs []*commonpb.KeyValue) (service, host string) {
 	for _, kv := range attrs {
 		switch kv.Key {
@@ -25,6 +26,8 @@ func ExtractResource(attrs []*commonpb.KeyValue) (service, host string) {
 	return
 }
 
+// OTLPLogToEntry converts an OTLP log record (with its resource service/host)
+// into a model.LogEntry.
 func OTLPLogToEntry(lr *logspb.LogRecord, service, host string) (model.LogEntry, error) {
 	level, _ := model.LevelFromString(lr.SeverityText)
 
@@ -57,6 +60,8 @@ func OTLPLogToEntry(lr *logspb.LogRecord, service, host string) (model.LogEntry,
 	return entry, nil
 }
 
+// OTLPSpanToEntry converts an OTLP span (with its resource service) into a
+// model.SpanEntry.
 func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) {
 	var traceID model.TraceID
 	var spanID model.SpanID
@@ -91,6 +96,7 @@ func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) 
 	return entry, nil
 }
 
+// OTLPStatusToModel maps an OTLP span status to the model's SpanStatus.
 func OTLPStatusToModel(s *tracepb.Status) model.SpanStatus {
 	if s == nil {
 		return model.SpanStatusUnset
@@ -105,6 +111,8 @@ func OTLPStatusToModel(s *tracepb.Status) model.SpanStatus {
 	}
 }
 
+// AnyValueToString renders an OTLP AnyValue as a string (JSON for composite
+// kinds), the form amber stores attribute values in.
 func AnyValueToString(v *commonpb.AnyValue) string {
 	if v == nil {
 		return ""
