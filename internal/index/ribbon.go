@@ -6,10 +6,16 @@ import (
 	"github.com/dariasmyr/fts-engine/pkg/filter"
 )
 
+// RibbonFilter is an approximate set-membership filter over a segment's keys
+// (e.g. service names, FTS tokens), used to skip segments that cannot match a
+// query before any scan. It is best-effort: a build failure degrades to a scan.
 type RibbonFilter struct {
 	inner *filter.RibbonFilter
 }
 
+// BuildRibbonFilter builds a filter over keys. An empty key set yields an
+// empty filter that matches nothing. The second parameter is unused (the
+// window width is fixed; see the comment within).
 func BuildRibbonFilter(keys [][]byte, _ uint8) (*RibbonFilter, error) {
 	if len(keys) == 0 {
 		return &RibbonFilter{}, nil
@@ -39,6 +45,8 @@ func BuildRibbonFilter(keys [][]byte, _ uint8) (*RibbonFilter, error) {
 	return &RibbonFilter{inner: rf}, nil
 }
 
+// Contains reports whether key may be present. False is definitive (the key is
+// absent); true may be a false positive, so callers still verify by scanning.
 func (f *RibbonFilter) Contains(key []byte) bool {
 	if f.inner == nil {
 		return false
@@ -46,6 +54,7 @@ func (f *RibbonFilter) Contains(key []byte) bool {
 	return f.inner.Contains(key)
 }
 
+// Save writes the filter to path atomically.
 func (f *RibbonFilter) Save(path string) error {
 	if f.inner == nil {
 		return atomicWriteFile(path, nil)
@@ -55,6 +64,7 @@ func (f *RibbonFilter) Save(path string) error {
 	})
 }
 
+// LoadRibbonFilter reads a filter previously written by Save.
 func LoadRibbonFilter(path string) (*RibbonFilter, error) {
 	file, err := os.Open(path)
 	if err != nil {

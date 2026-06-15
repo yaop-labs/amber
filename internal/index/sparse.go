@@ -10,6 +10,7 @@ import (
 	"sync"
 )
 
+// SegmentTimeRange is the event-time span [MinTS, MaxTS] of one segment.
 type SegmentTimeRange struct {
 	SegmentID uint32
 	FileName  string
@@ -17,6 +18,8 @@ type SegmentTimeRange struct {
 	MaxTS     int64
 }
 
+// SparseIndex maps segments to their time spans so a time-bounded query can
+// skip segments that cannot overlap it. It is safe for concurrent use.
 type SparseIndex struct {
 	mu     sync.RWMutex
 	ranges []SegmentTimeRange
@@ -38,6 +41,8 @@ func (s *SparseIndex) Add(r SegmentTimeRange) {
 	s.ranges = append(s.ranges, r)
 }
 
+// Touch widens a segment's recorded span to include ts, adding the segment if
+// it is not yet tracked.
 func (s *SparseIndex) Touch(segmentID uint32, fileName string, ts int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -60,6 +65,7 @@ func (s *SparseIndex) Touch(segmentID uint32, fileName string, ts int64) {
 	})
 }
 
+// TouchRange widens a segment's recorded span to cover [minTS, maxTS].
 func (s *SparseIndex) TouchRange(segmentID uint32, fileName string, minTS, maxTS int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,6 +99,7 @@ func (s *SparseIndex) Remove(segmentID uint32) {
 	}
 }
 
+// Lookup returns the segments whose span overlaps [from, to].
 func (s *SparseIndex) Lookup(from, to int64) []SegmentTimeRange {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -109,6 +116,7 @@ func (s *SparseIndex) Lookup(from, to int64) []SegmentTimeRange {
 	return result
 }
 
+// All returns every tracked segment span, sorted by start time.
 func (s *SparseIndex) All() []SegmentTimeRange {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -128,6 +136,7 @@ func (s *SparseIndex) Size() int {
 
 const sparseIndexFile = "sparse.idx"
 
+// Save writes the index to sparse.idx in dir atomically.
 func (s *SparseIndex) Save(dir string) error {
 	s.mu.RLock()
 	data, err := json.MarshalIndent(s.ranges, "", "  ")
@@ -143,6 +152,8 @@ func (s *SparseIndex) Save(dir string) error {
 	return nil
 }
 
+// LoadSparseIndex reads the index from dir, returning an empty index when no
+// file exists yet.
 func LoadSparseIndex(dir string) (*SparseIndex, error) {
 	path := dir + "/" + sparseIndexFile
 

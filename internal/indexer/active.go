@@ -22,6 +22,9 @@ type kindSlot struct {
 	name   string
 }
 
+// ActiveIndex holds the in-memory bitmap index of the current active log and
+// span segments. It rotates its bitmap lazily when the manager seals a segment
+// and opens a new one. It is safe for concurrent use.
 type ActiveIndex struct {
 	logManager  *storage.SegmentManager
 	spanManager *storage.SegmentManager
@@ -31,6 +34,7 @@ type ActiveIndex struct {
 	span kindSlot
 }
 
+// New returns an ActiveIndex over the given log and span segment managers.
 func New(logManager, spanManager *storage.SegmentManager) *ActiveIndex {
 	return &ActiveIndex{
 		logManager:  logManager,
@@ -75,10 +79,13 @@ func (a *ActiveIndex) ensure(mgr *storage.SegmentManager, slot *kindSlot) *index
 	return fresh
 }
 
+// LookupLog returns the active log bitmap if it indexes segment name, letting
+// queries against the unsealed segment use the index instead of a scan.
 func (a *ActiveIndex) LookupLog(name string) (*index.MultiFieldIndex, bool) {
 	return a.lookup(&a.log, name)
 }
 
+// LookupSpan is LookupLog for the active span segment.
 func (a *ActiveIndex) LookupSpan(name string) (*index.MultiFieldIndex, bool) {
 	return a.lookup(&a.span, name)
 }
@@ -91,6 +98,7 @@ func (a *ActiveIndex) activeSpan() *index.MultiFieldIndex {
 	return a.ensure(a.spanManager, &a.span)
 }
 
+// IndexLogEntry adds one log entry's indexable fields to the active log bitmap.
 func (a *ActiveIndex) IndexLogEntry(entry model.LogEntry) {
 	idx := a.activeLog()
 	if idx == nil {
@@ -111,6 +119,7 @@ func (a *ActiveIndex) IndexLogEntry(entry model.LogEntry) {
 	}
 }
 
+// IndexSpanEntry adds one span's indexable fields to the active span bitmap.
 func (a *ActiveIndex) IndexSpanEntry(span model.SpanEntry) {
 	idx := a.activeSpan()
 	if idx == nil {
@@ -127,6 +136,8 @@ func (a *ActiveIndex) IndexSpanEntry(span model.SpanEntry) {
 	}
 }
 
+// IndexLogEntries adds a batch of log entries to the active log bitmap in one
+// pass, the path the batcher uses after a write.
 func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 	if len(entries) == 0 {
 		return
@@ -183,6 +194,7 @@ func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 	flush("trace_id", traceGroups)
 }
 
+// IndexSpanEntries adds a batch of spans to the active span bitmap in one pass.
 func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	if len(spans) == 0 {
 		return

@@ -95,10 +95,13 @@ type ftsBuildEntry struct {
 
 var ftsPipeline = textproc.DefaultMultilingualPipeline()
 
+// TokenizeFTS splits and stems text into searchable tokens, the pipeline
+// applied identically at index time and query time.
 func TokenizeFTS(text string) []string {
 	return ftsPipeline.Process(text)
 }
 
+// NewFTSIndex returns an empty index in build mode, ready for Add.
 func NewFTSIndex() *FTSIndex {
 	return &FTSIndex{byHash: make(map[uint64]int32)}
 }
@@ -398,6 +401,9 @@ func intersectSorted(a, b []uint64) []uint64 {
 //	crc32 IEEE over everything above [4, little-endian]
 var ftsMagic = [4]byte{'A', 'F', 'T', '2'}
 
+// Save seals the build state and writes the index to path in the AFT2 format,
+// then demotes the index to file-backed mode so the resident unique-token
+// arrays can be released.
 func (f *FTSIndex) Save(path string) error {
 	f.seal()
 	written := 0
@@ -470,6 +476,8 @@ func (f *FTSIndex) Save(path string) error {
 	return nil
 }
 
+// LoadFTSIndex opens an AFT2 index at path in file-backed mode: the dictionary
+// is resident but the df==1 unique section is searched on disk with pread.
 func LoadFTSIndex(path string) (*FTSIndex, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

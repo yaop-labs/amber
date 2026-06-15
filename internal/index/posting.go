@@ -70,6 +70,8 @@ type PostingListBuilder struct {
 	pairs   []rawPair
 }
 
+// NewPostingListBuilder returns a builder for keys of keySize bytes (16 for
+// trace IDs).
 func NewPostingListBuilder(keySize int) *PostingListBuilder {
 	return &PostingListBuilder{keySize: keySize}
 }

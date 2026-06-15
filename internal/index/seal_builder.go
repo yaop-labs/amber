@@ -193,6 +193,9 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 	return out, nil
 }
 
+// BuildLogBitmapIndex builds just the log bitmap sidecar by scanning the
+// segment. Prefer BuildLogSealIndexes, which builds every sidecar in one scan;
+// the single-index builders exist for tests and targeted rebuilds.
 func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {
@@ -239,6 +242,8 @@ func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex
 	return idx, nil
 }
 
+// BuildLogFTSIndex builds just the log full-text sidecar by scanning the
+// segment (see BuildLogBitmapIndex on preferring the one-pass build).
 func BuildLogFTSIndex(segmentPath string, log *slog.Logger) (*FTSIndex, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {
@@ -276,6 +281,8 @@ func BuildLogFTSIndex(segmentPath string, log *slog.Logger) (*FTSIndex, error) {
 	return idx, nil
 }
 
+// BuildLogRibbonFilter builds just the log service-name ribbon filter by
+// scanning the segment.
 func BuildLogRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {
@@ -319,6 +326,8 @@ func BuildLogRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter, 
 	return f, nil
 }
 
+// BuildSpanRibbonFilter builds just the span service-name ribbon filter by
+// scanning the segment.
 func BuildSpanRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {
@@ -362,6 +371,8 @@ func BuildSpanRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter,
 	return f, nil
 }
 
+// BuildLogFTSRibbon builds just the log FTS-token ribbon filter (used to skip
+// segments for full-text queries) by scanning the segment.
 func BuildLogFTSRibbon(segmentPath string, log *slog.Logger) (*RibbonFilter, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {
@@ -490,6 +501,8 @@ func BuildSpanPostingList(segmentPath string, log *slog.Logger) (*PostingList, e
 	return pl, nil
 }
 
+// BuildSpanBitmapIndex builds just the span bitmap sidecar by scanning the
+// segment (see BuildSpanSealIndexes for the one-pass build).
 func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex, error) {
 	sr, err := storage.OpenSegmentReader(segmentPath, nil)
 	if err != nil {

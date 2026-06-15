@@ -101,10 +101,12 @@ func (b *BitmapIndex) bucket(value string) *valueBucket {
 	return vb
 }
 
+// Add records that entryID carries value.
 func (b *BitmapIndex) Add(value string, entryID uint64) {
 	b.bucket(value).add(entryID)
 }
 
+// AddMany records that every id in ids carries value.
 func (b *BitmapIndex) AddMany(value string, ids []uint64) {
 	if len(ids) == 0 {
 		return
@@ -139,6 +141,8 @@ func (b *BitmapIndex) Cardinality() int {
 	return len(b.values)
 }
 
+// MultiFieldIndex is a set of BitmapIndexes keyed by field name, the per-segment
+// index that answers field=value (and AND/OR) entry-ID lookups for queries.
 type MultiFieldIndex struct {
 	mu     sync.RWMutex
 	fields map[string]*BitmapIndex
@@ -316,6 +320,7 @@ func UnionSorted(a, b []uint64) []uint64 {
 // until then.
 var bitmapIndexMagic = [4]byte{'B', 'I', 'D', '2'}
 
+// Save writes the index to path atomically in the BID2 format.
 func (m *MultiFieldIndex) Save(path string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -382,6 +387,9 @@ func (m *MultiFieldIndex) Save(path string) error {
 	})
 }
 
+// LoadMultiFieldIndex reads a BID2 index from path, verifying the CRC. It
+// rejects the legacy roaring ("BIDX") format and corrupt files with an error so
+// the caller can fall back to a scan and rebuild.
 func LoadMultiFieldIndex(path string) (*MultiFieldIndex, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
