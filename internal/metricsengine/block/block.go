@@ -1,3 +1,16 @@
+// Package block implements amber's on-disk metrics block format (.meb): a
+// contiguous section of per-series timestamp and value chunks, followed by a
+// directory of per-series metadata, followed by a fixed footer.
+//
+// File layout:
+//
+//	"MEB1" | version[2] | chunk section | directory | footer
+//
+// The chunk section holds every series' encoded timestamp and value payloads
+// written sequentially. The directory (DirectoryEntry per series) carries the
+// labels, chunk offsets, zone map, and aggregate buckets; it is encoded as the
+// MDB2 binary form (directory_binary.go) or, for legacy blocks, JSON. The
+// 24-byte footer is dir_off[8] | dir_len[8] | dir_crc[4] | "MEF1".
 package block
 
 import (
@@ -25,6 +38,7 @@ const (
 	defaultAggregateBucketSize = 64
 )
 
+// Series is the input to WriteFile: one series' samples before encoding.
 type Series struct {
 	ID         uint64
 	Type       model.MetricType
@@ -33,6 +47,8 @@ type Series struct {
 	Values     []int64
 }
 
+// ZoneMap summarizes a series' values for decode-free pruning and aggregation:
+// min/max/sum/count plus first/last and monotonicity (counter reset) flags.
 type ZoneMap struct {
 	Min       int64 `json:"min"`
 	Max       int64 `json:"max"`
@@ -44,6 +60,9 @@ type ZoneMap struct {
 	HasReset  bool  `json:"has_reset"`
 }
 
+// AggregateBucket is a fixed-size window of a series' samples pre-aggregated at
+// write time, so range aggregations can answer from the directory without
+// decoding the value chunk when a window is fully covered.
 type AggregateBucket struct {
 	TimeMin int64 `json:"time_min"`
 	TimeMax int64 `json:"time_max"`
@@ -53,6 +72,9 @@ type AggregateBucket struct {
 	Count   int   `json:"count"`
 }
 
+// DirectoryEntry is the per-series directory record: its labels, time range,
+// the offsets/lengths and codec parameters of its timestamp and value chunks
+// within the chunk section, the zone map, and the aggregate buckets.
 type DirectoryEntry struct {
 	SeriesID         uint64                  `json:"series_id"`
 	Type             model.MetricType        `json:"type"`
@@ -74,11 +96,14 @@ type DirectoryEntry struct {
 	AggregateBuckets []AggregateBucket       `json:"aggregate_buckets,omitempty"`
 }
 
+// Directory is a block's full set of per-series entries.
 type Directory struct {
 	Version uint16           `json:"version"`
 	Series  []DirectoryEntry `json:"series"`
 }
 
+// TimeRange returns the min and max event time across all series, and false
+// when the directory is empty.
 func (d Directory) TimeRange() (int64, int64, bool) {
 	if len(d.Series) == 0 {
 		return 0, 0, false
@@ -96,15 +121,24 @@ func (d Directory) TimeRange() (int64, int64, bool) {
 	return min, max, true
 }
 
+// DecodedSeries is a series' directory entry paired with its decoded samples,
+// the unit handed to scan callbacks and returned by the read helpers.
 type DecodedSeries struct {
 	Entry      DirectoryEntry
 	Timestamps []int64
 	Values     []int64
 }
 
+// EntryFilter selects which directory entries a read or scan visits.
 type EntryFilter func(DirectoryEntry) bool
+
+// SeriesFunc receives each decoded series during a scan; returning an error
+// stops the scan.
 type SeriesFunc func(DecodedSeries) error
 
+// WriteFile encodes series into a metrics block at path. Identical timestamp
+// streams are stored once and shared across series. The write is atomic: it
+// goes to a temp file, fsyncs, then renames and fsyncs the directory.
 func WriteFile(path string, series []Series) error {
 	var buf bytes.Buffer
 	if _, err := buf.WriteString(fileMagic); err != nil {
@@ -213,6 +247,8 @@ func WriteFile(path string, series []Series) error {
 	return syncDir(filepath.Dir(path))
 }
 
+// normalizeSeries returns the series with samples stably sorted by timestamp,
+// the ordering the codecs and zone map assume.
 func normalizeSeries(s Series) Series {
 	if len(s.Timestamps) != len(s.Values) || len(s.Timestamps) <= 1 {
 		return s
@@ -292,6 +328,8 @@ func syncDir(dir string) error {
 	return file.Sync()
 }
 
+// ReadDirectory reads and verifies just the directory of a block — its
+// per-series metadata, no chunk payloads.
 func ReadDirectory(path string) (Directory, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -336,10 +374,13 @@ func ReadDirectory(path string) (Directory, error) {
 	return decodeDirectoryPayload(dirPayload, dirCRC)
 }
 
+// ReadFile decodes every series in a block.
 func ReadFile(path string) ([]DecodedSeries, error) {
 	return ReadFileFiltered(path, nil)
 }
 
+// ReadFileFiltered decodes the series whose directory entry passes filter
+// (nil = all), returning independent copies of the samples.
 func ReadFileFiltered(path string, filter EntryFilter) ([]DecodedSeries, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -354,6 +395,8 @@ func ReadFileFiltered(path string, filter EntryFilter) ([]DecodedSeries, error) 
 	return readFileFilteredWithDirectory(file, dir, filter)
 }
 
+// ReadFileFilteredWithDirectory is ReadFileFiltered using a directory the
+// caller already read, avoiding a second footer read.
 func ReadFileFilteredWithDirectory(path string, dir Directory, filter EntryFilter) ([]DecodedSeries, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -373,10 +416,17 @@ func readFileFilteredWithDirectory(file *os.File, dir Directory, filter EntryFil
 	return out, err
 }
 
+// ScanFileFilteredWithDirectory invokes fn for each matching series, handing it
+// independent copies of the timestamps and values that are safe to retain after
+// the callback returns.
 func ScanFileFilteredWithDirectory(path string, dir Directory, filter EntryFilter, fn SeriesFunc) error {
 	return scanFileFilteredWithDirectoryPath(path, dir, filter, true, true, fn)
 }
 
+// ScanFileFilteredWithDirectoryShared is the allocation-light variant: the
+// timestamp and value slices it passes to fn alias reused buffers and the
+// shared chunk section, so fn must consume them before returning and must not
+// retain them. Used by the aggregation paths that fold each series on the spot.
 func ScanFileFilteredWithDirectoryShared(path string, dir Directory, filter EntryFilter, fn SeriesFunc) error {
 	return scanFileFilteredWithDirectoryPath(path, dir, filter, false, false, fn)
 }
@@ -633,6 +683,8 @@ func decodeEntryTimestampsFromFileCopy(file *os.File, entry DirectoryEntry, cach
 	return timestamps, nil
 }
 
+// BuildZoneMap computes the per-series value summary. HasReset/Monotonic are
+// raw observations; WriteFile clears them for non-counter series.
 func BuildZoneMap(values []int64) ZoneMap {
 	if len(values) == 0 {
 		return ZoneMap{}
@@ -661,6 +713,8 @@ func BuildZoneMap(values []int64) ZoneMap {
 	return z
 }
 
+// BuildAggregateBuckets pre-aggregates samples into fixed-size windows of
+// bucketSize consecutive samples for the directory.
 func BuildAggregateBuckets(timestamps []int64, values []int64, bucketSize int) []AggregateBucket {
 	if bucketSize <= 0 || len(timestamps) == 0 || len(timestamps) != len(values) {
 		return nil
