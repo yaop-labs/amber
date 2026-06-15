@@ -1,3 +1,6 @@
+// Package index maintains the in-memory series registry: the mapping from
+// label sets to series IDs, label-matching selectors, and the retention-driven
+// eviction of cold series.
 package index
 
 import (
@@ -10,8 +13,10 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
+// SeriesID is the registry's dense identifier for a series.
 type SeriesID uint64
 
+// MatchOp is a label matcher's comparison operator.
 type MatchOp uint8
 
 const (
@@ -21,12 +26,15 @@ const (
 	MatchNotRegexp
 )
 
+// Matcher constrains one label by name and operator.
 type Matcher struct {
 	Name  string
 	Op    MatchOp
 	Value string
 }
 
+// Selector is a conjunction of matchers; a series matches when it satisfies all
+// of them.
 type Selector struct {
 	Matchers []Matcher
 }
@@ -37,6 +45,7 @@ func NewSelector(matchers ...Matcher) Selector {
 	return Selector{Matchers: append([]Matcher(nil), matchers...)}
 }
 
+// MetricName builds an equality matcher on the reserved __name__ label.
 func MetricName(name string) Matcher {
 	return LabelEqual(model.MetricNameLabel, name)
 }
@@ -66,6 +75,9 @@ func (s Selector) Validate() error {
 	return nil
 }
 
+// Optimized returns the selector with matchers reordered cheapest-first
+// (equality before regexp) so intersection starts from the most selective,
+// least costly predicates.
 func (s Selector) Optimized() Selector {
 	out := Selector{Matchers: append([]Matcher(nil), s.Matchers...)}
 	sort.SliceStable(out.Matchers, func(i, j int) bool {
@@ -82,6 +94,10 @@ func (s Selector) Optimized() Selector {
 	return out
 }
 
+// Registry is the in-memory series index. It assigns dense IDs to label sets,
+// answers equality-selector lookups from per-label postings, and tracks each
+// series' last-touch time so the eviction sweep can drop cold series. It is
+// safe for concurrent use.
 type Registry struct {
 	mu       sync.RWMutex
 	next     SeriesID
@@ -419,6 +435,10 @@ func (r *Registry) Labels(id SeriesID) (model.LabelSet, bool) {
 	return append(model.LabelSet(nil), labels...), ok
 }
 
+// Match returns the sorted IDs of series satisfying the selector. An empty
+// selector matches every series. Matchers are intersected starting from the
+// smallest posting list; only equality matchers are supported here (regexp and
+// negative matchers are handled on the scan path, not the registry).
 func (r *Registry) Match(selector Selector) ([]SeriesID, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
