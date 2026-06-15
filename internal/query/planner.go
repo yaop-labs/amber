@@ -6,6 +6,8 @@ import (
 	"github.com/yaop-labs/amber/internal/index"
 )
 
+// ExecutionPlan is the planned log query: the candidate segments after time
+// pruning and the ordered steps the executor will run.
 type ExecutionPlan struct {
 	Segments       []index.SegmentTimeRange
 	Steps          []PlanStep
@@ -13,6 +15,7 @@ type ExecutionPlan struct {
 	PrunedSegments int
 }
 
+// PlanStep is one stage of log query execution.
 type PlanStep uint8
 
 const (
@@ -43,14 +46,19 @@ func (s PlanStep) String() string {
 	}
 }
 
+// Planner builds an ExecutionPlan for a log query using the sparse index for
+// time-based segment pruning.
 type Planner struct {
 	sparse *index.SparseIndex
 }
 
+// NewPlanner returns a planner backed by the given sparse index.
 func NewPlanner(sparse *index.SparseIndex) *Planner {
 	return &Planner{sparse: sparse}
 }
 
+// Plan prunes segments by time and assembles the steps (bitmap filter, FTS,
+// fetch, post-filter, paginate) the query requires.
 func (p *Planner) Plan(q *LogQuery) *ExecutionPlan {
 	plan := &ExecutionPlan{
 		TotalSegments: p.sparse.Size(),
@@ -90,6 +98,7 @@ func (p *Planner) Plan(q *LogQuery) *ExecutionPlan {
 	return plan
 }
 
+// HasStep reports whether the plan includes the given step.
 func (plan *ExecutionPlan) HasStep(step PlanStep) bool {
 	return slices.Contains(plan.Steps, step)
 }

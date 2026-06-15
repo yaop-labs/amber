@@ -13,6 +13,8 @@ const (
 	MaxSpanLimit = 100_000
 )
 
+// LogQuery describes a log search: time range, field filters, full-text query,
+// trace ID, page size, and an optional pagination cursor.
 type LogQuery struct {
 	From     time.Time
 	To       time.Time
@@ -30,6 +32,8 @@ type LogQuery struct {
 	Cursor string
 }
 
+// Validate checks the query and normalizes it in place: a zero Limit becomes
+// DefaultLimit, and the cursor is verified decodable.
 func (q *LogQuery) Validate() error {
 	if q.Limit < 0 {
 		return fmt.Errorf("query: limit cannot be negative")
@@ -68,6 +72,8 @@ func (q *LogQuery) FromUnixNano() int64 {
 	return q.From.UnixNano()
 }
 
+// ToUnixNano returns To as Unix nanoseconds, or maxint64 (open-ended) when To
+// is unset. FromUnixNano returns 0 when From is unset.
 func (q *LogQuery) ToUnixNano() int64 {
 	if q.To.IsZero() {
 		return int64(^uint64(0) >> 1)
@@ -75,6 +81,9 @@ func (q *LogQuery) ToUnixNano() int64 {
 	return q.To.UnixNano()
 }
 
+// LogResult is a page of matching log entries. TotalHits is a lower bound, not
+// an exact count: the heap-threshold block skip can stop early, so it must not
+// be used for verification (use admin segment stats instead).
 type LogResult struct {
 	Entries   []model.LogEntry
 	TotalHits int
@@ -90,6 +99,8 @@ type LogResult struct {
 	CacheHit   bool `json:"cache_hit,omitempty"`
 }
 
+// SpanQuery describes a span search: time range, service/operation/status
+// filters, trace ID, duration bounds, page size, and an optional cursor.
 type SpanQuery struct {
 	From        time.Time
 	To          time.Time
@@ -120,6 +131,7 @@ func (q *SpanQuery) ToUnixNano() int64 {
 	return q.To.UnixNano()
 }
 
+// Validate checks the query and normalizes Limit in place, like LogQuery.Validate.
 func (q *SpanQuery) Validate() error {
 	if q.Limit < 0 {
 		return fmt.Errorf("query: span limit cannot be negative")
@@ -139,6 +151,8 @@ func (q *SpanQuery) Validate() error {
 	return nil
 }
 
+// SpanResult is a page of matching spans. TotalHits is a lower bound, as in
+// LogResult.
 type SpanResult struct {
 	Spans     []model.SpanEntry
 	TotalHits int

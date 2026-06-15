@@ -90,6 +90,10 @@ func spanEntryNewer(a, b model.SpanEntry) bool {
 	return bytes.Compare(a.ID[:], b.ID[:]) > 0
 }
 
+// Executor runs log and span queries: it prunes segments, applies the bitmap,
+// FTS, ribbon, and posting-list sidecars (registered warm at seal time and
+// LRU-cached when loaded from disk), reverse-scans with a top-k heap, and
+// paginates by cursor. It also serves a result cache. Safe for concurrent use.
 type Executor struct {
 	logManager  *storage.SegmentManager
 	spanManager *storage.SegmentManager
@@ -388,6 +392,9 @@ const (
 	defaultResultCacheTTL  = 5 * time.Second
 )
 
+// NewExecutor builds an executor with the default index cache size and no
+// explicit segment directories (sealed sidecars are loaded relative to the
+// managers). NewExecutorWithCache gives full control.
 func NewExecutor(
 	logManager *storage.SegmentManager,
 	spanManager *storage.SegmentManager,
@@ -397,6 +404,8 @@ func NewExecutor(
 	return NewExecutorWithCache(logManager, spanManager, logSparse, spanSparse, "", "", defaultIndexCacheSize)
 }
 
+// NewExecutorWithCache builds an executor with the given log/span segment
+// directories and sealed-index LRU cache size.
 func NewExecutorWithCache(
 	logManager *storage.SegmentManager,
 	spanManager *storage.SegmentManager,
@@ -444,6 +453,8 @@ func (e *Executor) SetSegmentStores(logStore, spanStore storage.SegmentStore, lo
 	}
 }
 
+// InvalidateLogSegment drops cached sidecar indexes for a log segment, e.g.
+// after it is removed by retention.
 func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 	if e.logReaders != nil {
 		e.logReaders.invalidate(e.logManager.SegmentPath(seg))
@@ -469,6 +480,7 @@ func (e *Executor) InvalidateResultRange(from, to int64) {
 	e.resultCache.invalidateRange(from, to)
 }
 
+// InvalidateSpanSegment drops cached sidecar indexes for a span segment.
 func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
 	if e.spanReaders != nil {
 		e.spanReaders.invalidate(e.spanManager.SegmentPath(seg))
@@ -480,6 +492,7 @@ func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
 	e.resultCache.clear()
 }
 
+// Close releases the executor's cached resources.
 func (e *Executor) Close() {
 	if e.logReaders != nil {
 		e.logReaders.close()
@@ -489,40 +502,52 @@ func (e *Executor) Close() {
 	}
 }
 
+// The Register* methods install a freshly built sidecar index for a sealed
+// segment directly into the executor's caches ("warm registration"), so the
+// first query after a seal skips reloading it from disk.
+
+// RegisterBitmapIndex registers a log segment's bitmap index.
 func (e *Executor) RegisterBitmapIndex(segmentFile string, idx *index.MultiFieldIndex) {
 	e.logBitmapCache.put(segmentFile, idx)
 }
 
+// RegisterSpanBitmapIndex registers a span segment's bitmap index.
 func (e *Executor) RegisterSpanBitmapIndex(segmentFile string, idx *index.MultiFieldIndex) {
 	e.spanBitmapCache.put(segmentFile, idx)
 }
 
+// RegisterFTSIndex registers a log segment's full-text index.
 func (e *Executor) RegisterFTSIndex(segmentFile string, idx *index.FTSIndex) {
 	e.ftsCache.put(segmentFile, idx)
 }
 
+// RegisterLogRibbon registers a log segment's service-name ribbon filter.
 func (e *Executor) RegisterLogRibbon(segmentFile string, f *index.RibbonFilter) {
 	e.sealedMu.Lock()
 	e.logRibbons[segmentFile] = f
 	e.sealedMu.Unlock()
 }
 
+// RegisterLogFTSRibbon registers a log segment's FTS-token ribbon filter.
 func (e *Executor) RegisterLogFTSRibbon(segmentFile string, f *index.RibbonFilter) {
 	e.sealedMu.Lock()
 	e.logFTSRibbons[segmentFile] = f
 	e.sealedMu.Unlock()
 }
 
+// RegisterSpanRibbon registers a span segment's service-name ribbon filter.
 func (e *Executor) RegisterSpanRibbon(segmentFile string, f *index.RibbonFilter) {
 	e.sealedMu.Lock()
 	e.spanRibbons[segmentFile] = f
 	e.sealedMu.Unlock()
 }
 
+// RegisterLogPostingList registers a log segment's trace-ID posting list.
 func (e *Executor) RegisterLogPostingList(segmentFile string, pl *index.PostingList) {
 	e.logPostingCache.put(segmentFile, pl)
 }
 
+// RegisterSpanPostingList registers a span segment's trace-ID posting list.
 func (e *Executor) RegisterSpanPostingList(segmentFile string, pl *index.PostingList) {
 	e.spanPostingCache.put(segmentFile, pl)
 }
@@ -629,6 +654,8 @@ func (e *Executor) spanRibbon(name string) (*index.RibbonFilter, bool) {
 	return f, ok
 }
 
+// Services returns the distinct service names known across segments, for the
+// services API.
 func (e *Executor) Services() []string {
 	seen := make(map[string]struct{})
 
@@ -737,6 +764,9 @@ func filterQueryableSegments(segs []index.SegmentTimeRange, manager *storage.Seg
 	return out
 }
 
+// ExecLog runs a log query: it serves from the result cache when possible,
+// otherwise prunes segments, applies the available indexes, reverse-scans newest
+// first into a top-k heap, post-filters, and returns one cursor-paginated page.
 func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err error) {
 	start := time.Now()
 	defer func() {
@@ -1070,6 +1100,8 @@ func (e *Executor) execLogSegment(
 	return matched, nil
 }
 
+// ExecSpan runs a span query, mirroring ExecLog: index-assisted, reverse-scan
+// top-k, post-filter (service, operation, duration, status), cursor-paginated.
 func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, err error) {
 	start := time.Now()
 	cacheHit := false
