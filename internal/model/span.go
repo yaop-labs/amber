@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// SpanStatus is the OTLP span status code.
 type SpanStatus uint8
 
 const (
@@ -28,6 +29,7 @@ func (s SpanStatus) String() string {
 	}
 }
 
+// SpanEntry is a single trace span as stored in the WAL and span segments.
 type SpanEntry struct {
 	ID        EntryID
 	TraceID   TraceID
@@ -41,6 +43,7 @@ type SpanEntry struct {
 	Attrs     []Attr
 }
 
+// NewSpanEntry builds a span with a freshly minted ID and StartTime set to now.
 func NewSpanEntry(traceID TraceID, spanID SpanID, parentID SpanID, service, operation string) (SpanEntry, error) {
 	id, err := NewEntryID()
 	if err != nil {
@@ -67,6 +70,14 @@ func (s *SpanEntry) IsRoot() bool {
 	return IsZeroSpanID(s.ParentID)
 }
 
+// WriteTo encodes the span in amber's binary record format:
+//
+//	id[16] | trace_id[16] | span_id[8] | parent_id[8] |
+//	service[u16-len+bytes] | operation[u16-len+bytes] |
+//	start[8 LE unixnano] | end[8 LE unixnano] | status[1] |
+//	attr_count[2] | (key[u16-len+bytes], value[u16-len+bytes])*
+//
+// ReadFrom and DecodeBytes are its inverses.
 func (s *SpanEntry) WriteTo(w io.Writer) (int64, error) {
 	var n int64
 
@@ -154,6 +165,8 @@ func (s *SpanEntry) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
+// DecodeBytes decodes a span from an in-memory slice, the read path used by
+// segment scans.
 func (s *SpanEntry) DecodeBytes(data []byte) error {
 	off := 0
 
@@ -230,6 +243,7 @@ func (s *SpanEntry) DecodeBytes(data []byte) error {
 	return nil
 }
 
+// ReadFrom decodes a span written by WriteTo from a stream.
 func (s *SpanEntry) ReadFrom(r io.Reader) (int64, error) {
 	var n int64
 

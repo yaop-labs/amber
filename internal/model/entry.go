@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// Level is a log severity, ordered from least to most severe.
 type Level uint8
 
 const (
@@ -42,6 +43,8 @@ func (l Level) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + l.String() + `"`), nil
 }
 
+// LevelFromString parses a level name case-insensitively ("WARNING" maps to
+// LevelWarn). An unrecognized name returns LevelInfo and an error.
 func LevelFromString(s string) (Level, error) {
 	switch s {
 	case "TRACE", "trace":
@@ -66,6 +69,7 @@ type Attr struct {
 	Value string
 }
 
+// LogEntry is a single log record as stored in the WAL and segments.
 type LogEntry struct {
 	ID        EntryID
 	Timestamp time.Time
@@ -78,6 +82,7 @@ type LogEntry struct {
 	Attrs     []Attr
 }
 
+// NewLogEntry builds an entry with a freshly minted ID and the current time.
 func NewLogEntry(level Level, service, host, body string, attrs ...Attr) (LogEntry, error) {
 	id, err := NewEntryID()
 	if err != nil {
@@ -95,6 +100,14 @@ func NewLogEntry(level Level, service, host, body string, attrs ...Attr) (LogEnt
 	}, nil
 }
 
+// WriteTo encodes the entry in amber's binary record format, the layout shared
+// by the WAL and the segment files:
+//
+//	id[16] | ts[8 LE unixnano] | level[1] | service[u16-len+bytes] |
+//	host[u16-len+bytes] | trace_id[16] | span_id[8] | body[u32-len+bytes] |
+//	attr_count[2] | (key[u16-len+bytes], value[u16-len+bytes])*
+//
+// ReadFrom and DecodeBytes are its inverses.
 func (e *LogEntry) WriteTo(w io.Writer) (int64, error) {
 	var n int64
 
@@ -175,6 +188,8 @@ func (e *LogEntry) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
+// ReadFrom decodes a record written by WriteTo from a stream. DecodeBytes is
+// the allocation-light counterpart for records already in memory.
 func (e *LogEntry) ReadFrom(r io.Reader) (int64, error) {
 	var n int64
 
@@ -278,6 +293,8 @@ func writeString(w io.Writer, s string) (int64, error) {
 	return n, err
 }
 
+// writeLargeString is writeString with a 4-byte length prefix, used for the
+// body field where strings may exceed 64 KiB.
 func writeLargeString(w io.Writer, s string) (int64, error) {
 	var lenBuf [4]byte
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(s)))
@@ -325,6 +342,9 @@ func readLargeStringBytes(data []byte, off int) (string, int, error) {
 	return s, off + length, nil
 }
 
+// DecodeBytes decodes a record from an in-memory slice, the read path used by
+// segment scans. It avoids the per-field stream reads of ReadFrom; string
+// fields still allocate (they are copied out of data).
 func (e *LogEntry) DecodeBytes(data []byte) error {
 	off := 0
 
