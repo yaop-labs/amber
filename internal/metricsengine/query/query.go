@@ -1,3 +1,12 @@
+// Package query executes read-only computations over metrics blocks and head
+// snapshots: series selection, label-grouped aggregation, and counter rate and
+// increase over a single window or per range step. Results are exact.
+//
+// Many functions form families distinguished by suffix:
+//   - WithDirectory operates on a block file, reusing a directory the caller
+//     already read; InSeries operates on in-memory series (the head snapshot);
+//   - Steps computes a value at every step of a range, not a single window;
+//   - ByLabel groups results by one label's value.
 package query
 
 import (
@@ -9,6 +18,8 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
+// Options bounds which samples a query considers. Nil pointers leave a bound
+// unset. See the constructors in options.go.
 type Options struct {
 	StartMillis        *int64
 	EndMillis          *int64
@@ -17,11 +28,15 @@ type Options struct {
 	MaxSampleGapMillis *int64
 }
 
+// RateResult is one series' per-second counter rate.
 type RateResult struct {
 	SeriesID uint64
 	Rate     float64
 }
 
+// RateSummary is the windowed counter statistics for one series: the first and
+// last sample, the total monotonic increase (reset-aware), and the number of
+// resets and samples observed. Rate is derived from it via RateFromSummary.
 type RateSummary struct {
 	SeriesID    uint64
 	Labels      model.LabelSet
@@ -34,6 +49,7 @@ type RateSummary struct {
 	Count       int
 }
 
+// Aggregate is a running sum/count/min/max over a set of values.
 type Aggregate struct {
 	Sum   int64
 	Count int
@@ -41,6 +57,7 @@ type Aggregate struct {
 	Max   int64
 }
 
+// Avg returns the mean, or 0 for an empty aggregate.
 func (a Aggregate) Avg() float64 {
 	if a.Count == 0 {
 		return 0
@@ -48,6 +65,7 @@ func (a Aggregate) Avg() float64 {
 	return float64(a.Sum) / float64(a.Count)
 }
 
+// SelectBlock decodes the series in a block that match the selector and bounds.
 func SelectBlock(path string, selector index.Selector, opts Options) ([]block.DecodedSeries, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -61,6 +79,7 @@ func SelectBlock(path string, selector index.Selector, opts Options) ([]block.De
 	return trimSeries(series, opts), nil
 }
 
+// SelectBlockWithDirectory is SelectBlock using a directory already read.
 func SelectBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options) ([]block.DecodedSeries, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -74,6 +93,7 @@ func SelectBlockWithDirectory(path string, dir block.Directory, selector index.S
 	return trimSeries(series, opts), nil
 }
 
+// SelectSeries filters and trims in-memory series by the selector and bounds.
 func SelectSeries(input []block.Series, selector index.Selector, opts Options) ([]block.DecodedSeries, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -99,6 +119,9 @@ func SelectSeries(input []block.Series, selector index.Selector, opts Options) (
 	return trimSeries(out, opts), nil
 }
 
+// ScanBlockWithDirectoryShared streams matching series to fn without
+// materializing them all; the samples alias shared buffers (see
+// block.ScanFileFilteredWithDirectoryShared), so fn must not retain them.
 func ScanBlockWithDirectoryShared(path string, dir block.Directory, selector index.Selector, opts Options, fn block.SeriesFunc) error {
 	if err := selector.Validate(); err != nil {
 		return err
@@ -108,6 +131,7 @@ func ScanBlockWithDirectoryShared(path string, dir block.Directory, selector ind
 	}, fn)
 }
 
+// ScanSeries streams matching in-memory series to fn.
 func ScanSeries(input []block.Series, selector index.Selector, opts Options, fn block.SeriesFunc) error {
 	if err := selector.Validate(); err != nil {
 		return err
@@ -134,6 +158,8 @@ func ScanSeries(input []block.Series, selector index.Selector, opts Options, fn 
 	return nil
 }
 
+// AggregateByLabel groups the samples of in-memory series by the value of one
+// label and returns the per-group sum/count/min/max.
 func AggregateByLabel(series []block.DecodedSeries, label string) map[string]Aggregate {
 	out := make(map[string]Aggregate)
 	for _, s := range series {
@@ -150,6 +176,10 @@ func AggregateByLabel(series []block.DecodedSeries, label string) map[string]Agg
 	return out
 }
 
+// AggregateByLabelStepsInBlockWithDirectory computes the label-grouped
+// aggregate over each step's window. It answers from the directory's aggregate
+// buckets where they fully cover a window and decodes only the series and steps
+// that need it.
 func AggregateByLabelStepsInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]AggregateStep, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -228,6 +258,10 @@ func aggregateByLabelStepsInBlockBucketsHybrid(path string, dir block.Directory,
 	return out, nil
 }
 
+// AggregateByLabelStepsInDirectoryBuckets answers the stepped aggregate purely
+// from the directory's aggregate buckets, without reading chunks. It returns
+// false when any step window is not fully covered by buckets, signalling the
+// caller to fall back to a decode.
 func AggregateByLabelStepsInDirectoryBuckets(dir block.Directory, selector index.Selector, label string, steps []int64, window time.Duration) ([]AggregateStep, bool) {
 	if err := selector.Validate(); err != nil {
 		return nil, false
@@ -264,6 +298,10 @@ func AggregateByLabelStepsInDirectoryBuckets(dir block.Directory, selector index
 	return out, true
 }
 
+// AggregateByLabelInBlockWithDirectory computes the label-grouped aggregate
+// over a single window. Without point filters it uses the directory zone maps;
+// with them it answers from aggregate buckets where possible and decodes the
+// rest.
 func AggregateByLabelInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options, label string) (map[string]Aggregate, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -372,6 +410,8 @@ func aggregateByLabelInBlockPayload(path string, dir block.Directory, selector i
 	return out, nil
 }
 
+// AggregateByLabelInDirectory computes the label-grouped aggregate from the
+// directory zone maps alone, used when no per-sample time/value filter applies.
 func AggregateByLabelInDirectory(dir block.Directory, selector index.Selector, opts Options, label string) map[string]Aggregate {
 	out := make(map[string]Aggregate)
 	for _, entry := range dir.Series {
@@ -389,6 +429,8 @@ func AggregateByLabelInDirectory(dir block.Directory, selector index.Selector, o
 	return out
 }
 
+// Rate returns the per-second counter rate of each in-memory series over its
+// full sample span, reset-aware.
 func Rate(series []block.DecodedSeries) ([]RateResult, error) {
 	out := make([]RateResult, 0, len(series))
 	for _, s := range series {
@@ -404,6 +446,8 @@ func Rate(series []block.DecodedSeries) ([]RateResult, error) {
 	return out, nil
 }
 
+// RateByLabelStepsInBlockWithDirectory computes the label-grouped counter rate
+// in each step's trailing window, summing per-series rates within a group.
 func RateByLabelStepsInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]FloatStep, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -428,6 +472,8 @@ func RateByLabelStepsInBlockWithDirectory(path string, dir block.Directory, sele
 	return out, nil
 }
 
+// IncreaseByLabelStepsInBlockWithDirectory is the counter-increase counterpart
+// of RateByLabelStepsInBlockWithDirectory.
 func IncreaseByLabelStepsInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, label string, startMillis int64, endMillis int64, step time.Duration, window time.Duration) ([]IntStep, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -554,6 +600,8 @@ func accumulateAggregateByLabelSelectedSteps(out []AggregateStep, steps []int64,
 	return nil
 }
 
+// RateByLabelInBlockWithDirectory computes the label-grouped counter rate over
+// the single window given by opts.
 func RateByLabelInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options, label string) (map[string]float64, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -582,6 +630,8 @@ func RateByLabelInBlockWithDirectory(path string, dir block.Directory, selector 
 	return out, nil
 }
 
+// IncreaseByLabelInBlockWithDirectory is the counter-increase counterpart of
+// RateByLabelInBlockWithDirectory.
 func IncreaseByLabelInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options, label string) (map[string]int64, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -610,6 +660,8 @@ func IncreaseByLabelInBlockWithDirectory(path string, dir block.Directory, selec
 	return out, nil
 }
 
+// RateSummariesInBlockWithDirectory returns the per-series RateSummary (with
+// labels attached) for series matching the selector and window.
 func RateSummariesInBlockWithDirectory(path string, dir block.Directory, selector index.Selector, opts Options) ([]RateSummary, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -634,6 +686,8 @@ func RateSummariesInBlockWithDirectory(path string, dir block.Directory, selecto
 	return out, nil
 }
 
+// RateByLabelInSeries is RateByLabelInBlockWithDirectory for in-memory series
+// (the head snapshot).
 func RateByLabelInSeries(input []block.Series, selector index.Selector, opts Options, label string) (map[string]float64, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -666,6 +720,8 @@ func RateByLabelInSeries(input []block.Series, selector index.Selector, opts Opt
 	return out, nil
 }
 
+// IncreaseByLabelInSeries is IncreaseByLabelInBlockWithDirectory for in-memory
+// series.
 func IncreaseByLabelInSeries(input []block.Series, selector index.Selector, opts Options, label string) (map[string]int64, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -698,6 +754,8 @@ func IncreaseByLabelInSeries(input []block.Series, selector index.Selector, opts
 	return out, nil
 }
 
+// RateSummariesInSeries is RateSummariesInBlockWithDirectory for in-memory
+// series.
 func RateSummariesInSeries(input []block.Series, selector index.Selector, opts Options) ([]RateSummary, error) {
 	if err := selector.Validate(); err != nil {
 		return nil, err
@@ -738,6 +796,10 @@ func rateOneSamples(timestamps []int64, values []int64, opts Options) (float64, 
 	return RateFromSummary(summary)
 }
 
+// RateSummaryForSamples computes the RateSummary for one series' raw samples,
+// trimming to the window in opts. It returns ok=false when fewer than two
+// samples remain, the span is non-positive, or a stale gap suppresses the rate.
+// Decreases are counted as counter resets rather than negative increase.
 func RateSummaryForSamples(seriesID uint64, timestamps []int64, values []int64, opts Options) (RateSummary, bool, error) {
 	if len(timestamps) != len(values) {
 		return RateSummary{}, false, errors.New("query: timestamp/value length mismatch")
@@ -1085,6 +1147,9 @@ func seriesMayContainSamples(entry block.DirectoryEntry, opts Options) bool {
 	return true
 }
 
+// RateFromSummary derives the per-second rate (increase over elapsed seconds)
+// from a summary, returning ok=false when it has fewer than two samples or a
+// non-positive time span.
 func RateFromSummary(summary RateSummary) (float64, bool, error) {
 	if summary.Count < 2 {
 		return 0, false, nil

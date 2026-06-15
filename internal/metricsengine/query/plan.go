@@ -8,6 +8,7 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 )
 
+// Operation is the kind of query a Plan describes.
 type Operation int
 
 const (
@@ -24,6 +25,8 @@ const (
 	OpAggregateByLabelRangeSteps
 )
 
+// Plan is a fully specified query: the operation, its selector/range, the time
+// span and step, and the group-by label. Which fields apply depends on Operation.
 type Plan struct {
 	Operation     Operation
 	Selector      index.Selector
@@ -35,6 +38,8 @@ type Plan struct {
 	ByLabel       string
 }
 
+// Result holds a query's output; only the fields relevant to the operation are
+// populated.
 type Result struct {
 	Series         []block.DecodedSeries
 	Aggregates     map[string]Aggregate
@@ -45,6 +50,9 @@ type Result struct {
 	AggregateSteps []AggregateStep
 }
 
+// ExecutionPath is a strategy the planner can choose to satisfy a plan, trading
+// decode work against memory (materialize all series, stream block-by-block,
+// answer from directory zone maps or aggregate buckets, coalesce summaries).
 type ExecutionPath int
 
 const (
@@ -57,6 +65,8 @@ const (
 	PathCoalescedSummaries
 )
 
+// CandidateStats are the cardinality estimates (block/head series and samples,
+// step count, bucket coverage) the planner scores execution paths against.
 type CandidateStats struct {
 	BlockCount          int
 	BlockSeries         int
@@ -70,6 +80,8 @@ type CandidateStats struct {
 	PartialBucketSeries int
 }
 
+// PlanCost is the estimated cost of one execution path; planCandidateScore
+// reduces it to a single comparable score.
 type PlanCost struct {
 	EstimatedSeries         int
 	EstimatedSamples        int
@@ -81,12 +93,15 @@ type PlanCost struct {
 	UsesBuckets             bool
 }
 
+// PlanCandidate is one scored execution-path option.
 type PlanCandidate struct {
 	Path  ExecutionPath
 	Cost  PlanCost
 	Score int64
 }
 
+// ExecutionPlan is the planner's decision: the chosen path and its cost, plus
+// the inputs and all considered candidates for Explain.
 type ExecutionPlan struct {
 	Plan       Plan
 	Path       ExecutionPath
@@ -95,6 +110,8 @@ type ExecutionPlan struct {
 	Candidates []PlanCandidate
 }
 
+// Validate checks that the plan's selector, range, and step are well-formed for
+// its operation.
 func (p Plan) Validate() error {
 	switch p.Operation {
 	case OpSelect, OpSumByLabel, OpAggregateByLabel, OpRateByLabel, OpIncreaseByLabel:
@@ -112,6 +129,9 @@ func (p Plan) Validate() error {
 	}
 }
 
+// StorageSelectorOptions returns the optimized selector and the read-time
+// bounds the storage layer should scan with. For range-step operations it
+// widens the start by one window so the first step has its lookback samples.
 func (p Plan) StorageSelectorOptions() (index.Selector, Options, error) {
 	if err := p.Validate(); err != nil {
 		return index.Selector{}, Options{}, err
@@ -133,6 +153,9 @@ func (p Plan) StorageSelectorOptions() (index.Selector, Options, error) {
 	}
 }
 
+// PlanExecution enumerates the viable execution paths for plan given the
+// cardinality stats, scores each, and returns the cheapest along with all
+// candidates.
 func PlanExecution(plan Plan, stats CandidateStats) (ExecutionPlan, error) {
 	if err := plan.Validate(); err != nil {
 		return ExecutionPlan{}, err
@@ -238,6 +261,9 @@ func newPlanCandidate(path ExecutionPath, cost PlanCost) PlanCandidate {
 	return PlanCandidate{Path: path, Cost: cost, Score: planCandidateScore(cost)}
 }
 
+// planCandidateScore collapses a cost into a single comparable number (lower is
+// cheaper): decoded samples dominate, coalescing is penalized, and directory or
+// bucket answers are discounted. chooseBestCandidate picks the minimum.
 func planCandidateScore(cost PlanCost) int64 {
 	score := int64(cost.EstimatedDecodedSamples)*10 + int64(cost.EstimatedSamples) + int64(cost.EstimatedSeries)*5 + int64(cost.StepCount)
 	if cost.RequiresCoalesce {
@@ -312,6 +338,8 @@ func validateRangeSelector(rangeSelector RangeSelector) error {
 	return nil
 }
 
+// DirectoryStats returns the matching series and sample counts from a block
+// directory alone, feeding the planner's CandidateStats.
 func DirectoryStats(dir block.Directory, selector index.Selector, opts Options) (int, int, error) {
 	if err := selector.Validate(); err != nil {
 		return 0, 0, err
@@ -328,6 +356,10 @@ func DirectoryStats(dir block.Directory, selector index.Selector, opts Options) 
 	return seriesCount, sampleCount, nil
 }
 
+// DirectoryBucketStats reports how much of the matching data the directory's
+// aggregate buckets cover: series with a fully-covered bucket, the samples
+// those buckets represent, and series needing a chunk decode. Returns zeros
+// when a value filter rules out the bucket fast path.
 func DirectoryBucketStats(dir block.Directory, selector index.Selector, opts Options) (int, int, int, error) {
 	if err := selector.Validate(); err != nil {
 		return 0, 0, 0, err
@@ -369,6 +401,8 @@ func DirectoryBucketStats(dir block.Directory, selector index.Selector, opts Opt
 	return bucketSeries, bucketSamples, partialSeries, nil
 }
 
+// SeriesStats returns the matching series and sample counts for in-memory
+// series (the head), the head-side counterpart of DirectoryStats.
 func SeriesStats(input []block.Series, selector index.Selector, opts Options) (int, int, error) {
 	if err := selector.Validate(); err != nil {
 		return 0, 0, err
