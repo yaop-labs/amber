@@ -1,3 +1,5 @@
+// Package otlp adapts OTLP metric points into the engine's storage samples,
+// including the float-to-scaled-int64 conversion and its overflow guards.
 package otlp
 
 import (
@@ -9,6 +11,7 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
+// NumberKind distinguishes an integer from a floating-point data point.
 type NumberKind uint8
 
 const (
@@ -16,6 +19,7 @@ const (
 	NumberFloat
 )
 
+// MetricKind is the OTLP metric instrument type of a point.
 type MetricKind uint8
 
 const (
@@ -25,6 +29,8 @@ const (
 	MetricExponentialHistogram
 )
 
+// Point is one OTLP data point with its name, attributes, value (int or float
+// with the scale used to store floats as int64), and instrument kind.
 type Point struct {
 	Name       string
 	Kind       MetricKind
@@ -36,6 +42,7 @@ type Point struct {
 	Scale      int64
 }
 
+// Batch is a set of OTLP points sharing resource and scope attributes.
 type Batch struct {
 	ResourceAttributes map[string]string
 	ScopeAttributes    map[string]string
