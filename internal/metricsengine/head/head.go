@@ -1,3 +1,6 @@
+// Package head holds the in-memory write buffer of scalar samples that have not
+// yet been flushed to a block. Queries read it alongside the sealed blocks; a
+// flush snapshots it and Reset clears it.
 package head
 
 import (
@@ -9,6 +12,7 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
+// Head buffers unflushed samples per series. It is safe for concurrent use.
 type Head struct {
 	mu       sync.RWMutex
 	registry *index.Registry
@@ -32,6 +36,8 @@ func New(registry *index.Registry) *Head {
 	}
 }
 
+// Append resolves the series ID for labels (creating it and updating eviction
+// bookkeeping) and buffers the sample. It returns the series ID.
 func (h *Head) Append(labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) index.SeriesID {
 	id := h.registry.GetOrCreateAt(labels, timestamp)
 	return h.AppendWithID(id, labels, typ, timestamp, value)
@@ -57,6 +63,7 @@ func (h *Head) AppendWithID(id index.SeriesID, labels model.LabelSet, typ model.
 	return id
 }
 
+// Snapshot returns a copy of every buffered series.
 func (h *Head) Snapshot() []block.Series {
 	return h.SnapshotMatching(nil)
 }
@@ -115,6 +122,8 @@ func (h *Head) SampleCount() int {
 	return count
 }
 
+// Reset drops all buffered series. It is called after a flush commits their
+// samples to a block.
 func (h *Head) Reset() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
