@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -28,60 +27,9 @@ type logQueryResponse struct {
 	CacheHit   bool             `json:"cache_hit,omitempty"`
 }
 
-type httpCacheEntry struct {
-	body    []byte
-	expires int64
-}
-
-type httpCache struct {
-	mu      sync.Mutex
-	entries map[string]httpCacheEntry
-	ttl     time.Duration
-	maxSize int
-}
-
-func newHTTPCache(maxSize int, ttl time.Duration) *httpCache {
-	return &httpCache{
-		entries: make(map[string]httpCacheEntry, maxSize),
-		ttl:     ttl,
-		maxSize: maxSize,
-	}
-}
-
-func (c *httpCache) get(key string) ([]byte, bool) {
-	c.mu.Lock()
-	e, ok := c.entries[key]
-	c.mu.Unlock()
-	if !ok || time.Now().UnixNano() > e.expires {
-		return nil, false
-	}
-	return e.body, true
-}
-
-func (c *httpCache) put(key string, body []byte) {
-	c.mu.Lock()
-	if len(c.entries) >= c.maxSize {
-		now := time.Now().UnixNano()
-		for k, e := range c.entries {
-			if e.expires < now {
-				delete(c.entries, k)
-			}
-		}
-		if len(c.entries) >= c.maxSize {
-			c.entries = make(map[string]httpCacheEntry, c.maxSize)
-		}
-	}
-	c.entries[key] = httpCacheEntry{
-		body:    body,
-		expires: time.Now().Add(c.ttl).UnixNano(),
-	}
-	c.mu.Unlock()
-}
-
 type QueryHandler struct {
-	exec  *query.Executor
-	log   *slog.Logger
-	cache *httpCache
+	exec *query.Executor
+	log  *slog.Logger
 }
 
 func NewQueryHandler(exec *query.Executor, log *slog.Logger) *QueryHandler {
@@ -97,24 +45,6 @@ func wantsNDJSON(r *http.Request) bool {
 
 func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ndjson := wantsNDJSON(r)
-
-	cacheKey := r.URL.RawQuery
-	if ndjson {
-		cacheKey = "ndjson:" + cacheKey
-	}
-
-	if h.cache != nil {
-		if body, ok := h.cache.get(cacheKey); ok {
-			if ndjson {
-				w.Header().Set("Content-Type", "application/x-ndjson")
-			} else {
-				w.Header().Set("Content-Type", "application/json")
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Write(body)
-			return
-		}
-	}
 
 	q, err := parseLogQuery(r)
 	if err != nil {
@@ -168,10 +98,6 @@ func (h *QueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body = buf.Bytes()
-	}
-
-	if h.cache != nil {
-		h.cache.put(cacheKey, body)
 	}
 
 	w.Header().Set("Content-Type", contentType)

@@ -15,9 +15,8 @@ import (
 )
 
 type TraceHandler struct {
-	exec  *query.Executor
-	log   *slog.Logger
-	cache *httpCache
+	exec *query.Executor
+	log  *slog.Logger
 }
 
 func NewTraceHandler(exec *query.Executor, log *slog.Logger) *TraceHandler {
@@ -39,15 +38,6 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if traceIDStr == "" {
 		writeError(w, http.StatusBadRequest, "missing trace_id")
 		return
-	}
-
-	if h.cache != nil {
-		if body, ok := h.cache.get(traceIDStr); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write(body)
-			return
-		}
 	}
 
 	traceIDBytes, err := hex.DecodeString(traceIDStr)
@@ -100,9 +90,6 @@ func (h *TraceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := buf.Bytes()
-	if h.cache != nil {
-		h.cache.put(traceIDStr, body)
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
