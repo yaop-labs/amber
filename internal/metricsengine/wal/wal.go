@@ -1,3 +1,7 @@
+// Package wal is the metrics engine's write-ahead log: an append-only file of
+// length+CRC framed binary records (series declarations, scalar samples, and
+// histogram sketches) replayed on open to rebuild the unflushed head. The
+// writer is fail-stop and replay tolerates a torn tail; see Replay and WAL.
 package wal
 
 import (
@@ -55,6 +59,8 @@ type legacyRecord struct {
 	Value     int64            `json:"value"`
 }
 
+// WAL is an append-only, fsync-on-commit write-ahead log. It is safe for
+// concurrent use and fail-stops after a write or fsync error (see failed).
 type WAL struct {
 	mu   sync.Mutex
 	path string
@@ -77,6 +83,8 @@ func (w *WAL) failStop(err error) error {
 	return err
 }
 
+// Open opens (creating if needed) the WAL at path for appending. Recover the
+// existing contents with RecoverReplay before opening for append.
 func Open(path string) (*WAL, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -89,6 +97,9 @@ func (w *WAL) Append(record Record) error {
 	return w.AppendBatch([]Record{record})
 }
 
+// AppendBatch encodes records, writes them, and fsyncs before returning, so a
+// nil return means the batch is durable. A write or fsync failure fail-stops
+// the WAL.
 func (w *WAL) AppendBatch(records []Record) error {
 	if len(records) == 0 {
 		return nil
@@ -324,6 +335,8 @@ func (r *byteReader) str() string {
 	return s
 }
 
+// Truncate resets the WAL to empty, called after a flush durably commits its
+// records to a block. It refuses to run on a failed writer.
 func (w *WAL) Truncate() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -470,6 +483,8 @@ func replayValid(path string, fn func(Record) error, repair bool) (RecoverStats,
 	return stats, nil
 }
 
+// HasRecords reports whether the WAL file exists and is non-empty, used as a
+// tie-breaker when reconciling flush markers on open.
 func HasRecords(path string) (bool, error) {
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
