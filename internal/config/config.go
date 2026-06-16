@@ -10,6 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config is the root of the standalone server's YAML configuration; each field
+// is a top-level section.
 type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	Ingest    IngestConfig    `yaml:"ingest"`
@@ -44,6 +46,7 @@ type MetricsConfig struct {
 	DogfoodInterval time.Duration `yaml:"dogfood_interval"`
 }
 
+// DebugConfig configures debug/profiling endpoints.
 type DebugConfig struct {
 	Pprof     bool   `yaml:"pprof"`
 	PprofAddr string `yaml:"pprof_addr"`
@@ -83,6 +86,7 @@ func (s StreamRetentionConfig) HasGlobalTier() bool {
 	return s.MaxAge > 0 || s.MaxBytes > 0 || s.MaxSegments > 0
 }
 
+// S3Config configures the optional S3-compatible storage tier.
 type S3Config struct {
 	Bucket   string `yaml:"bucket"`
 	Prefix   string `yaml:"prefix"`
@@ -93,6 +97,7 @@ type S3Config struct {
 	ReconcileOnStart bool `yaml:"reconcile_on_start"`
 }
 
+// StorageConfig configures the data directory, segment rotation, and S3 tier.
 type StorageConfig struct {
 	DataDir           string   `yaml:"data_dir"`
 	SegmentMaxRecords uint64   `yaml:"segment_max_records"`
@@ -101,6 +106,7 @@ type StorageConfig struct {
 	S3                S3Config `yaml:"s3"`
 }
 
+// IngestConfig configures the batcher and its per-lane overrides.
 type IngestConfig struct {
 	BatchSize             int              `yaml:"batch_size"`
 	BatchTimeout          time.Duration    `yaml:"batch_timeout"`
@@ -114,6 +120,7 @@ type IngestConfig struct {
 	MaxAttrKeysPerService int              `yaml:"max_attr_keys_per_service"`
 }
 
+// IngestLaneConfig overrides ingest settings for one lane (logs or spans).
 type IngestLaneConfig struct {
 	BatchSize        int           `yaml:"batch_size"`
 	BatchTimeout     time.Duration `yaml:"batch_timeout"`
@@ -127,6 +134,7 @@ type NamedAPIKey struct {
 	Key  string `yaml:"key"`
 }
 
+// APIConfig configures the HTTP and gRPC listeners and API keys.
 type APIConfig struct {
 	HTTPAddr          string        `yaml:"http_addr"`
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
@@ -155,6 +163,7 @@ func (c APIConfig) ResolvedAPIKeys() []NamedAPIKey {
 	return nil
 }
 
+// LogConfig configures the server's own logging (level, format).
 type LogConfig struct {
 	Level  string `yaml:"level"`
 	Format string `yaml:"format"`
@@ -203,6 +212,7 @@ func Default() *Config {
 	}
 }
 
+// Load reads, parses, and validates the YAML config at path, applying defaults.
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
@@ -250,6 +260,7 @@ func detectLegacyRetention(data []byte) error {
 	return fmt.Errorf("retention.{%s} moved under retention.logs / retention.spans (breaking change); please rename in your config", strings.Join(found, ","))
 }
 
+// Validate reports the first invalid or inconsistent setting in the config.
 func (c *Config) Validate() error {
 	if c.Storage.DataDir == "" {
 		return fmt.Errorf("storage.data_dir is required")

@@ -16,6 +16,7 @@ type Sample struct {
 	Value  float64
 }
 
+// SampleLabel is one name/value label on a metric sample.
 type SampleLabel struct {
 	Name, Value string
 }

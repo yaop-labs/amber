@@ -38,6 +38,8 @@ type CounterVec struct {
 	children map[string]*Counter
 }
 
+// NewCounterVec creates a labeled counter family with the given metric name,
+// help text, and label keys.
 func NewCounterVec(name, help string, labels ...string) *CounterVec {
 	return &CounterVec{
 		name:     name,
@@ -47,6 +49,9 @@ func NewCounterVec(name, help string, labels ...string) *CounterVec {
 	}
 }
 
+// WithLabelValues returns the counter for one combination of label values,
+// creating it on first use. It panics if the value count does not match the
+// label keys.
 func (cv *CounterVec) WithLabelValues(values ...string) *Counter {
 	if len(values) != len(cv.labels) {
 		panic(fmt.Sprintf("metrics: %s expects %d labels, got %d", cv.name, len(cv.labels), len(values)))
@@ -144,6 +149,8 @@ type HistogramVec struct {
 	children map[string]*Histogram
 }
 
+// NewHistogramVec creates a labeled histogram family with the given name, help,
+// bucket upper bounds, and label keys.
 func NewHistogramVec(name, help string, buckets []float64, labels ...string) *HistogramVec {
 	return &HistogramVec{
 		name:     name,
@@ -154,6 +161,8 @@ func NewHistogramVec(name, help string, buckets []float64, labels ...string) *Hi
 	}
 }
 
+// WithLabelValues returns the histogram for one combination of label values,
+// creating it on first use.
 func (hv *HistogramVec) WithLabelValues(values ...string) *Histogram {
 	if len(values) != len(hv.labels) {
 		panic(fmt.Sprintf("metrics: %s expects %d labels, got %d", hv.name, len(hv.labels), len(values)))
@@ -191,24 +200,28 @@ var (
 	funcMetrics   []funcMetric
 )
 
+// RegisterCounterVec adds a counter family to the default registry exposed by Handler.
 func RegisterCounterVec(cv *CounterVec) {
 	regMu.Lock()
 	defer regMu.Unlock()
 	counterVecs = append(counterVecs, cv)
 }
 
+// RegisterHistogramVec adds a histogram family to the default registry.
 func RegisterHistogramVec(hv *HistogramVec) {
 	regMu.Lock()
 	defer regMu.Unlock()
 	histogramVecs = append(histogramVecs, hv)
 }
 
+// RegisterGaugeFunc registers a gauge whose value is read from fn at scrape time.
 func RegisterGaugeFunc(name, help string, fn func() float64) {
 	regMu.Lock()
 	defer regMu.Unlock()
 	funcMetrics = append(funcMetrics, funcMetric{name, help, "gauge", fn})
 }
 
+// RegisterCounterFunc registers a counter whose value is read from fn at scrape time.
 func RegisterCounterFunc(name, help string, fn func() float64) {
 	regMu.Lock()
 	defer regMu.Unlock()
@@ -290,6 +303,8 @@ func init() {
 	RegisterHistogramVec(MetricsQueryDuration)
 }
 
+// Handler returns an http.Handler that serves the registered metrics in the
+// Prometheus text exposition format.
 func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
