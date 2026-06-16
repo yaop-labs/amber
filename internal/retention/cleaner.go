@@ -25,6 +25,10 @@ type Policy struct {
 
 func (p Policy) hasLocalTier() bool { return p.LocalMaxAge > 0 || p.LocalMaxBytes > 0 }
 
+// Cleaner enforces a retention policy for one stream (logs or spans): it
+// removes sealed segments past the age or size limit and drops them from the
+// sparse index. With requireUploaded set it only deletes segments already
+// safe in remote storage.
 type Cleaner struct {
 	manager         *storage.SegmentManager
 	sparse          *index.SparseIndex
@@ -55,6 +59,8 @@ func NewCleaner(
 	}
 }
 
+// SetOnDelete registers a callback invoked for each segment the cleaner
+// removes, used to invalidate the executor's cached indexes.
 func (c *Cleaner) SetOnDelete(fn func(storage.SegmentMeta)) {
 	c.onDelete = fn
 }
@@ -307,6 +313,7 @@ func (c *Cleaner) deleteSegment(seg storage.SegmentMeta) error {
 	return nil
 }
 
+// StartLoop runs the cleaner on the given interval until done is closed.
 func (c *Cleaner) StartLoop(interval time.Duration, done <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

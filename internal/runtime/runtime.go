@@ -35,6 +35,7 @@ func joinS3Prefix(parts ...string) string {
 	return strings.Join(joined, "/")
 }
 
+// Options is the full configuration for assembling a Stack.
 type Options struct {
 	DataDir        string
 	Logger         *slog.Logger
@@ -66,6 +67,7 @@ type MetricsOptions struct {
 	DogfoodInterval time.Duration
 }
 
+// StorageOptions configures segment rotation and the optional S3 tier.
 type StorageOptions struct {
 	SegmentMaxRecords uint64
 	SegmentMaxBytes   int64
@@ -78,6 +80,7 @@ type StorageOptions struct {
 	S3ReconcileOnStart bool
 }
 
+// IngestOptions configures the batcher, with optional per-lane overrides.
 type IngestOptions struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
@@ -87,6 +90,7 @@ type IngestOptions struct {
 	Spans            IngestLaneOptions
 }
 
+// IngestLaneOptions overrides ingest settings for one lane (logs or spans).
 type IngestLaneOptions struct {
 	BatchSize        int
 	BatchTimeout     time.Duration
@@ -94,6 +98,7 @@ type IngestLaneOptions struct {
 	BreakerThreshold int
 }
 
+// CardinalityOptions configures the ingest cardinality guard.
 type CardinalityOptions struct {
 	MaxAttrsPerEntry      int
 	MaxAttrValueBytes     int
@@ -132,6 +137,10 @@ func (o Options) withDefaults() Options {
 	return out
 }
 
+// Stack is the assembled runtime: storage managers, sparse indexes, the query
+// executor, the ingest batcher, the optional metrics store, and the background
+// workers (uploaders, dogfood scraper, sealed-index bootstrap). It holds the
+// data-directory lock. amber.DB and cmd/amber are thin wrappers over it.
 type Stack struct {
 	LogManager  *storage.SegmentManager
 	SpanManager *storage.SegmentManager
@@ -164,6 +173,10 @@ type Stack struct {
 // IsReady reports whether bootstrap finished loading sealed indexes.
 func (s *Stack) IsReady() bool { return s.ready.Load() }
 
+// New assembles and starts a Stack: it takes the data-directory lock, opens
+// storage and the metrics store, wires the executor and batcher, and launches
+// the background workers. Bootstrap of sealed indexes runs asynchronously
+// (track it with Stack.IsReady). Close shuts everything down.
 func New(ctx context.Context, opts Options) (*Stack, error) {
 	if opts.DataDir == "" {
 		return nil, errors.New("runtime: DataDir required")

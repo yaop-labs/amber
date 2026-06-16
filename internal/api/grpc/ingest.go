@@ -19,6 +19,8 @@ type logsServer struct {
 	log     *slog.Logger
 }
 
+// Export implements the OTLP logs collector service: it converts the request's
+// records and enqueues them, returning Unavailable when the breaker is open.
 func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsServiceRequest) (*collectorlogs.ExportLogsServiceResponse, error) {
 	if s.batcher.IsLogBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
@@ -57,6 +59,7 @@ type tracesServer struct {
 	log     *slog.Logger
 }
 
+// Export implements the OTLP traces collector service, mirroring logsServer.Export.
 func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
 	if s.batcher.IsSpanBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")

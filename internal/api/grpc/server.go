@@ -20,6 +20,8 @@ type sender interface {
 	IsSpanBreakerOpen() bool
 }
 
+// NewServer builds a gRPC server exposing the OTLP logs and traces collector
+// services, writing received entries through batcher.
 func NewServer(batcher sender, maxRecvBytes int, log *slog.Logger) *grpc.Server {
 	var opts []grpc.ServerOption
 	if maxRecvBytes > 0 {
@@ -31,6 +33,7 @@ func NewServer(batcher sender, maxRecvBytes int, log *slog.Logger) *grpc.Server 
 	return s
 }
 
+// ListenAndServe binds addr and serves until the server is stopped.
 func ListenAndServe(s *grpc.Server, addr string) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {

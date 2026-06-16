@@ -175,6 +175,8 @@ type Stats struct {
 	} `json:"memory"`
 }
 
+// IngestLaneStats is the queue depth and breaker state of one ingest lane, as
+// reported by the admin stats endpoint.
 type IngestLaneStats struct {
 	QueueLen    int  `json:"queue_len"`
 	BreakerOpen bool `json:"breaker_open"`

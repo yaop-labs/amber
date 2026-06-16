@@ -45,6 +45,9 @@ func retryBuild(ctx context.Context, name string, log *slog.Logger, fn func() er
 	return err
 }
 
+// LoadSealedIndexes loads (or rebuilds) the sidecar indexes of all sealed
+// segments into the executor's caches in parallel at startup, so the first
+// queries hit warm indexes instead of scanning. It honors ctx for cancellation.
 func LoadSealedIndexes(
 	ctx context.Context,
 	exec *query.Executor,
@@ -176,6 +179,8 @@ func loadSpanSegments(
 	wg.Wait()
 }
 
+// SetupSealCallbacks wires the segment managers' on-seal hooks to build each
+// newly sealed segment's sidecar indexes and register them warm in the executor.
 func SetupSealCallbacks(
 	ctx context.Context,
 	exec *query.Executor,
