@@ -9,33 +9,88 @@ on:
 permissions:
   contents: read
 
+# Staged pipeline: cheap static checks gate the build, which gates the
+# expensive race test. A failure in an early stage skips everything downstream.
 jobs:
-  test:
-    name: Test
+  # ---- Stage 1: static analysis (fast, runs in parallel, no deps) ----
+  gofmt:
+    name: gofmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
-          cache: true
-
-      - name: Build
-        run: go build ./...
-
-      - name: Test
-        run: go test ./... -race -count=1 -timeout=10m
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
 
   vet:
-    name: Vet
+    name: go vet
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
           cache: true
-
       - run: go vet ./...
+
+  tidy:
+    name: go mod tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5
+          args: --timeout=5m
+
+  # ---- Stage 2: build (gated by all static checks) ----
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [gofmt, vet, tidy, lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - run: go build ./...
+
+  # ---- Stage 3: test with the race detector (gated by build) ----
+  test:
+    name: Test (race)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - run: go test ./... -race -count=1 -timeout=10m
