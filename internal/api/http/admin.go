@@ -10,6 +10,7 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
+// AdminHandler serves the admin endpoints (stats and segment listing).
 type AdminHandler struct {
 	manager *storage.SegmentManager
 	sparse  *index.SparseIndex
@@ -17,10 +18,13 @@ type AdminHandler struct {
 	log     *slog.Logger
 }
 
+// NewAdminHandler builds the admin handler for one stream's manager.
 func NewAdminHandler(manager *storage.SegmentManager, sparse *index.SparseIndex, batcher *ingest.Batcher, log *slog.Logger) *AdminHandler {
 	return &AdminHandler{manager: manager, sparse: sparse, batcher: batcher, log: log}
 }
 
+// Stats serves runtime, segment, and ingest-queue statistics as JSON. Segment
+// totals are authoritative (unlike a query's TotalHits).
 func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -87,6 +91,7 @@ func (h *AdminHandler) ingestStats() map[string]any {
 	}
 }
 
+// Segments serves the per-segment metadata list as JSON.
 func (h *AdminHandler) Segments(w http.ResponseWriter, r *http.Request) {
 	segments := h.manager.Segments()
 	writeJSON(w, http.StatusOK, map[string]any{

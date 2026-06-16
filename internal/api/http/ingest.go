@@ -10,11 +10,15 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
+// IngestHandler serves the native JSON log/span ingest endpoint, enqueuing
+// parsed entries on the batcher. A partial queue-full reject returns 503 with
+// accepted/rejected counts in the body.
 type IngestHandler struct {
 	batcher *ingest.Batcher
 	log     *slog.Logger
 }
 
+// NewIngestHandler builds the native ingest handler.
 func NewIngestHandler(batcher *ingest.Batcher, log *slog.Logger) *IngestHandler {
 	return &IngestHandler{batcher: batcher, log: log}
 }

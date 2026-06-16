@@ -12,11 +12,14 @@ import (
 	"github.com/yaop-labs/amber/internal/query"
 )
 
+// TracesHandler serves the trace search endpoint, filtering by service,
+// operation, time range, and duration.
 type TracesHandler struct {
 	exec *query.Executor
 	log  *slog.Logger
 }
 
+// NewTracesHandler builds the trace search handler.
 func NewTracesHandler(exec *query.Executor, log *slog.Logger) *TracesHandler {
 	return &TracesHandler{exec: exec, log: log}
 }
@@ -41,6 +44,25 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if v := q.Get("service"); v != "" {
 		sq.Services = splitComma(v)
+	}
+	if v := q.Get("operation"); v != "" {
+		sq.Operations = splitComma(v)
+	}
+	if v := q.Get("min_duration"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid 'min_duration': "+err.Error())
+			return
+		}
+		sq.MinDuration = d
+	}
+	if v := q.Get("max_duration"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid 'max_duration': "+err.Error())
+			return
+		}
+		sq.MaxDuration = d
 	}
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)

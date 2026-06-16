@@ -8,11 +8,13 @@ import (
 	"github.com/yaop-labs/amber/internal/query"
 )
 
+// ServicesHandler serves the endpoint listing known service names.
 type ServicesHandler struct {
 	exec *query.Executor
 	log  *slog.Logger
 }
 
+// NewServicesHandler builds the services handler.
 func NewServicesHandler(exec *query.Executor, log *slog.Logger) *ServicesHandler {
 	return &ServicesHandler{exec: exec, log: log}
 }

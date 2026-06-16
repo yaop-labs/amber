@@ -17,12 +17,15 @@ import (
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
+// OTLPHandler serves the OTLP/HTTP endpoint for logs, traces, and metrics,
+// routing logs/spans to the batcher and metrics to the metric store.
 type OTLPHandler struct {
 	batcher     *ingest.Batcher
 	metricStore *metricsengine.Store // nil when metrics are disabled
 	log         *slog.Logger
 }
 
+// NewOTLPHandler builds the OTLP handler. A nil metricStore disables metric ingest.
 func NewOTLPHandler(batcher *ingest.Batcher, metricStore *metricsengine.Store, log *slog.Logger) *OTLPHandler {
 	return &OTLPHandler{batcher: batcher, metricStore: metricStore, log: log}
 }

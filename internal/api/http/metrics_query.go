@@ -14,11 +14,14 @@ import (
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
+// MetricsQueryHandler serves the instant metric query endpoint (rate/sum/etc.
+// by label over a window).
 type MetricsQueryHandler struct {
 	store *metricsengine.Store
 	log   *slog.Logger
 }
 
+// NewMetricsQueryHandler builds the instant metric query handler.
 func NewMetricsQueryHandler(store *metricsengine.Store, log *slog.Logger) *MetricsQueryHandler {
 	return &MetricsQueryHandler{store: store, log: log}
 }
@@ -30,6 +33,7 @@ type MetricsListHandler struct {
 	log    *slog.Logger
 }
 
+// NewMetricsListHandler builds the metric-name listing handler.
 func NewMetricsListHandler(scalar *metricsengine.Store, log *slog.Logger) *MetricsListHandler {
 	return &MetricsListHandler{scalar: scalar, log: log}
 }
@@ -72,6 +76,7 @@ type MetricsStatsHandler struct {
 	log    *slog.Logger
 }
 
+// NewMetricsStatsHandler builds the metrics-store stats handler.
 func NewMetricsStatsHandler(scalar *metricsengine.Store, log *slog.Logger) *MetricsStatsHandler {
 	return &MetricsStatsHandler{scalar: scalar, log: log}
 }
@@ -255,6 +260,7 @@ type MetricsRateRangeHandler struct {
 	log   *slog.Logger
 }
 
+// NewMetricsRateRangeHandler builds the per-step range-rate query handler.
 func NewMetricsRateRangeHandler(store *metricsengine.Store, log *slog.Logger) *MetricsRateRangeHandler {
 	return &MetricsRateRangeHandler{store: store, log: log}
 }
@@ -398,6 +404,7 @@ type MetricsQuantileHandler struct {
 	log   *slog.Logger
 }
 
+// NewMetricsQuantileHandler builds the histogram-quantile query handler.
 func NewMetricsQuantileHandler(store *metricsengine.Store, log *slog.Logger) *MetricsQuantileHandler {
 	return &MetricsQuantileHandler{store: store, log: log}
 }

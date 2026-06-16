@@ -27,11 +27,13 @@ type logQueryResponse struct {
 	CacheHit   bool             `json:"cache_hit,omitempty"`
 }
 
+// QueryHandler serves the log query endpoint, returning JSON or NDJSON.
 type QueryHandler struct {
 	exec *query.Executor
 	log  *slog.Logger
 }
 
+// NewQueryHandler builds the log query handler.
 func NewQueryHandler(exec *query.Executor, log *slog.Logger) *QueryHandler {
 	return &QueryHandler{
 		exec: exec,

@@ -23,6 +23,8 @@ func APIKeyNameFromContext(ctx context.Context) (string, bool) {
 	return v, ok
 }
 
+// ReadyHandler serves a readiness probe: 200 once isReady reports true, else
+// 503 while sealed indexes are still loading.
 func ReadyHandler(isReady func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isReady != nil && !isReady() {
@@ -33,6 +35,8 @@ func ReadyHandler(isReady func() bool) http.Handler {
 	})
 }
 
+// MaxBytesMiddleware caps each request body at limit bytes (a non-positive
+// limit disables the cap).
 func MaxBytesMiddleware(limit int64, next http.Handler) http.Handler {
 	if limit <= 0 {
 		return next

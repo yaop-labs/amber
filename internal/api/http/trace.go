@@ -14,11 +14,14 @@ import (
 	"github.com/yaop-labs/amber/internal/query"
 )
 
+// TraceHandler serves a single trace by ID, returning its spans assembled into
+// a tree with their associated logs.
 type TraceHandler struct {
 	exec *query.Executor
 	log  *slog.Logger
 }
 
+// NewTraceHandler builds the single-trace handler.
 func NewTraceHandler(exec *query.Executor, log *slog.Logger) *TraceHandler {
 	return &TraceHandler{
 		exec: exec,

@@ -14,6 +14,7 @@ import (
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
+// RoutesDeps are the runtime collaborators the HTTP handlers need.
 type RoutesDeps struct {
 	Batcher    *ingest.Batcher
 	Executor   *query.Executor
@@ -27,6 +28,7 @@ type RoutesDeps struct {
 	Logger      *slog.Logger
 }
 
+// RoutesConfig holds request-level policy: API-key auth and the body-size cap.
 type RoutesConfig struct {
 	// APIKeys, when non-empty, gates every non-health route. Empty disables
 	// auth (single-node / dev). Use config.APIConfig.ResolvedAPIKeys() at
@@ -35,6 +37,8 @@ type RoutesConfig struct {
 	MaxRequestBytes int64
 }
 
+// RegisterRoutes wires every HTTP endpoint (ingest, query, trace, metrics,
+// admin, health) onto mux, applying API-key auth and the body-size limit.
 func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
