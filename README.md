@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="media/readme.png" alt="Amber" width="400">
+  <img src="media/readme.png" alt="Amber" width="900">
 </p>
-
-<h1 align="center">Amber</h1>
 
 <p align="center">
   <a href="https://github.com/yaop-labs/amber/actions/workflows/ci.yaml"><img src="https://github.com/yaop-labs/amber/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>

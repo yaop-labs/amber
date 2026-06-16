@@ -1,6 +1,6 @@
 # obsbench targets. Copy to systems.yaml and adjust ports.
 # protocol: native = the system's own bulk API; otlp = shared protobuf
-# payload (same-client fairness baseline, METHODOLOGY.md §5).
+# payload (same-client fairness baseline, METHODOLOGY.md).
 targets:
   amber:
     kind: amber
