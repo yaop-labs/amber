@@ -25,16 +25,27 @@ import (
 type TargetConfig struct {
 	// Kind: amber | loki | victorialogs (logs) | mimir | victoriametrics |
 	// prometheus (metrics; amber doubles as a metrics target).
-	Kind     string `yaml:"kind"`
-	BaseURL  string `yaml:"base_url"`
-	APIKey   string `yaml:"api_key,omitempty"`
-	Protocol string `yaml:"protocol"` // native | otlp
+	Kind    string `yaml:"kind"`
+	BaseURL string `yaml:"base_url"`
+	// IngestBaseURL overrides BaseURL for the ingest (push) path only; queries
+	// still go to BaseURL. Tempo splits its OTLP receiver (:4318) from its
+	// query API (:3200), so trace ingest and trace search live on different
+	// ports of the same host.
+	IngestBaseURL string `yaml:"ingest_base_url,omitempty"`
+	APIKey        string `yaml:"api_key,omitempty"`
+	Protocol      string `yaml:"protocol"` // native | otlp
 	// OTLPPath overrides the OTLP logs path; systems mount it differently
 	// (amber /v1/logs, Loki /otlp/v1/logs, VictoriaLogs /insert/opentelemetry/v1/logs).
 	OTLPPath string `yaml:"otlp_path,omitempty"`
 	// OTLPMetricsPath overrides the OTLP metrics mount (defaults per kind in
 	// otlpMetricsPath).
 	OTLPMetricsPath string `yaml:"otlp_metrics_path,omitempty"`
+	// OTLPTracesPath overrides the OTLP traces mount (defaults per kind in
+	// otlpTracesPath).
+	OTLPTracesPath string `yaml:"otlp_traces_path,omitempty"`
+	// JaegerPrefix prepends the Jaeger-compatible query API mount (VictoriaTraces
+	// serves it under /select/jaeger).
+	JaegerPrefix string `yaml:"jaeger_prefix,omitempty"`
 	// PromPrefix prepends the PromQL API mount (Mimir serves it under
 	// /prometheus; Prometheus and VictoriaMetrics at the root).
 	PromPrefix string `yaml:"prom_prefix,omitempty"`

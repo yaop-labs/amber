@@ -138,8 +138,7 @@ func TestMetricsInstance_CrossSystemIdentity(t *testing.T) {
 // Payload-format or endpoint drift fails here instead of producing a
 // zero-sample benchmark.
 func TestE2E_AmberMetricsIngestVerifyQuery(t *testing.T) {
-	stack, srv := startAmber(t)
-	_ = stack
+	_, srv := startAmber(t)
 	target := TargetConfig{Kind: "amber", BaseURL: srv.URL}
 
 	const ticks = 10

@@ -16,6 +16,17 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
+// Three setup helpers exercise different read paths, so a benchmark name can
+// pin which one it measures:
+//
+//   - setupBenchQueryBatched writes directly via WriteBatch, rotates, and
+//     builds bitmap indexes over the sealed segments — the indexed sealed-read
+//     path used by the 100k/1M scenarios.
+//   - setupBenchQuery feeds the same data through the ingest handler before
+//     rotating; otherwise identical (sealed + bitmap), at the 1k smoke scale.
+//   - setupBenchQueryActive only Flushes (no Rotate, no bitmap), leaving data
+//     in the active segment — the post-filter scan path with no index.
+
 func setupBenchQueryBatched(b *testing.B, n int) (*query.Executor, *index.SparseIndex, *storage.SegmentManager, func()) {
 	b.Helper()
 	dir := b.TempDir()
@@ -231,6 +242,9 @@ func benchQueryFullScanBatched(b *testing.B, n int) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		// Clear the result cache each iteration so every op is a cold query;
+		// otherwise iterations 2..N would measure a cache hit, not the query
+		// path. (The same pattern repeats across the query benchmarks below.)
 		exec.ClearResultCache()
 		if _, err := exec.ExecLog(ctx, q); err != nil {
 			b.Fatalf("ExecLog: %v", err)

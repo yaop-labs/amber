@@ -154,10 +154,7 @@ func Ingest(ctx context.Context, targetName string, target TargetConfig, dataset
 	}
 
 readLoop:
-	for {
-		if opts.Limit > 0 && sent+uint64(len(batch)) >= opts.Limit {
-			break
-		}
+	for opts.Limit == 0 || sent+uint64(len(batch)) < opts.Limit {
 		rec, err := reader.Next()
 		if err == io.EOF {
 			break

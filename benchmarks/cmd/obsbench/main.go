@@ -4,7 +4,14 @@
 //	preflight — environment gate (mem/disk/swap/governor)
 //	datagen   — seeded zstd-compressed log dataset
 //	sample    — 1 Hz external RSS/PSS sampler → CSV
-//	ingest    — load generation against one target
+//	kill9     — acked-loss test (crash mid-ingest, recount survivors)
+//	compare   — cross-system equality gate over query result files
+//
+// Each signal has its own ingest/query/verify trio against one target:
+//
+//	logs    — ingest   / query        / verify
+//	metrics — metrics-ingest / metrics-query / metrics-verify
+//	traces  — traces-ingest  / traces-query  / traces-verify
 //
 // Each run's raw outputs (JSON summaries, sampler CSVs) are the publishable
 // artifacts; tables are derived from them, never typed by hand.
@@ -54,6 +61,12 @@ func main() {
 		err = cmdMetricsQuery(os.Args[2:])
 	case "metrics-verify":
 		err = cmdMetricsVerify(os.Args[2:])
+	case "traces-ingest":
+		err = cmdTracesIngest(os.Args[2:])
+	case "traces-query":
+		err = cmdTracesQuery(os.Args[2:])
+	case "traces-verify":
+		err = cmdTracesVerify(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -65,7 +78,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare|verify|kill9|metrics-ingest|metrics-query|metrics-verify> [flags]`)
+	fmt.Fprintln(os.Stderr, `usage: obsbench <preflight|datagen|sample|ingest|query|compare|verify|kill9|metrics-ingest|metrics-query|metrics-verify|traces-ingest|traces-query|traces-verify> [flags]`)
 }
 
 // loadTarget resolves -config/-target, the boilerplate every subcommand shares.
@@ -252,6 +265,186 @@ func cmdMetricsVerify(args []string) error {
 		got, ir.SentScalar, ir.SentHist)
 	if got != ir.SentScalar {
 		return fmt.Errorf("metrics-verify: scalar count mismatch (silent loss or duplication) — numbers from this run are void")
+	}
+	return nil
+}
+
+func cmdTracesIngest(args []string) error {
+	fs := flag.NewFlagSet("traces-ingest", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	seed := fs.Uint64("seed", 1, "workload seed (same seed across systems = same traces)")
+	traces := fs.Int("traces", 0, "total traces to emit (required)")
+	spansPerTrace := fs.Int("spans-per-trace", 10, "spans per trace")
+	errorPercent := fs.Int("error-percent", 5, "percent of traces with an error root span")
+	rate := fs.Int("rate", 0, "cap spans/sec across workers (0 = burst)")
+	workers := fs.Int("workers", 8, "concurrent senders")
+	batch := fs.Int("batch", 200, "whole traces per OTLP request")
+	out := fs.String("out", "", "write JSON summary here in addition to stdout")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("traces-ingest: %w", err)
+	}
+	if *traces <= 0 {
+		return fmt.Errorf("traces-ingest: -traces is required")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	res, err := obsbench.IngestTraces(ctx, *targetName, target, obsbench.TracesIngestOptions{
+		Gen: obsbench.TracesGenConfig{
+			Seed:          *seed,
+			SpansPerTrace: *spansPerTrace,
+			ErrorPercent:  *errorPercent,
+		},
+		Traces:      *traces,
+		Rate:        *rate,
+		Workers:     *workers,
+		BatchTraces: *batch,
+	}, func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "traces-ingest: "+format+"\n", args...)
+	})
+	if err != nil {
+		return err
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		return err
+	}
+	if *out != "" {
+		data, _ := json.MarshalIndent(res, "", "  ")
+		if err := os.WriteFile(*out, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cmdTracesQuery(args []string) error {
+	fs := flag.NewFlagSet("traces-query", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	scenarios := fs.String("scenarios", "all", "comma-separated scenario list or 'all'")
+	iterations := fs.Int("iterations", 30, "instances per scenario")
+	seed := fs.Uint64("seed", 1, "instance-parameter seed (same seed across systems = same queries)")
+	genSeed := fs.Uint64("gen-seed", 0, "workload seed for QT1 trace IDs (overrides ingest summary)")
+	tracesFlag := fs.Int("traces", 0, "ingested trace count for QT1 (overrides ingest summary)")
+	qps := fs.Int("qps", 0, "pace queries (0 = back-to-back)")
+	ingestSummary := fs.String("ingest-summary", "", "traces ingest summary JSON; supplies window + gen-seed + trace count")
+	fromFlag := fs.String("from", "", "window start (RFC3339; overrides ingest summary)")
+	toFlag := fs.String("to", "", "window end (RFC3339; overrides ingest summary)")
+	out := fs.String("out", "", "results JSON path (required for compare)")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("traces-query: %w", err)
+	}
+
+	opts := obsbench.TraceQueryRunOptions{
+		Iterations: *iterations,
+		Seed:       *seed,
+		GenSeed:    *genSeed,
+		Traces:     *tracesFlag,
+		QPS:        *qps,
+	}
+	if *scenarios == "all" {
+		opts.Scenarios = obsbench.AllTraceScenarios
+	} else {
+		opts.Scenarios = strings.Split(*scenarios, ",")
+	}
+
+	if *ingestSummary != "" {
+		data, err := os.ReadFile(*ingestSummary)
+		if err != nil {
+			return err
+		}
+		var ir obsbench.TracesIngestResult
+		if err := json.Unmarshal(data, &ir); err != nil {
+			return fmt.Errorf("traces ingest summary: %w", err)
+		}
+		opts.From, opts.To = ir.StartedAt, ir.FinishedAt
+		if opts.GenSeed == 0 {
+			opts.GenSeed = ir.Seed
+		}
+		if opts.Traces == 0 {
+			opts.Traces = ir.Traces
+		}
+	}
+	if *fromFlag != "" {
+		if opts.From, err = time.Parse(time.RFC3339, *fromFlag); err != nil {
+			return fmt.Errorf("-from: %w", err)
+		}
+	}
+	if *toFlag != "" {
+		if opts.To, err = time.Parse(time.RFC3339, *toFlag); err != nil {
+			return fmt.Errorf("-to: %w", err)
+		}
+	}
+	if opts.From.IsZero() || opts.To.IsZero() {
+		return fmt.Errorf("traces-query: time window required (-ingest-summary or -from/-to)")
+	}
+	if opts.Traces <= 0 {
+		return fmt.Errorf("traces-query: trace count required for QT1 (-ingest-summary or -traces)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	outcomes, err := obsbench.RunTraceQueries(ctx, target, opts)
+	if err != nil {
+		return err
+	}
+
+	rf := obsbench.ResultFile{Target: *targetName, Outcomes: outcomes}
+	if *out != "" {
+		if err := obsbench.WriteResultFile(*out, rf); err != nil {
+			return err
+		}
+	}
+	printQuerySummary(rf)
+	return nil
+}
+
+func cmdTracesVerify(args []string) error {
+	fs := flag.NewFlagSet("traces-verify", flag.ExitOnError)
+	configPath := fs.String("config", "systems.yaml", "targets config")
+	targetName := fs.String("target", "", "target name from config (required)")
+	ingestSummary := fs.String("ingest-summary", "", "traces ingest summary JSON (required): trace-ID space + per-trace span count")
+	samples := fs.Int("samples", 1000, "trace IDs to spot-check (evenly spread)")
+	_ = fs.Parse(args)
+
+	target, err := loadTarget(*configPath, *targetName)
+	if err != nil {
+		return fmt.Errorf("traces-verify: %w", err)
+	}
+	if *ingestSummary == "" {
+		return fmt.Errorf("traces-verify: -ingest-summary is required")
+	}
+	data, err := os.ReadFile(*ingestSummary)
+	if err != nil {
+		return err
+	}
+	var ir obsbench.TracesIngestResult
+	if err := json.Unmarshal(data, &ir); err != nil {
+		return fmt.Errorf("traces ingest summary: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	vr, err := obsbench.VerifyTraces(ctx, target, ir, *samples)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("sampled=%d complete=%d spans_per_trace=%d\n", vr.Sampled, vr.Complete, ir.SpansPerTrace)
+	if !vr.OK() {
+		return fmt.Errorf("traces-verify: %d/%d traces incomplete (first miss %s had %d spans) — numbers from this run are void",
+			vr.Sampled-vr.Complete, vr.Sampled, vr.FirstMiss, vr.MissSpans)
 	}
 	return nil
 }

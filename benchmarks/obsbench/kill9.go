@@ -113,7 +113,7 @@ func runKill9Once(ctx context.Context, opts Kill9Options, run int, rng *rand.Ran
 		return Kill9RunResult{}, err
 	}
 	if err := waitReady(ctx, opts.ReadyURL, 60*time.Second); err != nil {
-		_ = srv.stop()
+		srv.stop()
 		return Kill9RunResult{}, fmt.Errorf("server not ready: %w", err)
 	}
 
@@ -140,13 +140,13 @@ func runKill9Once(ctx context.Context, opts Kill9Options, run int, rng *rand.Ran
 	case <-time.After(killAfter):
 	case err := <-errCh:
 		cancelIngest()
-		_ = srv.stop()
+		srv.stop()
 		return Kill9RunResult{}, fmt.Errorf("ingest failed before kill: %w", err)
 	case res := <-resCh:
 		// Dataset ran out before the kill point — the run is void; the
 		// caller should use a larger dataset or an earlier kill window.
 		cancelIngest()
-		_ = srv.stop()
+		srv.stop()
 		return Kill9RunResult{}, fmt.Errorf("ingest finished (%d acked) before kill at %s; enlarge dataset or shorten kill window",
 			res.AckedRecords, killAfter)
 	}
@@ -181,7 +181,7 @@ func runKill9Once(ctx context.Context, opts Kill9Options, run int, rng *rand.Ran
 	if err != nil {
 		return rr, fmt.Errorf("restart: %w", err)
 	}
-	defer func() { _ = srv2.stop() }()
+	defer func() { srv2.stop() }()
 	if err := waitReady(ctx, opts.ReadyURL, 120*time.Second); err != nil {
 		rr.RecoverError = err.Error()
 		return rr, nil
@@ -262,7 +262,7 @@ func (s *serverProc) kill9() error {
 }
 
 // stop shuts the server down gracefully, escalating to SIGKILL.
-func (s *serverProc) stop() error {
+func (s *serverProc) stop() {
 	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
@@ -278,7 +278,6 @@ func (s *serverProc) stop() error {
 	if s.log != nil {
 		_ = s.log.Close()
 	}
-	return nil
 }
 
 func waitReady(ctx context.Context, readyURL string, timeout time.Duration) error {

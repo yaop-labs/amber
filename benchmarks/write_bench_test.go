@@ -1,8 +1,14 @@
+// Package benchmarks holds in-process Go microbenchmarks for amber's hot paths
+// — ingest handler, batcher, segment/WAL writers, query executor, FTS index,
+// bitmap filter — driven directly against the internal packages. They isolate
+// one component at a time (throughput and allocations per op) and exist to
+// catch regressions in `go test -bench`; they are deliberately separate from
+// the obsbench harness (benchmarks/obsbench), which measures amber end to end
+// over HTTP against Loki/VictoriaLogs/etc. for the published campaign numbers.
 package benchmarks
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -15,6 +21,9 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
+// setupBenchStore wires an ingest handler with no active indexer, so the
+// IngestLog benchmarks measure the bare write path (segment + WAL) without
+// index-maintenance cost. setupBenchStoreIndexed is its indexed counterpart.
 func setupBenchStore(b *testing.B) (*ingest.Handler, func()) {
 	b.Helper()
 	dir := b.TempDir()
@@ -156,6 +165,9 @@ func BenchmarkIngestLog_Parallel(b *testing.B) {
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "entries/sec")
 }
 
+// setupBenchStoreIndexed wires the handler with the executor's active-segment
+// indexer attached, so the _Indexed benchmarks include the cost of keeping the
+// in-memory index current on every write (the delta vs setupBenchStore).
 func setupBenchStoreIndexed(b *testing.B) (*ingest.Handler, func()) {
 	b.Helper()
 	dir := b.TempDir()
@@ -382,5 +394,3 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 	*w.buf = append(*w.buf, p...)
 	return len(p), nil
 }
-
-var _ = fmt.Sprintf // prevent unused import
