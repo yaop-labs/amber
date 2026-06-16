@@ -185,10 +185,7 @@ func TestBatcher_RotationTouchesWrittenSegmentSparseIndex(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
-	for {
-		if len(logManager.Segments()) == 1 && len(logSparse.All()) == 1 {
-			break
-		}
+	for len(logManager.Segments()) != 1 || len(logSparse.All()) != 1 {
 		select {
 		case <-deadline:
 			t.Fatalf("timed out waiting for rotation; sealed=%d sparse=%d", len(logManager.Segments()), len(logSparse.All()))

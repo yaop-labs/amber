@@ -290,8 +290,8 @@ func MergeBlocks(paths []string, cutoffMillis int64) ([]ExpSeries, []ExplicitSer
 		}
 	}
 
-	var exp []ExpSeries
-	var explicit []ExplicitSeries
+	exp := make([]ExpSeries, 0, len(expOrder))
+	explicit := make([]ExplicitSeries, 0, len(explicitOrder))
 	for _, key := range expOrder {
 		g := expGroups[key]
 		if len(g.timestamps) == 0 {

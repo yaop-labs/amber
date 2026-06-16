@@ -30,7 +30,7 @@ func TestBuildLogSealIndexes_OnePass(t *testing.T) {
 		"payment authorized",
 		"cache warmup finished req_id=4f8a9b2c-dead-beef-cafe-1234567890ab",
 	}
-	var ids []uint64
+	ids := make([]uint64, 0, len(bodies))
 	for _, body := range bodies {
 		e, err := model.NewLogEntry(model.LevelInfo, "checkout", "host1", body)
 		if err != nil {

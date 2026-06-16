@@ -480,19 +480,19 @@ func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.
 	return spanItems, spanEntries
 }
 
-func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry) bool {
+func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry) {
 	targetMeta, hasTarget := b.logManager.ActiveSegmentMeta()
 	if err := b.logManager.WriteBatch(logItems); err != nil {
 		b.logM.writeFailed.Add(uint64(len(logItems)))
 		b.log.Error("log batch write failed", "err", err, "count", len(logItems))
 		b.recordLogFailure()
-		return true
+		return
 	}
 	if err := b.logManager.Flush(); err != nil {
 		b.logM.writeFailed.Add(uint64(len(logItems)))
 		b.log.Error("log segment flush failed", "err", err, "count", len(logItems))
 		b.recordLogFailure()
-		return true
+		return
 	}
 	b.logM.accepted.Add(uint64(len(logItems)))
 	if hasTarget {
@@ -506,22 +506,21 @@ func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*mode
 		b.cacheInvalidator.InvalidateResultRange(from, to)
 	}
 	b.resetLogFailures()
-	return false
 }
 
-func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry) bool {
+func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry) {
 	targetMeta, hasTarget := b.spanManager.ActiveSegmentMeta()
 	if err := b.spanManager.WriteBatch(spanItems); err != nil {
 		b.spanM.writeFailed.Add(uint64(len(spanItems)))
 		b.log.Error("span batch write failed", "err", err, "count", len(spanItems))
 		b.recordSpanFailure()
-		return true
+		return
 	}
 	if err := b.spanManager.Flush(); err != nil {
 		b.spanM.writeFailed.Add(uint64(len(spanItems)))
 		b.log.Error("span segment flush failed", "err", err, "count", len(spanItems))
 		b.recordSpanFailure()
-		return true
+		return
 	}
 	b.spanM.accepted.Add(uint64(len(spanItems)))
 	if hasTarget {
@@ -535,7 +534,6 @@ func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*m
 		b.cacheInvalidator.InvalidateResultRange(from, to)
 	}
 	b.resetSpanFailures()
-	return false
 }
 
 // batchTimeRange returns the min/max event timestamps of a written batch.

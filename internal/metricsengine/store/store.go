@@ -748,7 +748,7 @@ func (s *Store) Compact() (string, error) {
 			kept = append(kept, meta)
 		}
 	}
-	s.manifest.Blocks = append(kept, BlockMeta{
+	kept = append(kept, BlockMeta{
 		Path:        filepath.Base(path),
 		MinTime:     minTime,
 		MaxTime:     maxTime,
@@ -756,6 +756,7 @@ func (s *Store) Compact() (string, error) {
 		SampleCount: directorySampleCount(dir),
 		LabelValues: labelValues(dir),
 	})
+	s.manifest.Blocks = kept
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return "", err
 	}

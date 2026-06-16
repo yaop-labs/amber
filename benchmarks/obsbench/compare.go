@@ -63,7 +63,7 @@ func CompareCounts(files []ResultFile) []Mismatch {
 		}
 	}
 
-	var out []Mismatch
+	out := make([]Mismatch, 0, len(byKey))
 	for k, perTarget := range byKey {
 		if len(perTarget) < 2 {
 			continue // nothing to compare

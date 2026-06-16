@@ -345,7 +345,7 @@ func (s *Store) compactHistLocked() (string, error) {
 		return "", err
 	}
 	hmin, hmax, _ := hdir.TimeRange()
-	s.manifest.Blocks = append(rest, BlockMeta{
+	rest = append(rest, BlockMeta{
 		Path:        filepath.Base(dest),
 		Kind:        BlockKindHistogram,
 		MinTime:     hmin,
@@ -353,6 +353,7 @@ func (s *Store) compactHistLocked() (string, error) {
 		SeriesCount: len(hdir.Series),
 		LabelValues: histLabelValues(hdir),
 	})
+	s.manifest.Blocks = rest
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return "", err
 	}

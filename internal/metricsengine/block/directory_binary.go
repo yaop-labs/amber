@@ -36,14 +36,12 @@ func encodeDirectoryBinary(dir Directory) []byte {
 	// names are a tiny fixed set; values repeat heavily across series.
 	strIndex := make(map[string]uint64)
 	var strTable []string
-	intern := func(s string) uint64 {
-		if idx, ok := strIndex[s]; ok {
-			return idx
+	intern := func(s string) {
+		if _, ok := strIndex[s]; ok {
+			return
 		}
-		idx := uint64(len(strTable))
-		strIndex[s] = idx
+		strIndex[s] = uint64(len(strTable))
 		strTable = append(strTable, s)
-		return idx
 	}
 	// Pre-walk to populate the table so it is written before the entries.
 	for _, e := range dir.Series {

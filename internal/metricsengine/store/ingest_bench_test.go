@@ -105,7 +105,7 @@ func BenchmarkAppendBatch_I1Shape(b *testing.B) {
 					Labels:    labels[(lo+j)%seriesN],
 					Type:      model.MetricTypeCounter,
 					Timestamp: ts + tick*10_000,
-					Value:     int64(tick * 10),
+					Value:     tick * 10,
 				})
 			}
 			if _, err := st.AppendBatch(batch); err != nil {

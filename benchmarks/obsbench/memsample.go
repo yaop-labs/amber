@@ -69,7 +69,7 @@ func collectSamples(match *regexp.Regexp) []memSample {
 	if err != nil {
 		return nil
 	}
-	var out []memSample
+	out := make([]memSample, 0, len(procs))
 	self := os.Getpid()
 	for _, p := range procs {
 		pid, err := strconv.Atoi(p.Name())

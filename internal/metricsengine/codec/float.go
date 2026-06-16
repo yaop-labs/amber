@@ -122,8 +122,8 @@ func EncodeFloatValues(values []float64) FloatEncoding {
 	}
 
 	mantissas := make([]int64, 0, len(values))
-	var excPos []int
-	var excVal []uint64
+	excPos := make([]int, 0, len(values))
+	excVal := make([]uint64, 0, len(values))
 	for i, v := range values {
 		if exps[i] >= 0 && exps[i] <= bestExp && conformsAt(v, bestExp) {
 			mantissas = append(mantissas, int64(math.Round(v*pow10[bestExp])))
