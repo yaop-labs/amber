@@ -5,29 +5,29 @@
 <h1 align="center">Amber</h1>
 
 <p align="center">
-  <a href="https://github.com/hnlbs/amber/actions/workflows/ci.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/hnlbs/amber/actions/workflows/lint.yml"><img src="https://github.com/hnlbs/amber/actions/workflows/lint.yaml/badge.svg" alt="Lint"></a>
-  <a href="https://goreportcard.com/report/github.com/hnlbs/amber"><img src="https://goreportcard.com/badge/github.com/hnlbs/amber" alt="Go Report Card"></a>
-  <a href="https://pkg.go.dev/github.com/hnlbs/amber"><img src="https://pkg.go.dev/badge/github.com/hnlbs/amber.svg" alt="Go Reference"></a>
+  <a href="https://github.com/yaop-labs/amber/actions/workflows/ci.yaml"><img src="https://github.com/yaop-labs/amber/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
+  <a href="https://goreportcard.com/report/github.com/yaop-labs/amber"><img src="https://goreportcard.com/badge/github.com/yaop-labs/amber" alt="Go Report Card"></a>
+  <a href="https://pkg.go.dev/github.com/yaop-labs/amber"><img src="https://pkg.go.dev/badge/github.com/yaop-labs/amber.svg" alt="Go Reference"></a>
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white" alt="Go 1.25+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License"></a>
-  <a href="https://github.com/hnlbs/amber/releases"><img src="https://img.shields.io/github/v/release/hnlbs/amber?include_prereleases&sort=semver" alt="Release"></a>
+  <a href="https://github.com/yaop-labs/amber/releases"><img src="https://img.shields.io/github/v/release/yaop-labs/amber?include_prereleases&sort=semver" alt="Release"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status">
 </p>
 
-Append-only storage for logs and traces. 
+Append-only storage for logs, traces, and metrics — all three in one process.
 One binary, one directory, HTTP + gRPC API.
 Think "SQLite for observability".
 
 ## Features
 
+- **One store for logs, traces, and metrics** — counters, gauges, and exponential histograms share the same WAL, flush gate, retention, and compaction
 - **Append-only segments** with zstd compression and per-block min/max stats in segment footer
-- **Write-Ahead Log** for crash recovery
-- **Bitmap indexes** (Roaring Bitmap) for fast field filtering (service, level, host)
+- **Write-Ahead Log** for crash recovery (fail-stop writers, CRC over length+seq+payload)
+- **Bitmap indexes** (sorted `uint64` sets, not roaring — ULID-derived keys shattered roaring into one container per few IDs) for fast field filtering (service, level, host)
 - **Full-text search** index for log body
 - **Ribbon filters** for high-cardinality fields (trace_id)
 - **Sparse index** for time-based segment pruning (skips 95%+ data without I/O)
-- **OTLP compatible** — gRPC (:4317) and HTTP endpoints for logs and traces
+- **OTLP compatible** — gRPC (:4317) and HTTP endpoints for logs, traces, and metrics
 - **Log-trace correlation** — trace viewer with span tree and linked logs
 - **Retention policies** — max age, max bytes, max segments
 - **Embedded mode** — use as a Go library without HTTP server
@@ -38,7 +38,7 @@ Think "SQLite for observability".
 ### Binary
 
 ```bash
-git clone https://github.com/hnlbs/amber.git
+git clone https://github.com/yaop-labs/amber.git
 cd amber
 make build
 cp config.example.yaml config.yaml  # edit as needed
@@ -58,9 +58,9 @@ docker run -p 8080:8080 -p 4317:4317 \
 ### Embedded (Go library)
 
 ```go
-import "github.com/hnlbs/amber"
+import "github.com/yaop-labs/amber"
 
-db, err := amber.Open("./data")
+db, err := amber.Open("./data", nil) // nil = default Options
 defer db.Close()
 
 db.Log(ctx, amber.LogEntry{
@@ -194,6 +194,32 @@ Response fields for each trace summary:
 - `span_count`
 - `has_errors`
 
+### Metrics API
+
+Metrics are ingested over OTLP (`POST /v1/metrics`, HTTP or gRPC) and queried
+through a small purpose-built API — counters and gauges as rates, exponential
+histograms as quantiles:
+
+```bash
+# Instant rate by label (counters), evaluated at `time`
+curl "http://localhost:8080/api/v1/metrics/rate?metric=http_requests_total&by=service&time=2026-06-16T10:00:00Z" \
+  -H "Authorization: Bearer <key>"
+
+# Per-step range rate over a window
+curl "http://localhost:8080/api/v1/metrics/rate_range?metric=http_requests_total&by=route&from=2026-06-16T09:00:00Z&to=2026-06-16T10:00:00Z&step=60s" \
+  -H "Authorization: Bearer <key>"
+
+# Quantile from exponential histograms
+curl "http://localhost:8080/api/v1/metrics/quantile?metric=http_request_duration&q=0.95&by=service" \
+  -H "Authorization: Bearer <key>"
+
+# Series list and metrics store stats
+curl "http://localhost:8080/api/v1/metrics" -H "Authorization: Bearer <key>"
+curl "http://localhost:8080/api/v1/metrics/stats" -H "Authorization: Bearer <key>"
+```
+
+Sample values are stored as `int64` — see [Metrics value model](#metrics-value-model-alpha) below for the scale/precision trade-off.
+
 ### Admin API
 
 ```bash
@@ -272,47 +298,97 @@ See [config.example.yaml](config.example.yaml) for all options. Key settings:
 
 ## Benchmarks
 
-100M records, VPS (8 vCPU, 16 GB RAM), [obs-bench](https://codeberg.org/HoneyLabs/obs-bench) suite. All numbers are HTTP end-to-end (client-measured), p50 latency.
+Measured with the in-repo `obsbench` suite: rate-capped ingest (20k/s, so every
+system holds identical data), a fixed 600s settle, sequential runs, pinned
+competitor versions, and a **result-count equality gate** per run (same seeds →
+same query instances → systems must agree before any latency is published).
+amber runs with an 800 MB soft memory limit (`runtime.memory_limit`). All
+latencies are HTTP end-to-end, client-measured. Numbers are medians across runs.
 
-### Query latency (p50, ms)
+These are honest, current results — amber is a deliberately experimental engine
+(sorted-slice bitmaps, no roaring/columnar): it wins logs outright, and on
+metrics/traces it trades raw scan/aggregate speed for low memory and a compact,
+unified store. Where a columnar competitor wins, the table says so.
 
-| Query | Amber | Loki | ClickHouse | OpenSearch |
-|-------|------:|-----:|-----------:|----------:|
-| R1 — point (service + level) | 55 | 24 | 224 | 380 |
-| R2 — time range (1h window) | 59 | 8.6 | 249 | 51 |
-| R3 — full-text search | 57 | 28,941 | 197 | 25 |
-| R4 — rare token FTS | 49 | 66,404 | 123 | 5.1 |
-| R5 — trace ID lookup | 84 | 8.1 | 179 | 4.0 |
+### Logs — 5M records, 3 runs × 3 systems
 
-> Amber server-side latency (excluding JSON serialization + network): R1 2.2 ms, R2 0.9 ms, R3 0.9 ms, R5 2.2 ms. The ~50 ms overhead is Go JSON encoding of 100 entries per response — same overhead applies to all systems but varies by serialization library.
+Loki 3.4.2 · VictoriaLogs v1.36.0. Query p50/p95 (ms):
 
-### Ingest throughput (W1)
+| Scenario | amber | Loki | VictoriaLogs |
+|----------|------:|-----:|-------------:|
+| q1 — point (service + level) | **0.90** / 6.2 | 9.3 / 20 | 12.3 / 16 |
+| q2 — range (service sub-window) | **1.89** / 7.0 | 51 / 77 | 15.3 / 21 |
+| q3 — full-text (common token) | **4.06** / 5.2 | 57 / 73 | 28.4 / 31 |
+| q4 — full-text (rare token) | **0.46** / 0.93 | 1914 / 1987 | 10.3 / 11 |
 
-| System | rec/s | 
-|--------|------:|
-| ClickHouse | 336K |
-| Loki | 224K |
-| OpenSearch | 129K |
-| Amber | 118K |
+| Resource | amber | Loki | VictoriaLogs |
+|----------|------:|-----:|-------------:|
+| RSS peak / loaded (MB) | 809 / 582 | 1169 / 688 | **402 / 53** |
+| Storage (MB) | 875 | 260 | **226** |
 
-### Storage efficiency (100M records, 30 GB raw)
+**amber wins all four query scenarios.** It loses on RSS and on-disk size:
+VictoriaLogs is far leaner and Loki compacts hard during the settle window.
 
-| System | Storage | Ratio | Idle RSS |
-|--------|--------:|------:|---------:|
-| Amber | 5.9 GB | 0.20 | 14.8 MiB |
-| OpenSearch | 20.8 GB | 0.69 | 1,410 MiB |
-| Loki | 23.7 GB | 0.79 | 96.8 MiB |
-| ClickHouse | 27.9 GB | 0.93 | 462.6 MiB |
+### Metrics — 100k scalar + 10k histogram series, 3 runs × 4 systems
+
+Mimir 3.1.0 · VictoriaMetrics v1.145.0 · Prometheus v3.12.0. Query p50/p95 (ms):
+
+| Scenario | amber | Mimir | VictoriaMetrics | Prometheus |
+|----------|------:|------:|----------------:|-----------:|
+| qm1 — instant rate | 2139 / 2625 | 768 / 883 | **187 / 227** | 458 / 490 |
+| qm2 — range rate | 6330 / 6881 | 1325 / 1529 | **267 / 337** | 868 / 927 |
+| qm3 — histogram quantile | 1297 / 4320 | 495 / 654 | 291 / 609 | **259 / 344** |
+| qm4 — group-by rate | 2239 / 2852 | 760 / 922 | **179 / 206** | 423 / 506 |
+
+| Resource | amber | Mimir | VictoriaMetrics | Prometheus |
+|----------|------:|------:|----------------:|-----------:|
+| RSS peak (MB) | 1110 | 2076 | **576** | 718 |
+| Storage (MB) | 540 | 370 | **152** | 255 |
+
+> **Caveat (important):** at campaign time amber was the slowest on all four
+> metric queries — VictoriaMetrics (columnar) dominates. Since then the
+> range-step query path was rewritten (resident block index + series-partitioned
+> parallelism): in the amber-only bench **qm2 dropped 6.3s → ~0.68s (~9×)**,
+> moving amber past Mimir/Prometheus to ~2.5× VictoriaMetrics. A full
+> cross-system re-campaign on the fixed engine is pending, so the table above is
+> the last *fully comparable* run. amber already beats Mimir on RSS.
+
+### Traces — 3.6M traces / 36M spans, 2 runs × 3 systems
+
+Tempo 2.10.1 · VictoriaTraces v0.9.2. Query p50 (ms):
+
+| Scenario | amber | Tempo | VictoriaTraces |
+|----------|------:|------:|---------------:|
+| QT1 — trace-ID lookup | 108 | 94 | **18** |
+| QT2 — service + operation search | 7629 | 108 | **26** |
+| QT3 — service + duration search | 6078 | 67 | **40** |
+
+| Resource | amber | Tempo | VictoriaTraces |
+|----------|------:|------:|---------------:|
+| RSS peak (MB) | **617** | 2249 | 1537 |
+| Storage (MB) | 1872 | 5166 | **1639** |
+
+**amber wins RSS decisively** (≈3.6× lighter than Tempo) and is second on
+storage, but loses the scan-search scenarios (QT2/QT3): it currently full-scans
+spans with no tag/duration index, where VictoriaTraces' columnar engine answers
+in tens of ms. Point lookup (QT1) is on par with Tempo.
 
 <details>
 <summary>Methodology and notes</summary>
 
-- **Dataset**: 100M synthetic log entries (10 services, 6 levels, realistic bodies with UUIDs), pre-generated NDJSON
-- **Loadgen**: 8 workers, 500 rec/batch, max throughput (no rate limit)
-- **Queries**: 20 qps, 4 workers, 60s per scenario, randomized parameters
-- **VictoriaLogs** excluded: bulk ingest via `/insert/jsonline` silently dropped records (storage = 8 KB after 100M ingest). Single-record inserts work; bulk persistence bug not investigated. Results would be misleading
-- **ClickHouse FTS** uses `position(body, ?)` instead of `hasToken` because `hasToken` treats `_` as a token separator, rejecting UUIDs. This bypasses the `tokenbf_v1` index — R3/R4 numbers reflect a full scan
-- **Loki R3** had 11 errors (timeouts on 100M full-text scan)
+- **Equality gate**: each run compares result counts across systems before
+  publishing latency; a mismatch fails the run. Logs use exact set equality;
+  metrics/traces use coarse gates (group cardinality / full-page count) where
+  cross-system value identity isn't well defined.
+- **Ingest**: rate-capped at 20k/s for every system so they all index the same
+  data; partial queue-full rejects are parsed from amber's `503` body for true
+  acked counts.
+- **`TotalHits` is a lower bound** in amber (heap-threshold block skip) — it is
+  never used for verification; admin `segments.total_records` is.
+- **All OTLP labels are datapoint attributes** for metrics (resource attrs are
+  renamed per system and would break cross-system label identity); for traces
+  `service.name` rides as the OTLP resource attribute (backend standard).
+- Full methodology and per-run artifacts live with the `obsbench` harness.
 
 </details>
 
