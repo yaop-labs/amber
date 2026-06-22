@@ -59,17 +59,30 @@ type FTSIndex struct {
 	// result, never lose one; accepted deliberately — the result-count
 	// equality gate in benchmarks would flag it.
 	uniqHashes []byte // 8-byte big-endian hashes, sorted
-	uniqIDs    []byte // 8-byte big-endian entry IDs, parallel
+	uniqIDs    []byte // 4-byte big-endian ORDINALS (index into table), parallel
 
-	// Loaded (file-backed) mode: the unique section is NOT resident — it is
-	// binary-searched with pread on demand. Explicit reads, not mmap, on
-	// purpose: page faults would make tail latency depend on page-cache
-	// state and turn storage errors into SIGBUS process kills ("Are You
-	// Sure You Want to Use MMAP in Your DBMS?", CIDR 2022), while pread
-	// returns errors as values and still benefits from the OS page cache.
-	path      string
-	uniqOff   int64
-	uniqCount int
+	// Ordinal table (AFT3): the sorted distinct entry IDs of the segment.
+	// Postings and the unique section store a token's records as ordinals
+	// (positions in this table) instead of full 8-byte ULID-derived IDs:
+	// ordinals are dense 0..N-1, so delta-varint posting gaps shrink to ~1
+	// byte and a unique-token record fits in 4 bytes instead of 8. Lookups
+	// intersect in ordinal space (order-preserving, the table is sorted by
+	// ID) and map only the final ≤limit results back to real IDs, so the
+	// table is read on demand (pread when file-backed) and never inflates
+	// resident memory — amber trades disk for nothing on RSS here.
+	table []uint64 // resident only between seal and Save (then file-backed)
+
+	// Loaded (file-backed) mode: the unique section and ordinal table are NOT
+	// resident — they are read with pread on demand. Explicit reads, not mmap,
+	// on purpose: page faults would make tail latency depend on page-cache
+	// state and turn storage errors into SIGBUS process kills ("Are You Sure
+	// You Want to Use MMAP in Your DBMS?", CIDR 2022), while pread returns
+	// errors as values and still benefits from the OS page cache.
+	path       string
+	uniqOff    int64
+	uniqCount  int
+	tableOff   int64
+	tableCount int
 }
 
 func tokenHash(tok string) uint64 {
@@ -211,6 +224,22 @@ func (f *FTSIndex) seal() {
 		return bytes.Compare(f.tokenBytes(a), f.tokenBytes(b))
 	})
 
+	// Ordinal table: every distinct entry ID that appears in the index, sorted.
+	// A token's records are then stored as ordinals (positions in this table)
+	// rather than full 8-byte IDs.
+	var allIDs []uint64
+	for _, i := range dict {
+		allIDs = append(allIDs, f.entries[i].rest...)
+	}
+	for _, u := range uniqs {
+		allIDs = append(allIDs, u.id)
+	}
+	slices.Sort(allIDs)
+	f.table = dedupSorted(allIDs)
+	ordOf := func(id uint64) uint64 {
+		return uint64(sort.Search(len(f.table), func(k int) bool { return f.table[k] >= id }))
+	}
+
 	f.tokens = make([]string, len(dict))
 	f.postings = make([][]byte, len(dict))
 	f.counts = make([]int, len(dict))
@@ -220,8 +249,9 @@ func (f *FTSIndex) seal() {
 		blob := make([]byte, 0, len(e.rest)*2)
 		var prev uint64
 		for _, id := range e.rest {
-			blob = binary.AppendUvarint(blob, id-prev)
-			prev = id
+			ord := ordOf(id)
+			blob = binary.AppendUvarint(blob, ord-prev)
+			prev = ord
 		}
 		f.postings[di] = blob
 		f.counts[di] = len(e.rest)
@@ -229,18 +259,19 @@ func (f *FTSIndex) seal() {
 
 	sort.Slice(uniqs, func(a, b int) bool { return uniqs[a].hash < uniqs[b].hash })
 	f.uniqHashes = make([]byte, len(uniqs)*8)
-	f.uniqIDs = make([]byte, len(uniqs)*8)
+	f.uniqIDs = make([]byte, len(uniqs)*4)
 	for i, u := range uniqs {
 		binary.BigEndian.PutUint64(f.uniqHashes[i*8:], u.hash)
-		binary.BigEndian.PutUint64(f.uniqIDs[i*8:], u.id)
+		binary.BigEndian.PutUint32(f.uniqIDs[i*4:], uint32(ordOf(u.id)))
 	}
 	f.arena, f.entries, f.byHash = nil, nil, nil
 }
 
-// lookupUnique returns the entry IDs of df==1 tokens matching the hash
-// (adjacent duplicates included, so collisions can't drop records). The
-// in-memory arrays serve freshly built indexes; loaded indexes search the
-// file with pread instead of keeping ~13 MB per segment resident.
+// lookupUnique returns the ORDINALS of df==1 tokens matching the hash (adjacent
+// duplicates included, so hash collisions can't drop records). The in-memory
+// arrays serve freshly built indexes; loaded indexes search the file with pread
+// instead of keeping the unique section resident. Hashes are 8 bytes, ordinals
+// 4 bytes; Search maps the final results back to entry IDs.
 func (f *FTSIndex) lookupUnique(token string) []uint64 {
 	if f.uniqHashes != nil {
 		n := len(f.uniqHashes) / 8
@@ -251,14 +282,14 @@ func (f *FTSIndex) lookupUnique(token string) []uint64 {
 		i := sort.Search(n, func(i int) bool {
 			return binary.BigEndian.Uint64(f.uniqHashes[i*8:]) >= h
 		})
-		var ids []uint64
+		var ords []uint64
 		for ; i < n && binary.BigEndian.Uint64(f.uniqHashes[i*8:]) == h; i++ {
-			ids = append(ids, binary.BigEndian.Uint64(f.uniqIDs[i*8:]))
+			ords = append(ords, uint64(binary.BigEndian.Uint32(f.uniqIDs[i*4:])))
 		}
-		if len(ids) > 1 {
-			slices.Sort(ids)
+		if len(ords) > 1 {
+			slices.Sort(ords)
 		}
-		return ids
+		return ords
 	}
 	if f.uniqCount == 0 || f.path == "" {
 		return nil
@@ -270,19 +301,26 @@ func (f *FTSIndex) lookupUnique(token string) []uint64 {
 	defer file.Close()
 
 	h := tokenHash(token)
-	var buf [8]byte
-	readU64 := func(off int64) (uint64, bool) {
-		if _, err := file.ReadAt(buf[:], off); err != nil {
+	var buf8 [8]byte
+	var buf4 [4]byte
+	readHash := func(off int64) (uint64, bool) {
+		if _, err := file.ReadAt(buf8[:], off); err != nil {
 			return 0, false
 		}
-		return binary.BigEndian.Uint64(buf[:]), true
+		return binary.BigEndian.Uint64(buf8[:]), true
+	}
+	readOrd := func(off int64) (uint64, bool) {
+		if _, err := file.ReadAt(buf4[:], off); err != nil {
+			return 0, false
+		}
+		return uint64(binary.BigEndian.Uint32(buf4[:])), true
 	}
 
 	n := f.uniqCount
 	lo, hi := 0, n
 	for lo < hi {
 		mid := (lo + hi) / 2
-		v, ok := readU64(f.uniqOff + int64(mid)*8)
+		v, ok := readHash(f.uniqOff + int64(mid)*8)
 		if !ok {
 			return nil
 		}
@@ -292,23 +330,23 @@ func (f *FTSIndex) lookupUnique(token string) []uint64 {
 			hi = mid
 		}
 	}
-	idsOff := f.uniqOff + int64(n)*8
-	var ids []uint64
+	ordsOff := f.uniqOff + int64(n)*8
+	var ords []uint64
 	for i := lo; i < n; i++ {
-		v, ok := readU64(f.uniqOff + int64(i)*8)
+		v, ok := readHash(f.uniqOff + int64(i)*8)
 		if !ok || v != h {
 			break
 		}
-		id, ok := readU64(idsOff + int64(i)*8)
+		o, ok := readOrd(ordsOff + int64(i)*4)
 		if !ok {
 			break
 		}
-		ids = append(ids, id)
+		ords = append(ords, o)
 	}
-	if len(ids) > 1 {
-		slices.Sort(ids)
+	if len(ords) > 1 {
+		slices.Sort(ords)
 	}
-	return ids
+	return ords
 }
 
 func dedupSorted(ids []uint64) []uint64 {
@@ -330,20 +368,22 @@ func (f *FTSIndex) Search(_ context.Context, query string, limit int) ([]uint64,
 		return nil, nil
 	}
 
+	// Intersect in ordinal space (order-preserving — the table is sorted by ID),
+	// then map only the final ≤limit results back to entry IDs.
 	var acc []uint64
 	for i, tok := range tokens {
-		ids := f.lookup(tok)
-		if len(ids) == 0 {
-			ids = f.lookupUnique(tok)
+		ords := f.lookup(tok)
+		if len(ords) == 0 {
+			ords = f.lookupUnique(tok)
 		}
-		if len(ids) == 0 {
+		if len(ords) == 0 {
 			return nil, nil
 		}
 		if i == 0 {
-			acc = ids
+			acc = ords
 			continue
 		}
-		acc = intersectSorted(acc, ids)
+		acc = intersectSorted(acc, ords)
 		if len(acc) == 0 {
 			return nil, nil
 		}
@@ -351,27 +391,64 @@ func (f *FTSIndex) Search(_ context.Context, query string, limit int) ([]uint64,
 	if limit > 0 && len(acc) > limit {
 		acc = acc[:limit]
 	}
-	return acc, nil
+	return f.mapOrdinalsToIDs(acc)
 }
 
+// lookup returns the df>=2 token's records as ascending ORDINALS (positions in
+// the table); Search maps the final intersection back to entry IDs.
 func (f *FTSIndex) lookup(token string) []uint64 {
 	i := sort.SearchStrings(f.tokens, token)
 	if i >= len(f.tokens) || f.tokens[i] != token {
 		return nil
 	}
-	ids := make([]uint64, 0, f.counts[i])
+	ords := make([]uint64, 0, f.counts[i])
 	var prev uint64
 	blob := f.postings[i]
 	for len(blob) > 0 {
 		d, n := binary.Uvarint(blob)
 		if n <= 0 {
-			return ids
+			return ords
 		}
 		prev += d
-		ids = append(ids, prev)
+		ords = append(ords, prev)
 		blob = blob[n:]
 	}
-	return ids
+	return ords
+}
+
+// mapOrdinalsToIDs resolves ordinals to entry IDs via the table — resident for a
+// freshly sealed index, pread on demand once file-backed (so the table never
+// inflates resident memory). Only the final ≤limit results are mapped.
+func (f *FTSIndex) mapOrdinalsToIDs(ords []uint64) ([]uint64, error) {
+	out := make([]uint64, len(ords))
+	if f.table != nil {
+		for i, o := range ords {
+			if o >= uint64(len(f.table)) {
+				return nil, errors.New("fts: ordinal out of range")
+			}
+			out[i] = f.table[o]
+		}
+		return out, nil
+	}
+	if f.path == "" || f.tableCount == 0 {
+		return nil, errors.New("fts: ordinal table unavailable")
+	}
+	file, err := os.Open(f.path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var buf [8]byte
+	for i, o := range ords {
+		if int(o) >= f.tableCount {
+			return nil, errors.New("fts: ordinal out of range")
+		}
+		if _, err := file.ReadAt(buf[:], f.tableOff+int64(o)*8); err != nil {
+			return nil, err
+		}
+		out[i] = binary.BigEndian.Uint64(buf[:])
+	}
+	return out, nil
 }
 
 func intersectSorted(a, b []uint64) []uint64 {
@@ -392,18 +469,23 @@ func intersectSorted(a, b []uint64) []uint64 {
 	return out
 }
 
-// On-disk format ("AFT2"):
+// On-disk format ("AFT3"):
 //
 //	magic [4] | uvarint dictTokenCount
 //	per dict token, sorted: uvarint len | bytes | uvarint postingCount |
-//	                        uvarint blobLen | delta-varint postings
-//	uvarint uniqCount | uniqCount×8B BE sorted hashes | uniqCount×8B BE IDs
+//	                        uvarint blobLen | delta-varint ORDINALS
+//	uvarint uniqCount | uniqCount×8B BE sorted hashes | uniqCount×4B BE ordinals
+//	uvarint tableCount | tableCount×8B BE sorted entry IDs (ordinal -> id)
 //	crc32 IEEE over everything above [4, little-endian]
-var ftsMagic = [4]byte{'A', 'F', 'T', '2'}
+//
+// AFT3 replaces AFT2's full 8-byte entry IDs with ordinals (positions in the
+// table) in both postings and the unique section; an AFT2 file fails the magic
+// check and falls back to a scan.
+var ftsMagic = [4]byte{'A', 'F', 'T', '3'}
 
-// Save seals the build state and writes the index to path in the AFT2 format,
+// Save seals the build state and writes the index to path in the AFT3 format,
 // then demotes the index to file-backed mode so the resident unique-token
-// arrays can be released.
+// arrays and ordinal table can be released.
 func (f *FTSIndex) Save(path string) error {
 	f.seal()
 	written := 0
@@ -455,29 +537,44 @@ func (f *FTSIndex) Save(path string) error {
 		if err := mw(f.uniqIDs); err != nil {
 			return err
 		}
+		if err := uv(uint64(len(f.table))); err != nil {
+			return err
+		}
+		tableOff := written
+		var tbuf [8]byte
+		for _, id := range f.table {
+			binary.BigEndian.PutUint64(tbuf[:], id)
+			if err := mw(tbuf[:]); err != nil {
+				return err
+			}
+		}
 		var sum [4]byte
 		binary.LittleEndian.PutUint32(sum[:], crc.Sum32())
 		if _, err := w.Write(sum[:]); err != nil {
 			return err
 		}
 		f.uniqOff = int64(uniqOff)
+		f.tableOff = int64(tableOff)
 		return w.Flush()
 	})
 	if err != nil {
 		return err
 	}
-	// Demote to file-backed: the unique section now lives on disk, so a
-	// freshly sealed index registered in the executor cache costs the same
-	// few MB as a loaded one instead of pinning ~13 MB of hash arrays.
+	// Demote to file-backed: the unique section and ordinal table now live on
+	// disk, so a freshly sealed index registered in the executor cache costs the
+	// same few MB as a loaded one instead of pinning the hash arrays and table.
 	f.path = path
 	f.uniqCount = len(f.uniqHashes) / 8
+	f.tableCount = len(f.table)
 	f.uniqHashes = nil
 	f.uniqIDs = nil
+	f.table = nil
 	return nil
 }
 
-// LoadFTSIndex opens an AFT2 index at path in file-backed mode: the dictionary
-// is resident but the df==1 unique section is searched on disk with pread.
+// LoadFTSIndex opens an AFT3 index at path in file-backed mode: the dictionary
+// is resident but the df==1 unique section and the ordinal table are read on
+// disk with pread.
 func LoadFTSIndex(path string) (*FTSIndex, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -547,12 +644,25 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	if uniqCount*16 > uint64(len(r)) {
+	// Unique section: uniqCount × (8B hash + 4B ordinal). Searched via pread;
+	// record its position only.
+	if uniqCount*12 > uint64(len(r)) {
 		return nil, errors.New("fts: load index: unique section out of range")
 	}
-	// The unique section is searched via pread; record its position only.
 	f.path = path
 	f.uniqCount = int(uniqCount)
 	f.uniqOff = int64(len(data) - 4 - len(r))
+	r = r[uniqCount*12:]
+
+	tableCount, err := take()
+	if err != nil {
+		return nil, err
+	}
+	if tableCount*8 > uint64(len(r)) {
+		return nil, errors.New("fts: load index: ordinal table out of range")
+	}
+	// The ordinal table is read via pread; record its position only.
+	f.tableCount = int(tableCount)
+	f.tableOff = int64(len(data) - 4 - len(r))
 	return f, nil
 }
