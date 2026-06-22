@@ -125,11 +125,15 @@ func TestFTSIndex_HashCollisionChain(t *testing.T) {
 	if len(idx.tokens) != 1 || idx.tokens[0] != "aaaa" {
 		t.Fatalf("dict = %v, want [aaaa]", idx.tokens)
 	}
-	if got := idx.lookup("aaaa"); len(got) != 2 || got[0] != 1 || got[1] != 7 {
-		t.Fatalf("lookup(aaaa) = %v, want [1 7]", got)
+	// lookup/lookupUnique return ordinals (AFT3); map them back to entry IDs to
+	// pin the collision contract at the record level.
+	got, err := idx.mapOrdinalsToIDs(idx.lookup("aaaa"))
+	if err != nil || len(got) != 2 || got[0] != 1 || got[1] != 7 {
+		t.Fatalf("lookup(aaaa) ids = %v (err %v), want [1 7]", got, err)
 	}
-	if got := idx.lookupUnique("aaaa"); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("lookupUnique under collision hash = %v, want [2]", got)
+	gotU, err := idx.mapOrdinalsToIDs(idx.lookupUnique("aaaa"))
+	if err != nil || len(gotU) != 1 || gotU[0] != 2 {
+		t.Fatalf("lookupUnique under collision hash = %v (err %v), want [2]", gotU, err)
 	}
 }
 
