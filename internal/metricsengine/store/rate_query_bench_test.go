@@ -37,6 +37,12 @@ func TestMain(m *testing.M) {
 	if fixtureDir != "" {
 		os.RemoveAll(fixtureDir)
 	}
+	if histFixture != nil {
+		histFixture.st.Close()
+	}
+	if histFixtureDir != "" {
+		os.RemoveAll(histFixtureDir)
+	}
 	os.Exit(code)
 }
 

@@ -223,8 +223,14 @@ func MergeAll(hists []*ExponentialHistogram) *ExponentialHistogram {
 			continue
 		}
 		by := h.Scale - target
-		out.Positive.mergeInto(h.Positive.downscale(by))
-		out.Negative.mergeInto(h.Negative.downscale(by))
+		if by == 0 {
+			// Same scale: mergeInto only reads src, so skip downscale's clone.
+			out.Positive.mergeInto(h.Positive)
+			out.Negative.mergeInto(h.Negative)
+		} else {
+			out.Positive.mergeInto(h.Positive.downscale(by))
+			out.Negative.mergeInto(h.Negative.downscale(by))
+		}
 		out.ZeroCount += h.ZeroCount
 		out.Count += h.Count
 		out.Sum += h.Sum
