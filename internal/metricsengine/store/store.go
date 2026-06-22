@@ -1165,42 +1165,88 @@ func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label s
 	if len(paths) == 0 {
 		return query.RateByLabelInSeries(s.headSnapshot(selector), selector, opts, label)
 	}
-	if len(paths) == 1 && s.engine.BufferedSeries() == 0 {
-		dir, err := s.readDirectory(paths[0])
-		if err != nil {
-			return nil, err
-		}
-		return query.RateByLabelInBlockWithDirectory(paths[0], dir, selector, opts, label)
-	}
 	if opts.MaxSampleGapMillis != nil {
 		return s.rateByLabelExact(selector, opts, label)
 	}
-	seriesRates := make(map[uint64]seriesRate)
-	for _, path := range paths {
-		dir, err := s.readDirectory(path)
-		if err != nil {
-			return nil, err
-		}
-		summaries, err := query.RateSummariesInBlockWithDirectory(path, dir, selector, opts)
-		if err != nil {
-			return nil, err
-		}
-		for _, summary := range summaries {
-			addRateSummary(seriesRates, summary, summary.Labels)
-		}
-	}
-	head := s.headSnapshot(selector)
-	headSummaries, err := query.RateSummariesInSeries(head, selector, opts)
+	// Instant rate (qm1/qm4) runs on the resident index, the same compact form
+	// the range-step path builds — so a mixed rate workload populates only the
+	// resident cache instead of also filling the directory cache for the same
+	// blocks. Each series is assembled once across all in-window blocks and its
+	// rate computed exactly, which subsumes the old summary-merge + overlap
+	// fallback.
+	return s.rateByLabelResident(paths, selector, opts, label)
+}
+
+// rateByLabelResident computes the per-group instant rate over the resident
+// index, partitioned by series across workers (see parallelRangeStepReduce). It
+// falls back to the sequential resident scan for an oversized block.
+func (s *Store) rateByLabelResident(paths []string, selector index.Selector, opts query.Options, label string) (map[string]float64, error) {
+	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
+		func() map[string]float64 { return make(map[string]float64) },
+		func() func(map[string]float64, *groupedRateSeries) error {
+			return func(acc map[string]float64, gr *groupedRateSeries) error {
+				rate, ok, err := rateFromGroupedSamples(gr.samples, opts)
+				if err != nil {
+					return err
+				}
+				if ok {
+					acc[gr.groupKey] += rate
+				}
+				return nil
+			}
+		},
+		mergeFloatMap)
 	if err != nil {
 		return nil, err
 	}
-	for _, summary := range headSummaries {
-		addRateSummary(seriesRates, summary, summary.Labels)
+	if ok {
+		return out, nil
 	}
-	if hasOverlappingRateChunks(seriesRates) {
-		return s.rateByLabelExact(selector, opts, label)
+	grouped, err := s.collectRangeStepSeriesGrouped(paths, selector, opts, label)
+	if err != nil {
+		return nil, err
 	}
-	return finalizeRateByLabel(seriesRates, label), nil
+	out = make(map[string]float64)
+	for _, gr := range grouped {
+		rate, ok, err := rateFromGroupedSamples(gr.samples, opts)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[gr.groupKey] += rate
+		}
+	}
+	return out, nil
+}
+
+// rateFromGroupedSamples computes a single counter rate over a series' samples
+// assembled from every in-window block. The samples arrive in block order, so
+// they are sorted and deduplicated first. The window/value filtering already ran
+// in the scan and MaxSampleGap routes to the exact path, so the rate is summed
+// directly over the samples (positive deltas only, matching RateSummary) without
+// materialising the timestamp/value slices RateSummaryForSamples would need.
+func rateFromGroupedSamples(rawSamples []rateSample, _ query.Options) (float64, bool, error) {
+	samples := compactExactRateSamples(rawSamples)
+	if len(samples) < 2 {
+		return 0, false, nil
+	}
+	dtMillis := samples[len(samples)-1].timestamp - samples[0].timestamp
+	if dtMillis <= 0 {
+		return 0, false, nil
+	}
+	var increase int64
+	for i := 1; i < len(samples); i++ {
+		if delta := samples[i].value - samples[i-1].value; delta > 0 {
+			increase += delta
+		}
+	}
+	return float64(increase) / (float64(dtMillis) / 1000.0), true, nil
+}
+
+func mergeFloatMap(dst, src map[string]float64) {
+	for key, value := range src {
+		dst[key] += value
+	}
 }
 
 // RateByLabelRange returns the per-group counter rate over the range selector's
@@ -1647,25 +1693,6 @@ func hasOverlappingRateChunks(seriesRates map[uint64]seriesRate) bool {
 		}
 	}
 	return false
-}
-
-func finalizeRateByLabel(seriesRates map[uint64]seriesRate, groupLabel string) map[string]float64 {
-	out := make(map[string]float64)
-	for _, series := range seriesRates {
-		if !series.hasRate {
-			continue
-		}
-		rate, ok, err := query.RateFromSummary(series.summary)
-		if err != nil || !ok {
-			continue
-		}
-		key, ok := series.labels.Get(groupLabel)
-		if !ok {
-			key = ""
-		}
-		out[key] += rate
-	}
-	return out
 }
 
 func finalizeIncreaseByLabel(seriesRates map[uint64]seriesRate, groupLabel string) map[string]int64 {
