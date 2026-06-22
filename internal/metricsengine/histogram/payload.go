@@ -47,6 +47,7 @@ func decodeExpPayload(b []byte, tickCount int) ([]int64, []*ExponentialHistogram
 	}
 	sketches := make([]*ExponentialHistogram, 0, tickCount)
 	var prev *ExponentialHistogram
+	var sc decodeScratch
 	for t := 0; t < tickCount; t++ {
 		marker, err := r.byteVal()
 		if err != nil {
@@ -73,11 +74,11 @@ func decodeExpPayload(b []byte, tickCount int) ([]int64, []*ExponentialHistogram
 			if err := readExpScalars(&r, sk); err != nil {
 				return nil, nil, err
 			}
-			pos, err := applyBucketDeltas(&r, prev.Positive)
+			pos, err := applyBucketDeltas(&r, prev.Positive, &sc)
 			if err != nil {
 				return nil, nil, err
 			}
-			neg, err := applyBucketDeltas(&r, prev.Negative)
+			neg, err := applyBucketDeltas(&r, prev.Negative, &sc)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -179,69 +180,117 @@ func appendBucketDeltas(dst []byte, prev, cur Buckets) []byte {
 	return dst
 }
 
+// decodeScratch holds reusable buffers for applyBucketDeltas so a series' tick
+// decode loop allocates only the retained output bucket arrays, not the
+// transient index/delta/work buffers each tick. Not safe for concurrent use; the
+// tick loop calls applyBucketDeltas sequentially.
+type decodeScratch struct {
+	idxs   []int32
+	deltas []int64
+	work   []int64
+}
+
+func (s *decodeScratch) reset(n int) {
+	if cap(s.idxs) < n {
+		s.idxs = make([]int32, n)
+		s.deltas = make([]int64, n)
+	} else {
+		s.idxs = s.idxs[:n]
+		s.deltas = s.deltas[:n]
+	}
+}
+
+func (s *decodeScratch) workspace(n int) []int64 {
+	if cap(s.work) < n {
+		s.work = make([]int64, n)
+	} else {
+		s.work = s.work[:n]
+		clear(s.work)
+	}
+	return s.work
+}
+
 // applyBucketDeltas reconstructs cur buckets by applying stored deltas onto prev.
-func applyBucketDeltas(r *reader, prev Buckets) (Buckets, error) {
-	n, err := r.uvarint()
+// The deltas are stored as (indexDelta, countDelta) pairs sorted by ascending
+// absolute index, so the reconstruction copies prev's dense counts and applies
+// the sparse deltas over the union index range — no per-tick count map (the old
+// map build dominated the quantile decode's allocations and CPU). Transient
+// buffers come from sc; only the returned Counts array is freshly allocated.
+func applyBucketDeltas(r *reader, prev Buckets, sc *decodeScratch) (Buckets, error) {
+	n64, err := r.uvarint()
 	if err != nil {
 		return Buckets{}, err
 	}
-	// Start from a copy of prev's nonzero buckets.
-	merged := make(map[int32]int64)
-	for i, c := range prev.Counts {
-		if c != 0 {
-			merged[prev.Offset+int32(i)] = int64(c)
-		}
-	}
+	n := int(n64)
+	sc.reset(n)
+	idxs, deltas := sc.idxs, sc.deltas
 	var lastIdx int32
-	for k := uint64(0); k < n; k++ {
+	for k := 0; k < n; k++ {
 		raw, err := r.varint()
 		if err != nil {
 			return Buckets{}, err
 		}
-		var idx int32
-		if k == 0 {
-			idx = int32(raw)
-		} else {
-			idx = lastIdx + int32(raw)
+		idx := int32(raw)
+		if k != 0 {
+			idx += lastIdx
 		}
 		lastIdx = idx
 		delta, err := r.varint()
 		if err != nil {
 			return Buckets{}, err
 		}
-		merged[idx] += delta
+		idxs[k] = idx
+		deltas[k] = delta
 	}
-	return bucketsFromCountMap(merged), nil
-}
 
-func bucketsFromCountMap(m map[int32]int64) Buckets {
-	var minIdx, maxIdx int32
-	first := true
-	for idx, c := range m {
-		if c == 0 {
-			continue
-		}
-		if first {
-			minIdx, maxIdx, first = idx, idx, false
+	// Union index range of prev's dense array and the delta indices.
+	lo, hi, has := int32(0), int32(0), false
+	if len(prev.Counts) > 0 {
+		lo, hi, has = prev.Offset, prev.Offset+int32(len(prev.Counts))-1, true
+	}
+	if n > 0 {
+		if !has {
+			lo, hi, has = idxs[0], idxs[n-1], true
 		} else {
-			if idx < minIdx {
-				minIdx = idx
+			if idxs[0] < lo {
+				lo = idxs[0]
 			}
-			if idx > maxIdx {
-				maxIdx = idx
+			if idxs[n-1] > hi {
+				hi = idxs[n-1]
 			}
 		}
 	}
-	if first {
-		return Buckets{}
+	if !has {
+		return Buckets{}, nil
 	}
-	out := Buckets{Offset: minIdx, Counts: make([]uint64, maxIdx-minIdx+1)}
-	for idx, c := range m {
-		if c > 0 {
-			out.Counts[idx-minIdx] = uint64(c)
+
+	work := sc.workspace(int(hi - lo + 1))
+	for i, c := range prev.Counts {
+		work[prev.Offset+int32(i)-lo] = int64(c)
+	}
+	for k := range idxs {
+		work[idxs[k]-lo] += deltas[k]
+	}
+
+	// Trim to the positive-count range; interior non-positive buckets become 0.
+	start := 0
+	for start < len(work) && work[start] <= 0 {
+		start++
+	}
+	if start == len(work) {
+		return Buckets{}, nil
+	}
+	end := len(work) - 1
+	for work[end] <= 0 {
+		end--
+	}
+	out := Buckets{Offset: lo + int32(start), Counts: make([]uint64, end-start+1)}
+	for i := start; i <= end; i++ {
+		if work[i] > 0 {
+			out.Counts[i-start] = uint64(work[i])
 		}
 	}
-	return out
+	return out, nil
 }
 
 // --- explicit ---
