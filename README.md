@@ -310,22 +310,29 @@ unified store. Where a columnar competitor wins, the table says so.
 
 ### Logs — 5M records, 3 runs × 3 systems
 
-Loki 3.4.2 · VictoriaLogs v1.36.0. Query p50/p95 (ms):
+Loki 3.4.2 · VictoriaLogs v1.36.0. Query p50/p95 (ms), medians of 3 runs:
 
 | Scenario | amber | Loki | VictoriaLogs |
 |----------|------:|-----:|-------------:|
-| q1 — point (service + level) | **0.90** / 6.2 | 9.3 / 20 | 12.3 / 16 |
-| q2 — range (service sub-window) | **1.89** / 7.0 | 51 / 77 | 15.3 / 21 |
-| q3 — full-text (common token) | **4.06** / 5.2 | 57 / 73 | 28.4 / 31 |
-| q4 — full-text (rare token) | **0.46** / 0.93 | 1914 / 1987 | 10.3 / 11 |
+| q1 — point (service + level) | **0.88** / 5.5 | 9.4 / 16 | 9.3 / 14 |
+| q2 — range (service sub-window) | **1.72** / 6.4 | 48.5 / 69 | 13.8 / 19.5 |
+| q3 — full-text (common token) | **11.0** / 16.5 | 51 / 71 | 25.2 / 25 |
+| q4 — full-text (rare token) | **0.45** / 0.49 | 1927 / 1954 | 10.0 / 12.7 |
 
 | Resource | amber | Loki | VictoriaLogs |
 |----------|------:|-----:|-------------:|
-| RSS peak / loaded (MB) | 809 / 582 | 1169 / 688 | **402 / 53** |
-| Storage (MB) | 875 | 260 | **226** |
+| RSS peak (MB) | 810 | 1134 | **356** |
+| Storage (MB) | 653 | 260 | **226** |
 
-**amber wins all four query scenarios.** It loses on RSS and on-disk size:
-VictoriaLogs is far leaner and Loki compacts hard during the settle window.
+**amber wins all four query scenarios** — q4 (rare-token full-text) by three
+orders of magnitude over Loki, the FTS index paying off. It still loses on RSS and
+on-disk size, but the gap narrowed: the AFT3 ordinal-delta `.fidx` format cut
+amber's storage from 875 → **653 MB** (3.9× → 2.9× VictoriaLogs). The same change
+moved q3 (common-token full-text) from 4 → 11 ms — the ordinal table is mapped
+back to record IDs with a per-result `pread` rather than held resident, trading a
+few ms on wide result sets for flat memory; amber still answers q3 well ahead of
+both competitors. (Re-campaign on the fixed engine, 2026-06-23, equality gate
+green across all three runs.)
 
 ### Metrics — 100k scalar + 10k histogram series, 3 runs × 4 systems
 
