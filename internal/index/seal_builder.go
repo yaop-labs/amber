@@ -138,6 +138,7 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 
 	bitmap := NewMultiFieldIndex()
 	posting := NewPostingListBuilder(16)
+	cover := NewCoverBuilder()
 	var traceKeys [][]byte
 	var skipped int
 
@@ -151,6 +152,12 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 
 		if span.Service != "" {
 			bitmap.Add("service", span.Service, entryID)
+			// Covering projection is keyed by service (one copy per span); it
+			// lets trace-summary queries answer from the index without
+			// decompressing row blocks. See coverindex.go.
+			cover.Add(span.Service, entryID, span.TraceID,
+				span.StartTime.UnixNano(), span.EndTime.UnixNano(),
+				uint8(span.Status), span.Operation, span.IsRoot())
 		}
 		if span.Operation != "" {
 			bitmap.Add("operation", span.Operation, entryID)
@@ -175,6 +182,11 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 
 	if err := bitmap.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
+	}
+	if !cover.Empty() {
+		if err := cover.Save(segmentPath + ".cidx"); err != nil {
+			return nil, err
+		}
 	}
 	out := &SpanSealIndexes{}
 	if ribbon, err := BuildRibbonFilter(traceKeys, 8); err != nil {

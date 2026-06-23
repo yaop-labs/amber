@@ -30,7 +30,7 @@ var DefaultRotationPolicy = RotationPolicy{
 }
 
 // SegmentSidecarExts lists the files belonging to a sealed segment.
-var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".pidx"}
+var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".pidx", ".cidx"}
 
 // SegmentManager owns the active segment and WAL and drives the durability
 // protocol: it appends to the WAL, writes to the active segment, rotates and
