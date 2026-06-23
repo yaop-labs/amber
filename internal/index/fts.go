@@ -433,20 +433,53 @@ func (f *FTSIndex) mapOrdinalsToIDs(ords []uint64) ([]uint64, error) {
 	if f.path == "" || f.tableCount == 0 {
 		return nil, errors.New("fts: ordinal table unavailable")
 	}
+	if len(ords) == 0 {
+		return out, nil
+	}
+	// The result ordinals span a contiguous slice of the table; read that range
+	// once instead of one pread per result. A single sequential read beats N
+	// random reads even when the matches are spread across the segment, and the
+	// buffer is transient so resident memory stays flat.
+	minOrd, maxOrd := ords[0], ords[0]
+	for _, o := range ords {
+		if o < minOrd {
+			minOrd = o
+		}
+		if o > maxOrd {
+			maxOrd = o
+		}
+	}
+	if int(maxOrd) >= f.tableCount {
+		return nil, errors.New("fts: ordinal out of range")
+	}
 	file, err := os.Open(f.path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	var buf [8]byte
-	for i, o := range ords {
-		if int(o) >= f.tableCount {
-			return nil, errors.New("fts: ordinal out of range")
-		}
-		if _, err := file.ReadAt(buf[:], f.tableOff+int64(o)*8); err != nil {
+
+	// One ranged read when the results are clustered (the common case — a query
+	// returns the lowest ordinals of a posting, so the span is tight). If the
+	// results are sparse across the table (e.g. after an intersection), reading
+	// the whole span would pull far more than needed, so fall back to a pread per
+	// result — never worse than the per-result baseline either way.
+	span := int(maxOrd-minOrd) + 1
+	if span <= 8*len(ords) {
+		buf := make([]byte, span*8)
+		if _, err := file.ReadAt(buf, f.tableOff+int64(minOrd)*8); err != nil {
 			return nil, err
 		}
-		out[i] = binary.BigEndian.Uint64(buf[:])
+		for i, o := range ords {
+			out[i] = binary.BigEndian.Uint64(buf[int(o-minOrd)*8:])
+		}
+		return out, nil
+	}
+	var word [8]byte
+	for i, o := range ords {
+		if _, err := file.ReadAt(word[:], f.tableOff+int64(o)*8); err != nil {
+			return nil, err
+		}
+		out[i] = binary.BigEndian.Uint64(word[:])
 	}
 	return out, nil
 }
