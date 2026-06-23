@@ -368,21 +368,32 @@ the columnar scan/aggregate shape (qm3) and on storage.
 
 Tempo 2.10.1 · VictoriaTraces v0.9.2. Query p50 (ms):
 
+amber is an amber-only re-run after adding span tag/duration indexes (2026-06-23);
+competitors are the prior comparable run. Query p50 (ms):
+
 | Scenario | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
-| QT1 — trace-ID lookup | 108 | 94 | **18** |
-| QT2 — service + operation search | 7629 | 108 | **26** |
-| QT3 — service + duration search | 6078 | 67 | **40** |
+| QT1 — trace-ID lookup | 99 | 94 | **18** |
+| QT2 — service + operation search | 3720 | 108 | **26** |
+| QT3 — service + duration search | 2398 | 67 | **40** |
 
 | Resource | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
-| RSS peak (MB) | **617** | 2249 | 1537 |
-| Storage (MB) | 1872 | 5166 | **1639** |
+| RSS peak (MB) | **780** | 2249 | 1537 |
+| Storage (MB) | 2113 | 5166 | **1639** |
 
-**amber wins RSS decisively** (≈3.6× lighter than Tempo) and is second on
-storage, but loses the scan-search scenarios (QT2/QT3): it currently full-scans
-spans with no tag/duration index, where VictoriaTraces' columnar engine answers
-in tens of ms. Point lookup (QT1) is on par with Tempo.
+**amber wins RSS decisively** (≈2.9× lighter than Tempo) and is second on storage.
+The scan-search scenarios improved with the new span bitmaps (service/operation/
+status + log2 duration buckets, replacing a blind full-scan): QT2 7.6 → 3.7 s,
+QT3 6.1 → 2.4 s (~2–2.5×). They still trail VictoriaTraces' columnar engine by a
+wide margin, and the bench exposed why: with one service per trace the service
+posting is a large fraction of all spans, and the bitmap intersect is a full
+merge over it — so a low-selectivity predicate still pays an O(set) cost
+regardless of how few spans finally match. Closing the rest needs a
+selectivity-aware intersect (galloping/binary-search for skewed sets, or skipping
+a field whose set is most of the segment), not more index fields. An honest
+partial win: indexing took scan-search from *embarrassing* to *2–2.5× better*,
+and named the next bottleneck precisely. Point lookup (QT1) is on par with Tempo.
 
 <details>
 <summary>Methodology and notes</summary>
