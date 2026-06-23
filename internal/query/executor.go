@@ -1226,6 +1226,15 @@ func (e *Executor) execSpanSegment(
 
 	var allowedSlice []uint64
 	hasFilter := false
+	restrict := func(ids []uint64) bool {
+		if !hasFilter {
+			allowedSlice = ids
+			hasFilter = true
+		} else {
+			allowedSlice = index.IntersectSorted(allowedSlice, ids)
+		}
+		return len(allowedSlice) > 0
+	}
 
 	if !model.IsZeroTraceID(q.TraceID) {
 		if ribbon, ok := e.spanRibbon(seg.FileName); ok {
@@ -1235,12 +1244,22 @@ func (e *Executor) execSpanSegment(
 		}
 		if pl, ok := e.spanPosting(seg.FileName); ok {
 			ids := pl.Lookup(q.TraceID[:])
-			if len(ids) == 0 {
+			slices.Sort(ids)
+			if !restrict(ids) {
 				return 0, nil
 			}
-			slices.Sort(ids)
-			allowedSlice = ids
-			hasFilter = true
+		}
+	}
+
+	// Service/operation/status are bitmap-indexed in the span .bidx; intersect
+	// the matching candidates so the scan decodes only those, not every span.
+	// The scan still applies these filters exactly (plus time/duration/cursor),
+	// so a missing or coarse bitmap only loses pruning, never correctness.
+	if conditions := buildSpanBitmapConditions(q); len(conditions) > 0 {
+		if bm, ok := e.spanBitmap(seg.FileName); ok {
+			if !restrict(bm.FilterMulti(conditions)) {
+				return 0, nil
+			}
 		}
 	}
 
@@ -1380,6 +1399,27 @@ func buildBitmapConditions(q *LogQuery) map[string][]string {
 	}
 	if len(q.Levels) > 0 {
 		conditions["level"] = q.Levels
+	}
+	return conditions
+}
+
+// buildSpanBitmapConditions maps a span query's exact-match fields to the span
+// .bidx fields built by BuildSpanSealIndexes (service/operation/status), so the
+// scan decodes only candidate spans instead of every span in the segment.
+func buildSpanBitmapConditions(q *SpanQuery) map[string][]string {
+	conditions := make(map[string][]string)
+	if len(q.Services) > 0 {
+		conditions["service"] = q.Services
+	}
+	if len(q.Operations) > 0 {
+		conditions["operation"] = q.Operations
+	}
+	if len(q.Statuses) > 0 {
+		statuses := make([]string, len(q.Statuses))
+		for i, s := range q.Statuses {
+			statuses[i] = s.String()
+		}
+		conditions["status"] = statuses
 	}
 	return conditions
 }

@@ -127,6 +127,44 @@ func TestExecutor_ExecSpan_ServiceFilter(t *testing.T) {
 	}
 }
 
+// TestExecutor_ExecSpan_ServiceAndOperation is the QT2 shape: service +
+// operation, served by intersecting the span .bidx bitmaps. The dataset aligns
+// service[i%3] with operation[i%3], so an aligned pair intersects to a non-empty
+// set and a crossed pair intersects to nothing (exercising the bitmap early-out).
+func TestExecutor_ExecSpan_ServiceAndOperation(t *testing.T) {
+	exec, cleanup := buildSpanDataset(t, 30)
+	defer cleanup()
+
+	hit, err := exec.ExecSpan(context.Background(), &SpanQuery{
+		Services:   []string{"api-gateway"},
+		Operations: []string{"GET /widgets"},
+		Limit:      100,
+	})
+	if err != nil {
+		t.Fatalf("ExecSpan: %v", err)
+	}
+	if len(hit.Spans) == 0 {
+		t.Fatal("expected spans for api-gateway + GET /widgets, got 0")
+	}
+	for _, s := range hit.Spans {
+		if s.Service != "api-gateway" || s.Operation != "GET /widgets" {
+			t.Errorf("filter leaked: got %q / %q", s.Service, s.Operation)
+		}
+	}
+
+	miss, err := exec.ExecSpan(context.Background(), &SpanQuery{
+		Services:   []string{"api-gateway"},
+		Operations: []string{"POST /orders"},
+		Limit:      100,
+	})
+	if err != nil {
+		t.Fatalf("ExecSpan: %v", err)
+	}
+	if len(miss.Spans) != 0 {
+		t.Errorf("non-co-occurring service+operation: got %d spans, want 0", len(miss.Spans))
+	}
+}
+
 // TestExecutor_ExecSpan_TraceIDFilter is the span path's reason for
 // existing: pulling a complete trace by id. Every span in the dataset
 // shares one trace id, so we expect every record back regardless of

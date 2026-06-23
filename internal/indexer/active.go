@@ -129,6 +129,10 @@ func (a *ActiveIndex) IndexSpanEntry(span model.SpanEntry) {
 	if span.Service != "" {
 		idx.Add("service", span.Service, entryID)
 	}
+	if span.Operation != "" {
+		idx.Add("operation", span.Operation, entryID)
+	}
+	idx.Add("status", span.Status.String(), entryID)
 	if !model.IsZeroTraceID(span.TraceID) {
 		var traceHex [32]byte
 		hex.Encode(traceHex[:], span.TraceID[:])
@@ -205,6 +209,8 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	}
 
 	serviceGroups := make(map[string][]uint64, 4)
+	operationGroups := make(map[string][]uint64, 8)
+	statusGroups := make(map[string][]uint64, 4)
 	traceGroups := make(map[string][]uint64)
 	var traceHexCache map[model.TraceID]string
 
@@ -214,6 +220,10 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 		if span.Service != "" {
 			serviceGroups[span.Service] = append(serviceGroups[span.Service], entryID)
 		}
+		if span.Operation != "" {
+			operationGroups[span.Operation] = append(operationGroups[span.Operation], entryID)
+		}
+		statusGroups[span.Status.String()] = append(statusGroups[span.Status.String()], entryID)
 		if !model.IsZeroTraceID(span.TraceID) {
 			if traceHexCache == nil {
 				traceHexCache = make(map[model.TraceID]string)
@@ -232,6 +242,18 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	if len(serviceGroups) > 0 {
 		bi := idx.GetOrCreate("service")
 		for value, ids := range serviceGroups {
+			bi.AddMany(value, ids)
+		}
+	}
+	if len(operationGroups) > 0 {
+		bi := idx.GetOrCreate("operation")
+		for value, ids := range operationGroups {
+			bi.AddMany(value, ids)
+		}
+	}
+	if len(statusGroups) > 0 {
+		bi := idx.GetOrCreate("status")
+		for value, ids := range statusGroups {
 			bi.AddMany(value, ids)
 		}
 	}
