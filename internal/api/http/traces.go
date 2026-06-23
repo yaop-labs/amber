@@ -34,7 +34,6 @@ type traceSummary struct {
 	HasErrors  bool      `json:"has_errors"`
 }
 
-const traceSummaryPageSize = 2000
 const traceSummaryMaxSpans = 100_000
 
 func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -94,17 +93,21 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	summaries, total, truncated, err := collectTraceSummaries(
-		func(q *query.SpanQuery) (*query.SpanResult, error) {
-			return h.exec.ExecSpan(r.Context(), q)
-		},
-		sq,
-	)
+	// Covering .cidx projections answer service-filtered summaries without
+	// decompressing row blocks; segments without one fall back to the scan
+	// inside SpanSummaryFetch. The summary grouping (buildTraceSummaries) is
+	// shared, so output is identical to the scan path.
+	spans, truncated, err := h.exec.SpanSummaryFetch(r.Context(), &sq, traceSummaryMaxSpans)
 	if err != nil {
 		h.log.Error("traces list query failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "query failed")
 		return
 	}
+	summaries := buildTraceSummaries(spans)
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].StartTime.After(summaries[j].StartTime)
+	})
+	total := len(summaries)
 	if offset >= total {
 		summaries = nil
 	} else {
@@ -119,46 +122,6 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"total":     total,
 		"truncated": truncated,
 	})
-}
-
-func collectTraceSummaries(
-	fetch func(*query.SpanQuery) (*query.SpanResult, error),
-	base query.SpanQuery,
-) ([]traceSummary, int, bool, error) {
-	page := base
-	page.Limit = traceSummaryPageSize
-	page.Cursor = ""
-
-	var allSpans []model.SpanEntry
-	truncated := false
-	for {
-		result, err := fetch(&page)
-		if err != nil {
-			return nil, 0, false, err
-		}
-		remaining := traceSummaryMaxSpans - len(allSpans)
-		if remaining <= 0 {
-			truncated = true
-			break
-		}
-		if len(result.Spans) > remaining {
-			allSpans = append(allSpans, result.Spans[:remaining]...)
-			truncated = true
-			break
-		}
-		allSpans = append(allSpans, result.Spans...)
-
-		if result.NextCursor == "" || len(result.Spans) == 0 {
-			break
-		}
-		page.Cursor = result.NextCursor
-	}
-
-	summaries := buildTraceSummaries(allSpans)
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].StartTime.After(summaries[j].StartTime)
-	})
-	return summaries, len(summaries), truncated, nil
 }
 
 func buildTraceSummaries(spans []model.SpanEntry) []traceSummary {
