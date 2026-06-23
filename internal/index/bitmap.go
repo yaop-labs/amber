@@ -270,9 +270,21 @@ func (m *MultiFieldIndex) FilterAny(field string, values []string) []uint64 {
 
 // IntersectSorted returns the sorted intersection in a fresh slice — inputs
 // are often shared cache state and must not be mutated.
+//
+// A plain linear merge costs O(len(a)+len(b)), which walks the larger set in
+// full even when the smaller set is tiny. Span postings are highly skewed (a
+// single-service trace means one service's posting ≈ 1/N of all spans), so when
+// the sets differ a lot in size we gallop the small set through the large one in
+// O(len(small)·log len(large)) instead. Balanced sizes stay on the linear merge,
+// which is faster there and has no binary-search overhead.
 func IntersectSorted(a, b []uint64) []uint64 {
 	if len(b) < len(a) {
 		a, b = b, a
+	}
+	// a is the smaller set. Gallop only when b dwarfs a enough that
+	// len(a)·log2(len(b)) beats len(a)+len(b); the 8× gate is conservative.
+	if len(a) > 0 && len(b) >= len(a)*8 {
+		return intersectGalloping(a, b)
 	}
 	out := make([]uint64, 0, len(a))
 	i, j := 0, 0
@@ -289,6 +301,50 @@ func IntersectSorted(a, b []uint64) []uint64 {
 		}
 	}
 	return out
+}
+
+// intersectGalloping intersects a sorted small set a into a sorted large set b
+// by exponential+binary search, advancing the cursor in b so total work is
+// O(len(a)·log len(b)). a must be the smaller set.
+func intersectGalloping(a, b []uint64) []uint64 {
+	out := make([]uint64, 0, len(a))
+	j := 0
+	for _, target := range a {
+		j = gallopLowerBound(b, j, target)
+		if j >= len(b) {
+			break
+		}
+		if b[j] == target {
+			out = append(out, target)
+			j++
+		}
+	}
+	return out
+}
+
+// gallopLowerBound returns the first index >= start whose value in b is >=
+// target, using exponential search to bracket then binary search to land.
+func gallopLowerBound(b []uint64, start int, target uint64) int {
+	n := len(b)
+	if start >= n || b[start] >= target {
+		return start
+	}
+	// Exponential search for an upper bracket where b[start+hi] >= target.
+	hi := 1
+	for start+hi < n && b[start+hi] < target {
+		hi *= 2
+	}
+	lo := start + hi/2 // b[lo] < target (hi/2 was the previous step, or start)
+	h := min(start+hi, n)
+	for lo < h {
+		mid := lo + (h-lo)/2
+		if b[mid] < target {
+			lo = mid + 1
+		} else {
+			h = mid
+		}
+	}
+	return lo
 }
 
 // UnionSorted returns the sorted union in a fresh slice.
