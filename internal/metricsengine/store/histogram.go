@@ -72,22 +72,21 @@ func (s *Store) headMatchedExp(selector index.Selector, tr histogram.TimeRange) 
 		if !histogram.MatchLabels(series.Labels, selector) {
 			continue
 		}
-		var picked []*histogram.ExponentialHistogram
-		for i, ts := range series.Timestamps {
-			if tr.Contains(ts) {
-				picked = append(picked, series.Sketches[i])
-			}
-		}
-		if len(picked) == 0 {
-			continue
-		}
 		fp := series.Labels.Fingerprint()
-		m := out[fp]
-		if m == nil {
-			m = &histogram.MatchedExp{Labels: series.Labels}
-			out[fp] = m
+		var m *histogram.MatchedExp
+		for i, ts := range series.Timestamps {
+			if !tr.Contains(ts) {
+				continue
+			}
+			if m == nil {
+				m = out[fp]
+				if m == nil {
+					m = &histogram.MatchedExp{Labels: series.Labels}
+					out[fp] = m
+				}
+			}
+			m.Add(series.Sketches[i])
 		}
-		m.Sketches = append(m.Sketches, picked...)
 	}
 	return out
 }
@@ -95,7 +94,7 @@ func (s *Store) headMatchedExp(selector index.Selector, tr histogram.TimeRange) 
 func mergeMatched(dst, src map[uint64]*histogram.MatchedExp) {
 	for fp, m := range src {
 		if cur := dst[fp]; cur != nil {
-			cur.Sketches = append(cur.Sketches, m.Sketches...)
+			cur.AddMerged(m)
 		} else {
 			dst[fp] = m
 		}
@@ -110,9 +109,9 @@ func (s *Store) HistogramQuantile(selector index.Selector, q float64, tr histogr
 		return 0, err
 	}
 	mergeMatched(matched, s.headMatchedExp(selector, tr))
-	all := make([]*histogram.ExponentialHistogram, 0)
+	all := make([]*histogram.ExponentialHistogram, 0, len(matched))
 	for _, m := range matched {
-		all = append(all, m.Sketches...)
+		all = append(all, m.Merged)
 	}
 	merged := histogram.MergeAll(all)
 	if merged == nil {
@@ -132,7 +131,7 @@ func (s *Store) HistogramQuantileBy(selector index.Selector, q float64, tr histo
 	groups := make(map[string][]*histogram.ExponentialHistogram)
 	for _, m := range matched {
 		key := histogram.GroupKey(m.Labels, by)
-		groups[key] = append(groups[key], m.Sketches...)
+		groups[key] = append(groups[key], m.Merged)
 	}
 	out := make(map[string]float64, len(groups))
 	for key, hists := range groups {

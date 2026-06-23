@@ -29,10 +29,26 @@ func (tr TimeRange) Contains(ts int64) bool { return ts >= tr.Start && ts <= tr.
 
 func (tr TimeRange) Overlaps(mn, mx int64) bool { return mn <= tr.End && mx >= tr.Start }
 
-// MatchedExp is one label-distinct group of matched exp sketches.
+// MatchedExp is one label-distinct group of matched exp sketches, folded into a
+// single accumulator as they arrive so the query never holds every in-window
+// sketch at once (caps peak memory at one histogram per matched series).
 type MatchedExp struct {
-	Labels   model.LabelSet
-	Sketches []*ExponentialHistogram
+	Labels model.LabelSet
+	Merged *ExponentialHistogram
+}
+
+// Add folds one in-window sketch into the accumulator. h is not retained or
+// mutated (the first Add clones it).
+func (m *MatchedExp) Add(h *ExponentialHistogram) {
+	m.Merged = foldExp(m.Merged, h)
+}
+
+// AddMerged folds another series' accumulator into this one (e.g. head sketches
+// into the block-collected map for the same fingerprint).
+func (m *MatchedExp) AddMerged(other *MatchedExp) {
+	if other != nil {
+		m.Merged = foldExp(m.Merged, other.Merged)
+	}
 }
 
 // CollectExp gathers, grouped by label fingerprint, every exp sketch in the
@@ -77,7 +93,7 @@ func CollectExp(paths []string, selector index.Selector, tr TimeRange) (map[uint
 			}
 			for i, ts := range dec.Timestamps {
 				if tr.Contains(ts) {
-					m.Sketches = append(m.Sketches, dec.Sketches[i])
+					m.Add(dec.Sketches[i])
 				}
 			}
 		}
@@ -409,9 +425,9 @@ func QuantileForPaths(paths []string, selector index.Selector, q float64, tr Tim
 	if err != nil {
 		return 0, err
 	}
-	all := make([]*ExponentialHistogram, 0)
+	all := make([]*ExponentialHistogram, 0, len(matched))
 	for _, m := range matched {
-		all = append(all, m.Sketches...)
+		all = append(all, m.Merged)
 	}
 	merged := MergeAll(all)
 	if merged == nil {
@@ -430,7 +446,7 @@ func QuantileByForPaths(paths []string, selector index.Selector, q float64, tr T
 	groups := make(map[string][]*ExponentialHistogram)
 	for _, m := range matched {
 		key := GroupKey(m.Labels, by)
-		groups[key] = append(groups[key], m.Sketches...)
+		groups[key] = append(groups[key], m.Merged)
 	}
 	out := make(map[string]float64, len(groups))
 	for key, hists := range groups {

@@ -253,6 +253,55 @@ func MergeAll(hists []*ExponentialHistogram) *ExponentialHistogram {
 	return out
 }
 
+// foldExp merges h into acc in place and returns the accumulator, so a stream of
+// sketches collapses to one retained histogram instead of being held until a
+// final MergeAll. acc==nil starts a fresh owned copy (h is the right scale until
+// a coarser sketch arrives); h is never mutated. Merge is commutative and
+// associative and downscaling is monotonic ((x>>a)>>b == x>>(a+b)), so folding
+// is bucket-identical to MergeAll over the same inputs — only the peak memory
+// differs (O(1) accumulator vs O(all sketches)).
+func foldExp(acc, h *ExponentialHistogram) *ExponentialHistogram {
+	if h == nil {
+		return acc
+	}
+	if acc == nil {
+		return h.Clone()
+	}
+	if h.Scale < acc.Scale {
+		by := acc.Scale - h.Scale
+		acc.Positive = acc.Positive.downscale(by)
+		acc.Negative = acc.Negative.downscale(by)
+		acc.Scale = h.Scale
+	}
+	if by := h.Scale - acc.Scale; by == 0 {
+		// Same scale: mergeInto only reads src, so skip downscale's clone.
+		acc.Positive.mergeInto(h.Positive)
+		acc.Negative.mergeInto(h.Negative)
+	} else {
+		acc.Positive.mergeInto(h.Positive.downscale(by))
+		acc.Negative.mergeInto(h.Negative.downscale(by))
+	}
+	acc.ZeroCount += h.ZeroCount
+	acc.Count += h.Count
+	acc.Sum += h.Sum
+	if h.ZeroThreshold > acc.ZeroThreshold {
+		acc.ZeroThreshold = h.ZeroThreshold
+	}
+	if h.HasMinMax {
+		if !acc.HasMinMax {
+			acc.Min, acc.Max, acc.HasMinMax = h.Min, h.Max, true
+		} else {
+			if h.Min < acc.Min {
+				acc.Min = h.Min
+			}
+			if h.Max > acc.Max {
+				acc.Max = h.Max
+			}
+		}
+	}
+	return acc
+}
+
 // Quantile estimates the q-th quantile (0..1) of the distribution by walking the
 // merged buckets in value order (most-negative -> zero -> most-positive),
 // accumulating counts, and returning the geometric midpoint of the bucket that
