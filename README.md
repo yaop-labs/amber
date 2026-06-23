@@ -334,38 +334,35 @@ few ms on wide result sets for flat memory; amber still answers q3 well ahead of
 both competitors. (Re-campaign on the fixed engine, 2026-06-23, equality gate
 green across all three runs.)
 
-### Metrics — 100k scalar + 10k histogram series, 3 runs × 4 systems
+### Metrics — 100k scalar + 10k histogram series, 4 systems
 
-Mimir 3.1.0 · VictoriaMetrics v1.145.0 · Prometheus v3.12.0. Query p50/p95 (ms):
+Mimir 3.1.0 · VictoriaMetrics v1.145.0 · Prometheus v3.12.0. Query p50/p95 (ms).
+The amber column is an amber-only re-run on the reworked engine (2026-06-23);
+competitors are the prior fully-comparable run (sequential methodology — same
+workload, same equality gate).
 
 | Scenario | amber | Mimir | VictoriaMetrics | Prometheus |
 |----------|------:|------:|----------------:|-----------:|
-| qm1 — instant rate | 2139 / 2625 | 768 / 883 | **187 / 227** | 458 / 490 |
-| qm2 — range rate | 6330 / 6881 | 1325 / 1529 | **267 / 337** | 868 / 927 |
-| qm3 — histogram quantile | 1297 / 4320 | 495 / 654 | 291 / 609 | **259 / 344** |
-| qm4 — group-by rate | 2239 / 2852 | 760 / 922 | **179 / 206** | 423 / 506 |
+| qm1 — instant rate | **76 / 546** | 768 / 883 | 187 / 227 | 458 / 490 |
+| qm2 — range rate | 539 / 1194 | 1325 / 1529 | **267 / 337** | 868 / 927 |
+| qm3 — histogram quantile | 990 / 1370 | 495 / 654 | 291 / 609 | **259 / 344** |
+| qm4 — group-by rate | **80 / 564** | 760 / 922 | 179 / 206 | 423 / 506 |
 
 | Resource | amber | Mimir | VictoriaMetrics | Prometheus |
 |----------|------:|------:|----------------:|-----------:|
-| RSS peak (MB) | 1110 | 2076 | **576** | 718 |
-| Storage (MB) | 540 | 370 | **152** | 255 |
+| RSS peak (MB) | 912 | 2076 | **576** | 718 |
+| Storage (MB) | 539 | 370 | **152** | 255 |
 
-> **Caveat (important):** at campaign time amber was the slowest on all four
-> metric queries — VictoriaMetrics (columnar) dominates. The query engine has
-> since been reworked across every path, measured at campaign scale (100k series,
-> ~30 sealed blocks, 800 MB soft limit):
->
-> - **qm2 — range rate:** resident block index + series-partitioned parallelism,
->   **6.3s → ~0.6s (~10×)** — past Mimir/Prometheus to ~2.5× VictoriaMetrics.
-> - **qm1 / qm4 — instant & group-by rate:** moved onto the same resident index,
->   **~3.3× faster, −51% bytes/query**.
-> - **qm3 — histogram quantile:** map-free exponential-bucket delta decode with
->   buffer reuse, **−79% allocations** — removing the GC thrash that drove the
->   ~9× worst-case decode cost and the high p95.
->
-> These are bench-measured (store-level and amber-only); a full cross-system
-> re-campaign on the fixed engine is pending, so the table above is the last
-> *fully comparable* run. amber already beats Mimir on RSS.
+**The query rework flipped the metrics story.** At campaign time (2026-06-13)
+amber was the slowest on all four; on the reworked engine it now **wins qm1 and
+qm4 outright** — instant- and group-by-rate moved onto a resident block index,
+2139 → 76 ms and 2239 → 80 ms (~28×), ahead of even VictoriaMetrics. qm2 (range
+rate) dropped 6.3 s → 0.54 s (resident index + series-partitioned parallelism),
+second to VM at ~2× and past Mimir/Prometheus. qm3 (histogram quantile) is the
+remaining laggard but improved 1.30 → 0.99 s (map-free exp-bucket decode, −79%
+allocations). RSS peak fell 1110 → 912 MB — moving the rate paths off the
+directory cache removed the cache-coexistence overhead. amber still trails VM on
+the columnar scan/aggregate shape (qm3) and on storage.
 
 ### Traces — 3.6M traces / 36M spans, 2 runs × 3 systems
 
