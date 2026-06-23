@@ -165,6 +165,36 @@ func TestExecutor_ExecSpan_ServiceAndOperation(t *testing.T) {
 	}
 }
 
+// TestExecutor_ExecSpan_MinDuration is the QT3 shape: service-scoped duration
+// search, pruned by the span .bidx dur_bucket field then exact-filtered by the
+// scan. Every span in the dataset is 10 ms.
+func TestExecutor_ExecSpan_MinDuration(t *testing.T) {
+	exec, cleanup := buildSpanDataset(t, 30)
+	defer cleanup()
+
+	keep, err := exec.ExecSpan(context.Background(), &SpanQuery{
+		MinDuration: 5 * time.Millisecond,
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("ExecSpan: %v", err)
+	}
+	if len(keep.Spans) != 30 {
+		t.Fatalf("min_duration 5ms: got %d spans, want 30", len(keep.Spans))
+	}
+
+	drop, err := exec.ExecSpan(context.Background(), &SpanQuery{
+		MinDuration: 20 * time.Millisecond,
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("ExecSpan: %v", err)
+	}
+	if len(drop.Spans) != 0 {
+		t.Fatalf("min_duration 20ms: got %d spans, want 0", len(drop.Spans))
+	}
+}
+
 // TestExecutor_ExecSpan_TraceIDFilter is the span path's reason for
 // existing: pulling a complete trace by id. Every span in the dataset
 // shares one trace id, so we expect every record back regardless of
