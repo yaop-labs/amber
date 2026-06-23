@@ -370,13 +370,60 @@ func UnionSorted(a, b []uint64) []uint64 {
 	return out
 }
 
-// On-disk format ("BID2"): per field, per value, delta-varint sorted IDs
-// with a trailing CRC. Replaces the roaring serialization ("BIDX"), which
-// is rejected on load — bootstrap rebuilds, queries fall back to scans
-// until then.
-var bitmapIndexMagic = [4]byte{'B', 'I', 'D', '2'}
+// On-disk formats:
+//
+//	"BIDX" — legacy roaring serialization. Rejected on load (rebuild/scan).
+//	"BID2" — per field/value delta-varint postings, trailing whole-file CRC.
+//	         Still read for back-compat, no longer written.
+//	"BID3" — seekable: a postings region (each blob = CRC32 + count + deltas)
+//	         followed by a directory (field → value → blob offset+length) and a
+//	         12-byte footer (dirOffset:u64, fileCRC:u32). A reader can pull one
+//	         field+value posting with a directory lookup and a single pread,
+//	         instead of decoding the whole index — see SeekableBitmapIndex. The
+//	         span query path consumed ~34% of QT2/QT3 CPU re-parsing full .bidx
+//	         files on every query (a 32-slot cache vs 361 segments); BID3 reads
+//	         only the postings a query actually needs.
+var (
+	bitmapIndexMagic   = [4]byte{'B', 'I', 'D', '2'}
+	bitmapIndexMagicV3 = [4]byte{'B', 'I', 'D', '3'}
+)
 
-// Save writes the index to path atomically in the BID2 format.
+// appendPosting appends a posting blob payload (count + delta-varint ids) to dst.
+func appendPosting(dst []byte, ids []uint64) []byte {
+	var scratch [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(scratch[:], uint64(len(ids)))
+	dst = append(dst, scratch[:n]...)
+	var prev uint64
+	for _, id := range ids {
+		n := binary.PutUvarint(scratch[:], id-prev)
+		dst = append(dst, scratch[:n]...)
+		prev = id
+	}
+	return dst
+}
+
+// decodePosting decodes a posting payload (count + delta-varint ids).
+func decodePosting(b []byte) ([]uint64, error) {
+	count, n := binary.Uvarint(b)
+	if n <= 0 {
+		return nil, errors.New("bitmap: truncated posting count")
+	}
+	b = b[n:]
+	ids := make([]uint64, 0, count)
+	var prev uint64
+	for range count {
+		d, n := binary.Uvarint(b)
+		if n <= 0 {
+			return nil, errors.New("bitmap: truncated posting delta")
+		}
+		b = b[n:]
+		prev += d
+		ids = append(ids, prev)
+	}
+	return ids, nil
+}
+
+// Save writes the index to path atomically in the seekable BID3 format.
 func (m *MultiFieldIndex) Save(path string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -384,59 +431,104 @@ func (m *MultiFieldIndex) Save(path string) error {
 	return atomicWrite(path, func(file *os.File) error {
 		crc := crc32.NewIEEE()
 		w := bufio.NewWriterSize(file, 1<<20)
-		mw := func(b []byte) error {
+		var off int64
+		write := func(b []byte) error {
 			crc.Write(b)
-			_, err := w.Write(b)
+			n, err := w.Write(b)
+			off += int64(n)
 			return err
 		}
 		var scratch [binary.MaxVarintLen64]byte
 		uv := func(v uint64) error {
 			n := binary.PutUvarint(scratch[:], v)
-			return mw(scratch[:n])
+			return write(scratch[:n])
 		}
 
-		if err := mw(bitmapIndexMagic[:]); err != nil {
+		if err := write(bitmapIndexMagicV3[:]); err != nil {
 			return err
 		}
-		if err := uv(uint64(len(m.fields))); err != nil {
+
+		// Deterministic field/value order keeps output stable across saves.
+		fields := make([]string, 0, len(m.fields))
+		for f := range m.fields {
+			fields = append(fields, f)
+		}
+		slices.Sort(fields)
+
+		type loc struct{ off, length int64 }
+		dir := make(map[string][]string, len(fields)) // field -> sorted values
+		locs := make(map[string]map[string]loc, len(fields))
+
+		// Postings region: one CRC-prefixed blob per (field, value).
+		var blob []byte
+		for _, field := range fields {
+			bi := m.fields[field]
+			bi.mu.RLock()
+			values := make([]string, 0, len(bi.values))
+			for v := range bi.values {
+				values = append(values, v)
+			}
+			bi.mu.RUnlock()
+			slices.Sort(values)
+			dir[field] = values
+			locs[field] = make(map[string]loc, len(values))
+			for _, value := range values {
+				bi.mu.RLock()
+				vb := bi.values[value]
+				bi.mu.RUnlock()
+				ids := vb.sortedShared()
+				blob = appendPosting(blob[:0], ids)
+				var bc [4]byte
+				binary.LittleEndian.PutUint32(bc[:], crc32.ChecksumIEEE(blob))
+				blobOff := off
+				if err := write(bc[:]); err != nil {
+					return err
+				}
+				if err := write(blob); err != nil {
+					return err
+				}
+				locs[field][value] = loc{off: blobOff, length: int64(4 + len(blob))}
+			}
+		}
+
+		// Directory region.
+		dirOff := off
+		if err := uv(uint64(len(fields))); err != nil {
 			return err
 		}
-		for field, bi := range m.fields {
+		for _, field := range fields {
 			if err := uv(uint64(len(field))); err != nil {
 				return err
 			}
-			if err := mw([]byte(field)); err != nil {
+			if err := write([]byte(field)); err != nil {
 				return err
 			}
-			bi.mu.RLock()
-			values := bi.values
-			bi.mu.RUnlock()
+			values := dir[field]
 			if err := uv(uint64(len(values))); err != nil {
 				return err
 			}
-			for value, vb := range values {
-				ids := vb.sortedShared()
+			for _, value := range values {
+				l := locs[field][value]
 				if err := uv(uint64(len(value))); err != nil {
 					return err
 				}
-				if err := mw([]byte(value)); err != nil {
+				if err := write([]byte(value)); err != nil {
 					return err
 				}
-				if err := uv(uint64(len(ids))); err != nil {
+				if err := uv(uint64(l.off)); err != nil {
 					return err
 				}
-				var prev uint64
-				for _, id := range ids {
-					if err := uv(id - prev); err != nil {
-						return err
-					}
-					prev = id
+				if err := uv(uint64(l.length)); err != nil {
+					return err
 				}
 			}
 		}
-		var sum [4]byte
-		binary.LittleEndian.PutUint32(sum[:], crc.Sum32())
-		if _, err := w.Write(sum[:]); err != nil {
+
+		// Footer (not covered by fileCRC): dirOffset + CRC over magic..dirEnd.
+		var footer [12]byte
+		binary.LittleEndian.PutUint64(footer[:8], uint64(dirOff))
+		binary.LittleEndian.PutUint32(footer[8:], crc.Sum32())
+		if _, err := w.Write(footer[:]); err != nil {
 			return err
 		}
 		return w.Flush()
@@ -450,6 +542,9 @@ func LoadMultiFieldIndex(path string) (*MultiFieldIndex, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("bitmap: read %s: %w", path, err)
+	}
+	if len(data) >= 4 && bytes.Equal(data[:4], bitmapIndexMagicV3[:]) {
+		return loadMultiFieldIndexV3(data)
 	}
 	if len(data) < 8 || !bytes.Equal(data[:4], bitmapIndexMagic[:]) {
 		return nil, errors.New("bitmap: bad magic (old or corrupt .bidx)")

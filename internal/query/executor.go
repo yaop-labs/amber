@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -111,7 +112,7 @@ type Executor struct {
 	spanRibbons   map[string]*index.RibbonFilter
 
 	logBitmapCache   *indexLRU[*index.MultiFieldIndex]
-	spanBitmapCache  *indexLRU[*index.MultiFieldIndex]
+	spanBitmapCache  *indexLRU[index.SpanBitmap]
 	ftsCache         *indexLRU[*index.FTSIndex]
 	logPostingCache  *indexLRU[*index.PostingList]
 	spanPostingCache *indexLRU[*index.PostingList]
@@ -430,7 +431,7 @@ func NewExecutorWithCache(
 		logFTSRibbons:    make(map[string]*index.RibbonFilter),
 		spanRibbons:      make(map[string]*index.RibbonFilter),
 		logBitmapCache:   newIndexLRU[*index.MultiFieldIndex](cacheSize),
-		spanBitmapCache:  newIndexLRU[*index.MultiFieldIndex](cacheSize),
+		spanBitmapCache:  newIndexLRU[index.SpanBitmap](cacheSize),
 		ftsCache:         newIndexLRU[*index.FTSIndex](cacheSize),
 		logPostingCache:  newIndexLRU[*index.PostingList](cacheSize),
 		spanPostingCache: newIndexLRU[*index.PostingList](cacheSize),
@@ -600,7 +601,7 @@ func (e *Executor) logBitmap(name string) (*index.MultiFieldIndex, bool) {
 	return idx, true
 }
 
-func (e *Executor) spanBitmap(name string) (*index.MultiFieldIndex, bool) {
+func (e *Executor) spanBitmap(name string) (index.SpanBitmap, bool) {
 	if idx, ok := e.active.LookupSpan(name); ok {
 		return idx, true
 	}
@@ -610,7 +611,17 @@ func (e *Executor) spanBitmap(name string) (*index.MultiFieldIndex, bool) {
 	if e.spanDir == "" {
 		return nil, false
 	}
-	idx, err := index.LoadMultiFieldIndex(filepath.Join(e.spanDir, name+".bidx"))
+	path := filepath.Join(e.spanDir, name+".bidx")
+	// Sealed BID3 indexes open lazily (directory only); a query then preads
+	// just the postings it needs instead of decoding the whole .bidx. Legacy
+	// BID2 files fall back to a full resident load.
+	if idx, err := index.OpenSeekableBitmapIndex(path); err == nil {
+		e.spanBitmapCache.put(name, idx)
+		return idx, true
+	} else if !errors.Is(err, index.ErrBitmapNotSeekable) {
+		return nil, false
+	}
+	idx, err := index.LoadMultiFieldIndex(path)
 	if err != nil {
 		return nil, false
 	}
