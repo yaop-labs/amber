@@ -146,3 +146,68 @@ func TestDownscaleExactNesting(t *testing.T) {
 		}
 	}
 }
+
+// TestFoldExpMatchesMergeAll verifies the merge-as-you-go accumulator (foldExp,
+// the engine behind MatchedExp.Add) is bucket-identical to a batched MergeAll
+// over the same mixed-scale sketches, regardless of arrival order.
+func TestFoldExpMatchesMergeAll(t *testing.T) {
+	rng := rand.New(rand.NewSource(2024))
+	bucketsEqual := func(a, b Buckets) bool {
+		get := func(s Buckets, idx int32) uint64 {
+			p := int(idx - s.Offset)
+			if p < 0 || p >= len(s.Counts) {
+				return 0
+			}
+			return s.Counts[p]
+		}
+		lo, hi := a.Offset, a.Offset+int32(len(a.Counts))
+		if b.Offset < lo {
+			lo = b.Offset
+		}
+		if e := b.Offset + int32(len(b.Counts)); e > hi {
+			hi = e
+		}
+		for idx := lo; idx < hi; idx++ {
+			if get(a, idx) != get(b, idx) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for iter := 0; iter < 500; iter++ {
+		n := 1 + rng.Intn(12)
+		hists := make([]*ExponentialHistogram, 0, n)
+		for j := 0; j < n; j++ {
+			scale := int32(rng.Intn(8)) // mixed scales force downscaling
+			vals := make([]float64, 1+rng.Intn(200))
+			for k := range vals {
+				vals[k] = math.Exp(rng.NormFloat64()*1.5 + 1)
+			}
+			hists = append(hists, FromValues(scale, vals))
+		}
+
+		want := MergeAll(hists)
+		var got *ExponentialHistogram
+		for _, h := range hists {
+			got = foldExp(got, h) // progressive, in-place
+		}
+
+		if got == nil || want == nil {
+			t.Fatalf("iter %d: nil result (got=%v want=%v)", iter, got, want)
+		}
+		if got.Scale != want.Scale || got.Count != want.Count || got.ZeroCount != want.ZeroCount {
+			t.Fatalf("iter %d: scale/count mismatch got{%d,%d,%d} want{%d,%d,%d}",
+				iter, got.Scale, got.Count, got.ZeroCount, want.Scale, want.Count, want.ZeroCount)
+		}
+		if math.Abs(got.Sum-want.Sum) > 1e-6*math.Abs(want.Sum) {
+			t.Fatalf("iter %d: sum %v != %v", iter, got.Sum, want.Sum)
+		}
+		if got.Min != want.Min || got.Max != want.Max || got.HasMinMax != want.HasMinMax {
+			t.Fatalf("iter %d: minmax mismatch", iter)
+		}
+		if !bucketsEqual(got.Positive, want.Positive) || !bucketsEqual(got.Negative, want.Negative) {
+			t.Fatalf("iter %d: buckets differ between fold and MergeAll", iter)
+		}
+	}
+}
