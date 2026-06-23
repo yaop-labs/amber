@@ -156,6 +156,7 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 			bitmap.Add("operation", span.Operation, entryID)
 		}
 		bitmap.Add("status", span.Status.String(), entryID)
+		bitmap.Add(DurationBucketField, DurationBucket(span.Duration()), entryID)
 
 		if !model.IsZeroTraceID(span.TraceID) {
 			k := make([]byte, 16)
@@ -528,6 +529,7 @@ func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldInde
 			idx.Add("operation", span.Operation, entryID)
 		}
 		idx.Add("status", span.Status.String(), entryID)
+		idx.Add(DurationBucketField, DurationBucket(span.Duration()), entryID)
 
 		// trace_id excluded for same reason as log bitmap: high cardinality
 		// dominates index size. Ribbon filter handles segment pruning.

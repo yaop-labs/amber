@@ -1255,9 +1255,27 @@ func (e *Executor) execSpanSegment(
 	// the matching candidates so the scan decodes only those, not every span.
 	// The scan still applies these filters exactly (plus time/duration/cursor),
 	// so a missing or coarse bitmap only loses pruning, never correctness.
-	if conditions := buildSpanBitmapConditions(q); len(conditions) > 0 {
-		if bm, ok := e.spanBitmap(seg.FileName); ok {
+	// Service/operation/status are bitmap-indexed in the span .bidx, and duration
+	// is indexed into log2 buckets; intersect the matching candidates so the scan
+	// decodes only those. Constrain only by fields the bitmap actually holds — a
+	// field missing from an older .bidx falls through to the scan's exact filter
+	// (correctness), losing only the pruning — and the scan re-applies every
+	// predicate exactly, so coarse buckets never leak a wrong result.
+	if bm, ok := e.spanBitmap(seg.FileName); ok {
+		conditions := buildSpanBitmapConditions(q)
+		for field := range conditions {
+			if !bm.HasField(field) {
+				delete(conditions, field)
+			}
+		}
+		if len(conditions) > 0 {
 			if !restrict(bm.FilterMulti(conditions)) {
+				return 0, nil
+			}
+		}
+		if (q.MinDuration > 0 || q.MaxDuration > 0) && bm.HasField(index.DurationBucketField) {
+			labels := index.DurationBucketLabels(q.MinDuration, q.MaxDuration)
+			if !restrict(bm.FilterAny(index.DurationBucketField, labels)) {
 				return 0, nil
 			}
 		}
