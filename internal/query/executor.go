@@ -113,6 +113,7 @@ type Executor struct {
 
 	logBitmapCache   *indexLRU[*index.MultiFieldIndex]
 	spanBitmapCache  *indexLRU[index.SpanBitmap]
+	spanCoverCache   *indexLRU[*index.CoverIndex]
 	ftsCache         *indexLRU[*index.FTSIndex]
 	logPostingCache  *indexLRU[*index.PostingList]
 	spanPostingCache *indexLRU[*index.PostingList]
@@ -432,6 +433,7 @@ func NewExecutorWithCache(
 		spanRibbons:      make(map[string]*index.RibbonFilter),
 		logBitmapCache:   newIndexLRU[*index.MultiFieldIndex](cacheSize),
 		spanBitmapCache:  newIndexLRU[index.SpanBitmap](cacheSize),
+		spanCoverCache:   newIndexLRU[*index.CoverIndex](cacheSize),
 		ftsCache:         newIndexLRU[*index.FTSIndex](cacheSize),
 		logPostingCache:  newIndexLRU[*index.PostingList](cacheSize),
 		spanPostingCache: newIndexLRU[*index.PostingList](cacheSize),
@@ -487,6 +489,7 @@ func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
 		e.spanReaders.invalidate(e.spanManager.SegmentPath(seg))
 	}
 	e.spanBitmapCache.delete(seg.FileName)
+	e.spanCoverCache.delete(seg.FileName)
 	e.sealedMu.Lock()
 	delete(e.spanRibbons, seg.FileName)
 	e.sealedMu.Unlock()
