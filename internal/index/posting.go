@@ -1,6 +1,7 @@
 package index
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -171,7 +172,10 @@ func LoadPostingList(path string) (*PostingList, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return readPostingList(f)
+	// Buffer the file: readPostingList does many small io.ReadFull calls (key,
+	// count, and each id separately), so an unbuffered *os.File turns one .pidx
+	// load into ~100k read syscalls — the dominant cost of a trace-id lookup.
+	return readPostingList(bufio.NewReaderSize(f, 1<<20))
 }
 
 func readPostingList(r io.Reader) (*PostingList, error) {
