@@ -240,7 +240,7 @@ func (b *CoverBuilder) Save(path string) error {
 // encodeServiceBlob builds [crc32][zstd(SoA streams)] for one service's rows
 // (already id-sorted). The id stream is omitted - it comes from the BID3 posting.
 func encodeServiceBlob(rows []coverRow) []byte {
-	var body []byte
+	body := make([]byte, 0, len(rows)*8)
 	body = binary.AppendUvarint(body, uint64(len(rows)))
 
 	var traceS, startS, durS, opS []byte
