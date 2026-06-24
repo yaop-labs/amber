@@ -375,19 +375,19 @@ competitors are the prior comparable run. Query p50 (ms):
 
 | Scenario | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
-| QT1 — trace-ID lookup | 114 | 94 | **18** |
-| QT2 — service + operation search | **9** | 108 | 26 |
-| QT3 — service + duration search | **11** | 67 | 40 |
+| QT1 — trace-ID lookup | **4** | 94 | 18 |
+| QT2 — service + operation search | **8** | 108 | 26 |
+| QT3 — service + duration search | **10** | 67 | 40 |
 
 | Resource | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
 | RSS peak (MB) | **517** | 2249 | 1537 |
 | Storage (MB) | 2278 | 5166 | **1639** |
 
-**amber now wins the scan-search scenarios outright — on a row store.** QT2 and
-QT3 went 3.7 s / 2.4 s → **9 ms / 11 ms** (~400×), *below* VictoriaTraces' columnar
+**amber now wins all three trace queries outright — on a row store.** QT2 and
+QT3 went 3.7 s / 2.4 s → **8 ms / 10 ms** (~400×), *below* VictoriaTraces' columnar
 engine, while RSS *fell* to 517 MB (lightest of the three by far). The path there
-was three profile-driven steps, each measured and kept only if it moved the
+was four profile-driven steps, each measured and kept only if it moved the
 needle:
 
 1. **Seekable `.bidx` (BID3)** — span queries `pread` only the postings they need
@@ -405,12 +405,16 @@ needle:
    recent segment or two, so a query reads ~2 of ~10 candidate segments with no
    top-k heap and no span materialization. 459 → 9 ms.
 
+4. **Buffered posting reads** — the trace-id lookup (QT1) loaded a segment's
+   posting list (`.pidx`) by issuing one `io.ReadFull` per key, count, and id —
+   ~100k read syscalls per lookup against an unbuffered file. A `bufio` reader
+   collapsed that to one buffered read: QT1 96 → **4 ms**. A counter (the lookup
+   loads exactly *one* posting after the ribbon filter prunes 360 segments to 1)
+   caught this before a needless seekable-`.pidx` redesign.
+
 The thesis in one number: a non-columnar store, properly indexed, beats the
-columnar engine on this query. **Point lookup (QT1, 114 ms)** is unchanged code
-and is the standing weak spot — it is bound by loading the trace-id posting list
-(`.pidx`) from disk, the same re-parse pattern BID3 fixed for `.bidx`; a seekable
-`.pidx` is the next lever. (amber-only re-run; a 3-system head-to-head campaign
-would confirm the below-VictoriaTraces result rigorously.)
+columnar engine on every trace query. (amber-only re-run; a 3-system head-to-head
+campaign would confirm the below-VictoriaTraces result rigorously.)
 
 <details>
 <summary>Methodology and notes</summary>
