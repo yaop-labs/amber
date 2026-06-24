@@ -304,8 +304,10 @@ amber runs with an 800 MB soft memory limit (`runtime.memory_limit`). All
 latencies are HTTP end-to-end, client-measured. Numbers are medians across runs.
 
 These are honest, current results — amber is a deliberately experimental engine
-(sorted-slice bitmaps, no roaring/columnar): it wins logs outright, and on
-metrics/traces it trades raw scan/aggregate speed for low memory and a compact,
+(sorted-slice bitmaps, no roaring/columnar): it wins logs outright, and a
+covering index now wins the trace scan-search scenarios *below* the columnar
+competitor while staying the lightest on memory. On metrics it still trades raw
+aggregate speed (the histogram-quantile shape) for low memory and a compact,
 unified store. Where a columnar competitor wins, the table says so.
 
 ### Logs — 5M records, 3 runs × 3 systems
@@ -368,32 +370,47 @@ the columnar scan/aggregate shape (qm3) and on storage.
 
 Tempo 2.10.1 · VictoriaTraces v0.9.2. Query p50 (ms):
 
-amber is an amber-only re-run after adding span tag/duration indexes (2026-06-23);
+amber is an amber-only re-run on the covering-index engine (2026-06-24);
 competitors are the prior comparable run. Query p50 (ms):
 
 | Scenario | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
-| QT1 — trace-ID lookup | 99 | 94 | **18** |
-| QT2 — service + operation search | 3720 | 108 | **26** |
-| QT3 — service + duration search | 2398 | 67 | **40** |
+| QT1 — trace-ID lookup | 114 | 94 | **18** |
+| QT2 — service + operation search | **9** | 108 | 26 |
+| QT3 — service + duration search | **11** | 67 | 40 |
 
 | Resource | amber | Tempo | VictoriaTraces |
 |----------|------:|------:|---------------:|
-| RSS peak (MB) | **780** | 2249 | 1537 |
-| Storage (MB) | 2113 | 5166 | **1639** |
+| RSS peak (MB) | **517** | 2249 | 1537 |
+| Storage (MB) | 2278 | 5166 | **1639** |
 
-**amber wins RSS decisively** (≈2.9× lighter than Tempo) and is second on storage.
-The scan-search scenarios improved with the new span bitmaps (service/operation/
-status + log2 duration buckets, replacing a blind full-scan): QT2 7.6 → 3.7 s,
-QT3 6.1 → 2.4 s (~2–2.5×). They still trail VictoriaTraces' columnar engine by a
-wide margin, and the bench exposed why: with one service per trace the service
-posting is a large fraction of all spans, and the bitmap intersect is a full
-merge over it — so a low-selectivity predicate still pays an O(set) cost
-regardless of how few spans finally match. Closing the rest needs a
-selectivity-aware intersect (galloping/binary-search for skewed sets, or skipping
-a field whose set is most of the segment), not more index fields. An honest
-partial win: indexing took scan-search from *embarrassing* to *2–2.5× better*,
-and named the next bottleneck precisely. Point lookup (QT1) is on par with Tempo.
+**amber now wins the scan-search scenarios outright — on a row store.** QT2 and
+QT3 went 3.7 s / 2.4 s → **9 ms / 11 ms** (~400×), *below* VictoriaTraces' columnar
+engine, while RSS *fell* to 517 MB (lightest of the three by far). The path there
+was three profile-driven steps, each measured and kept only if it moved the
+needle:
+
+1. **Seekable `.bidx` (BID3)** — span queries `pread` only the postings they need
+   instead of re-parsing the whole bitmap per query (a 32-slot cache vs 361
+   segments was re-reading 583 MB/query). QT2 3.7 → 2.4 s.
+2. **Covering `.cidx` index** — each service posting carries a column-strided
+   projection of its spans' summary fields (trace-ordinal + start + duration +
+   status + operation + is-root, a per-segment trace-id dictionary taming the
+   16-byte id to ~0.5 B/span). Trace-summary search answers from this projection
+   with **zero block decompression**. The full spans stay in the row store; this
+   is a covering index, not a columnar layout. +165 MB on disk.
+3. **Per-trace early termination** — fold covering rows straight into per-trace
+   rollups newest-first and stop after the requested page plus one segment.
+   Because a trace's spans are time-local, the newest traces live in the most
+   recent segment or two, so a query reads ~2 of ~10 candidate segments with no
+   top-k heap and no span materialization. 459 → 9 ms.
+
+The thesis in one number: a non-columnar store, properly indexed, beats the
+columnar engine on this query. **Point lookup (QT1, 114 ms)** is unchanged code
+and is the standing weak spot — it is bound by loading the trace-id posting list
+(`.pidx`) from disk, the same re-parse pattern BID3 fixed for `.bidx`; a seekable
+`.pidx` is the next lever. (amber-only re-run; a 3-system head-to-head campaign
+would confirm the below-VictoriaTraces result rigorously.)
 
 <details>
 <summary>Methodology and notes</summary>
