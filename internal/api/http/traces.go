@@ -4,11 +4,9 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 	"time"
 
-	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/query"
 )
 
@@ -94,26 +92,33 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Covering .cidx projections answer service-filtered summaries without
-	// decompressing row blocks; segments without one fall back to the scan
-	// inside SpanSummaryFetch. The summary grouping (buildTraceSummaries) is
-	// shared, so output is identical to the scan path.
-	spans, truncated, err := h.exec.SpanSummaryFetch(r.Context(), &sq, traceSummaryMaxSpans)
+	// decompressing row blocks: SpanTraceSummaries folds covering rows straight
+	// into per-trace rollups newest-first and stops once it has the requested
+	// page, falling back to the row scan for segments without a .cidx.
+	rollups, total, truncated, err := h.exec.SpanTraceSummaries(r.Context(), &sq, offset+limit, traceSummaryMaxSpans)
 	if err != nil {
 		h.log.Error("traces list query failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "query failed")
 		return
 	}
-	summaries := buildTraceSummaries(spans)
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].StartTime.After(summaries[j].StartTime)
-	})
-	total := len(summaries)
-	if offset >= total {
-		summaries = nil
-	} else {
-		summaries = summaries[offset:]
-		if len(summaries) > limit {
-			summaries = summaries[:limit]
+
+	var summaries []traceSummary
+	if offset < len(rollups) {
+		page := rollups[offset:]
+		if len(page) > limit {
+			page = page[:limit]
+		}
+		summaries = make([]traceSummary, len(page))
+		for i, s := range page {
+			summaries[i] = traceSummary{
+				TraceID:    hex.EncodeToString(s.TraceID[:]),
+				Service:    s.Service,
+				Operation:  s.Operation,
+				StartTime:  s.Start,
+				DurationMs: s.End.Sub(s.Start).Milliseconds(),
+				SpanCount:  s.SpanCount,
+				HasErrors:  s.HasErrors,
+			}
 		}
 	}
 
@@ -122,58 +127,4 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"total":     total,
 		"truncated": truncated,
 	})
-}
-
-func buildTraceSummaries(spans []model.SpanEntry) []traceSummary {
-	type traceGroup struct {
-		root      *model.SpanEntry
-		start     time.Time
-		end       time.Time
-		spanCount int
-		hasErrors bool
-	}
-
-	groups := make(map[model.TraceID]*traceGroup)
-
-	for i := range spans {
-		sp := &spans[i]
-		g, ok := groups[sp.TraceID]
-		if !ok {
-			g = &traceGroup{start: sp.StartTime, end: sp.EndTime}
-			groups[sp.TraceID] = g
-		}
-		g.spanCount++
-		if sp.StartTime.Before(g.start) {
-			g.start = sp.StartTime
-		}
-		if sp.EndTime.After(g.end) {
-			g.end = sp.EndTime
-		}
-		if sp.Status == model.SpanStatusError {
-			g.hasErrors = true
-		}
-		if sp.IsRoot() || g.root == nil {
-			g.root = sp
-		}
-	}
-
-	summaries := make([]traceSummary, 0, len(groups))
-	for traceID, g := range groups {
-		service := ""
-		operation := ""
-		if g.root != nil {
-			service = g.root.Service
-			operation = g.root.Operation
-		}
-		summaries = append(summaries, traceSummary{
-			TraceID:    hex.EncodeToString(traceID[:]),
-			Service:    service,
-			Operation:  operation,
-			StartTime:  g.start,
-			DurationMs: g.end.Sub(g.start).Milliseconds(),
-			SpanCount:  g.spanCount,
-			HasErrors:  g.hasErrors,
-		})
-	}
-	return summaries
 }
