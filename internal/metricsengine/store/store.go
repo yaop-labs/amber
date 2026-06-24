@@ -1185,10 +1185,7 @@ func (s *Store) rateByLabelResident(paths []string, selector index.Selector, opt
 		func() map[string]float64 { return make(map[string]float64) },
 		func() func(map[string]float64, *groupedRateSeries) error {
 			return func(acc map[string]float64, gr *groupedRateSeries) error {
-				rate, ok, err := rateFromGroupedSamples(gr.samples, opts)
-				if err != nil {
-					return err
-				}
+				rate, ok := rateFromGroupedSamples(gr.samples, opts)
 				if ok {
 					acc[gr.groupKey] += rate
 				}
@@ -1208,10 +1205,7 @@ func (s *Store) rateByLabelResident(paths []string, selector index.Selector, opt
 	}
 	out = make(map[string]float64)
 	for _, gr := range grouped {
-		rate, ok, err := rateFromGroupedSamples(gr.samples, opts)
-		if err != nil {
-			return nil, err
-		}
+		rate, ok := rateFromGroupedSamples(gr.samples, opts)
 		if ok {
 			out[gr.groupKey] += rate
 		}
@@ -1225,14 +1219,14 @@ func (s *Store) rateByLabelResident(paths []string, selector index.Selector, opt
 // in the scan and MaxSampleGap routes to the exact path, so the rate is summed
 // directly over the samples (positive deltas only, matching RateSummary) without
 // materialising the timestamp/value slices RateSummaryForSamples would need.
-func rateFromGroupedSamples(rawSamples []rateSample, _ query.Options) (float64, bool, error) {
+func rateFromGroupedSamples(rawSamples []rateSample, _ query.Options) (float64, bool) {
 	samples := compactExactRateSamples(rawSamples)
 	if len(samples) < 2 {
-		return 0, false, nil
+		return 0, false
 	}
 	dtMillis := samples[len(samples)-1].timestamp - samples[0].timestamp
 	if dtMillis <= 0 {
-		return 0, false, nil
+		return 0, false
 	}
 	var increase int64
 	for i := 1; i < len(samples); i++ {
@@ -1240,7 +1234,7 @@ func rateFromGroupedSamples(rawSamples []rateSample, _ query.Options) (float64, 
 			increase += delta
 		}
 	}
-	return float64(increase) / (float64(dtMillis) / 1000.0), true, nil
+	return float64(increase) / (float64(dtMillis) / 1000.0), true
 }
 
 func mergeFloatMap(dst, src map[string]float64) {

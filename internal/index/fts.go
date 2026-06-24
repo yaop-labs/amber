@@ -227,7 +227,7 @@ func (f *FTSIndex) seal() {
 	// Ordinal table: every distinct entry ID that appears in the index, sorted.
 	// A token's records are then stored as ordinals (positions in this table)
 	// rather than full 8-byte IDs.
-	var allIDs []uint64
+	allIDs := make([]uint64, 0, len(dict)+len(uniqs))
 	for _, i := range dict {
 		allIDs = append(allIDs, f.entries[i].rest...)
 	}
