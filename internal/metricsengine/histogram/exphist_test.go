@@ -109,7 +109,7 @@ func TestQuantileAccuracyVsRaw(t *testing.T) {
 }
 
 // TestDownscaleExactNesting verifies that down-scaling a fine sketch produces the
-// exact same buckets as binning the same data directly at the coarse scale —
+// exact same buckets as binning the same data directly at the coarse scale -
 // because coarse boundaries are a strict subset of fine boundaries.
 func TestDownscaleExactNesting(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))

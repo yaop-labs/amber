@@ -20,12 +20,12 @@ import (
 // pin which one it measures:
 //
 //   - setupBenchQueryBatched writes directly via WriteBatch, rotates, and
-//     builds bitmap indexes over the sealed segments — the indexed sealed-read
+//     builds bitmap indexes over the sealed segments - the indexed sealed-read
 //     path used by the 100k/1M scenarios.
 //   - setupBenchQuery feeds the same data through the ingest handler before
 //     rotating; otherwise identical (sealed + bitmap), at the 1k smoke scale.
 //   - setupBenchQueryActive only Flushes (no Rotate, no bitmap), leaving data
-//     in the active segment — the post-filter scan path with no index.
+//     in the active segment - the post-filter scan path with no index.
 
 func setupBenchQueryBatched(b *testing.B, n int) (*query.Executor, *index.SparseIndex, *storage.SegmentManager, func()) {
 	b.Helper()

@@ -15,8 +15,8 @@ import (
 )
 
 // TestBuildSpanSealIndexesCoverParity writes spans into a real segment, seals
-// it, and checks the .cidx projection matches the input spans field-for-field —
-// validating the seal wiring end to end (WriteTo→segment→ReadFrom→.cidx).
+// it, and checks the .cidx projection matches the input spans field-for-field -
+// validating the seal wiring end to end (WriteTo->segment->ReadFrom->.cidx).
 func TestBuildSpanSealIndexesCoverParity(t *testing.T) {
 	dir := t.TempDir()
 	segPath := filepath.Join(dir, "seg_00000001.alog")

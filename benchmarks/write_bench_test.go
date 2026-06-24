@@ -1,6 +1,6 @@
 // Package benchmarks holds in-process Go microbenchmarks for amber's hot paths
-// — ingest handler, batcher, segment/WAL writers, query executor, FTS index,
-// bitmap filter — driven directly against the internal packages. They isolate
+// - ingest handler, batcher, segment/WAL writers, query executor, FTS index,
+// bitmap filter - driven directly against the internal packages. They isolate
 // one component at a time (throughput and allocations per op) and exist to
 // catch regressions in `go test -bench`; they are deliberately separate from
 // the obsbench harness (benchmarks/obsbench), which measures amber end to end

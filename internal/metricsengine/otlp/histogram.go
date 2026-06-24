@@ -100,8 +100,8 @@ type SummaryQuantile struct {
 	Value    float64
 }
 
-// SummarySamples lowers a set of Summary points into plain gauge samples — one
-// per quantile — reusing the existing gauge codec via Samples. There is no
+// SummarySamples lowers a set of Summary points into plain gauge samples - one
+// per quantile - reusing the existing gauge codec via Samples. There is no
 // histogram-specific storage for summaries.
 func SummarySamples(batch Batch, points []SummaryPoint) ([]model.Sample, error) {
 	gaugePoints := make([]Point, 0, len(points))

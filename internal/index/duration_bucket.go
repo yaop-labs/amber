@@ -10,7 +10,7 @@ import (
 // duration range without a per-value bitmap (duration is effectively continuous).
 // Bucket b covers nanosecond durations [2^b, 2^(b+1)); a query unions the buckets
 // overlapping its [min,max] window, then the scan applies the exact duration
-// filter — the same "coarse index + exact recheck" amber uses for zone maps.
+// filter - the same "coarse index + exact recheck" amber uses for zone maps.
 
 func durationBucketIndex(d time.Duration) int {
 	ns := int64(d)
@@ -30,7 +30,7 @@ func DurationBucket(d time.Duration) string {
 const DurationBucketField = "dur_bucket"
 
 // DurationBucketLabels returns every bucket label overlapping [min, max] (a zero
-// bound is open: min=0 ⇒ from the smallest bucket, max=0 ⇒ to the largest). The
+// bound is open: min=0 => from the smallest bucket, max=0 => to the largest). The
 // boundary buckets also hold spans just outside the window, which the scan's
 // exact duration filter removes.
 func DurationBucketLabels(min, max time.Duration) []string {

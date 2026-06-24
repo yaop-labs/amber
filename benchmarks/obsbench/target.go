@@ -21,7 +21,7 @@ import (
 // TargetConfig describes one system under test. Protocol selects the payload
 // builder: "otlp" is the shared protobuf encoding every system accepts (the
 // same-client fairness baseline); "native" is the system's own bulk API
-// (documented per system, METHODOLOGY.md §5).
+// (documented per system, METHODOLOGY.md).
 type TargetConfig struct {
 	// Kind: amber | loki | victorialogs (logs) | mimir | victoriametrics |
 	// prometheus (metrics; amber doubles as a metrics target).
@@ -72,7 +72,7 @@ func LoadConfig(path string) (Config, error) {
 
 // payloadBuilder renders one batch into an HTTP body. now is the send-time
 // timestamp applied to every record in the batch (the dataset carries no
-// event time by design — see Record).
+// event time by design - see Record).
 type payloadBuilder interface {
 	// Build returns (urlPath, contentType, body).
 	Build(batch []Record, now time.Time) (string, string, []byte, error)
@@ -129,7 +129,7 @@ func (amberBuilder) Build(batch []Record, _ time.Time) (string, string, []byte, 
 }
 
 // lokiBuilder posts /loki/api/v1/push with one stream per (service, level)
-// pair — the label-cardinality model Loki expects.
+// pair - the label-cardinality model Loki expects.
 type lokiBuilder struct{}
 
 func (lokiBuilder) Build(batch []Record, now time.Time) (string, string, []byte, error) {

@@ -306,7 +306,7 @@ func rateExecutionPath(stats CandidateStats) ExecutionPath {
 
 // SummaryStepCeiling bounds the streaming range-step summary path. That path
 // keeps one RateSummary per step per matching series, so its footprint grows
-// with steps × series; past this many steps the exact materialization path is
+// with steps x series; past this many steps the exact materialization path is
 // the cheaper of the two. 32 covers typical coarse dashboard grids (the
 // metrics campaign's QM2 uses ~20 steps over ~15 blocks) while rejecting fine
 // pixel-resolution grids whose summary map would dwarf the sample set it

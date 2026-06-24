@@ -10,16 +10,16 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-// TestRegistryConcurrentSweepAndQuery exercises the §4 v0 invariant: under
+// TestRegistryConcurrentSweepAndQuery exercises the v0 invariant: under
 // concurrent ingest + sweep + query, the RW-lock + monotonic-bucket scheme
 // must yield no panics, no torn reads, and a series evicted by the sweep
 // must be gone from a subsequent Match.
 //
 // Run with `-race` for the tearing/panic part (the test exits cleanly if
 // the race detector finds anything). The Match-after-eviction check
-// requires no race detector — it's a functional assertion.
+// requires no race detector - it's a functional assertion.
 //
-// What this test does NOT cover (deferred per spec §4):
+// What this test does NOT cover (deferred per spec):
 //   - The grace-period for in-flight queries spanning the sweep. The v0
 //     invariant is that readers RLock for the duration of Match, so a
 //     sweep cannot interleave. That's exercised here implicitly: any

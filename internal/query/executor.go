@@ -144,7 +144,7 @@ type queryCacheEntry struct {
 	expires int64
 	// from/to is the query's time window (unixnano), used to invalidate only
 	// entries an ingest batch can affect. Records carry event time, so a
-	// batch may land anywhere — overlap with the batch's [min,max] timestamp
+	// batch may land anywhere - overlap with the batch's [min,max] timestamp
 	// range is the correctness condition, not "touches the active segment".
 	from int64
 	to   int64
@@ -1018,7 +1018,7 @@ func (e *Executor) execLogSegment(
 			return false
 		}
 		// Once the heap holds k entries, a block whose newest record is
-		// older than the oldest kept entry cannot improve the result — the
+		// older than the oldest kept entry cannot improve the result - the
 		// intra-segment mirror of the per-segment MaxTS skip. Entry IDs are
 		// ULID-derived (bits 63..32 = low 32 bits of the ms timestamp), so
 		// the comparison runs in that truncated space with a wrap guard;
@@ -1271,9 +1271,9 @@ func (e *Executor) execSpanSegment(
 	// so a missing or coarse bitmap only loses pruning, never correctness.
 	// Service/operation/status are bitmap-indexed in the span .bidx, and duration
 	// is indexed into log2 buckets; intersect the matching candidates so the scan
-	// decodes only those. Constrain only by fields the bitmap actually holds — a
+	// decodes only those. Constrain only by fields the bitmap actually holds - a
 	// field missing from an older .bidx falls through to the scan's exact filter
-	// (correctness), losing only the pruning — and the scan re-applies every
+	// (correctness), losing only the pruning - and the scan re-applies every
 	// predicate exactly, so coarse buckets never leak a wrong result.
 	if bm, ok := e.spanBitmap(seg.FileName); ok {
 		conditions := buildSpanBitmapConditions(q)

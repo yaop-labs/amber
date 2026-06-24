@@ -60,7 +60,7 @@ type WAL struct {
 
 	// failed fail-stops the writer. After a failed fsync the kernel may have
 	// dropped the dirty pages without retrying (PostgreSQL's "fsyncgate"), and
-	// after a partial buffered write the tail is torn — replay stops there, so
+	// after a partial buffered write the tail is torn - replay stops there, so
 	// records appended past it would be silently lost. Either way the durable
 	// state is unknowable; no further append may be acknowledged. Guarded by mu.
 	failed error
@@ -154,7 +154,7 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 // WriteBatchTS appends (ts, data) records under a single fsync without
 // allocating per-record (ts||data) payloads. CRC is computed incrementally
 // over the two parts. On-disk format is identical to WriteBatch with a
-// payload of (8-byte LE ts || data) — replay code is unchanged.
+// payload of (8-byte LE ts || data) - replay code is unchanged.
 //
 // Hot path for SegmentManager.WriteBatch: the old path allocated a
 // []byte{8+len(data)} per record via makeWALPayload (~8% of processBatch
@@ -189,8 +189,8 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 		// Incremental CRC over length || seq || ts || data. Covering the
 		// header fields matters: an unprotected flipped bit in seq would
 		// make replay silently skip the record (seq <= synced watermark
-		// reads as "already in the segment") — undetected loss. crc32.Update
-		// with IEEETable is the same poly as crc32.ChecksumIEEE — bytes
+		// reads as "already in the segment") - undetected loss. crc32.Update
+		// with IEEETable is the same poly as crc32.ChecksumIEEE - bytes
 		// hashed in order produce the same digest as one-shot over the
 		// concat.
 		crc := crc32.Update(0, crc32.IEEETable, header[8:20])

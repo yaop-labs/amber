@@ -40,7 +40,7 @@ func TestDurationBucketLabelsCoverDuration(t *testing.T) {
 		labels := DurationBucketLabels(c.min, c.max)
 		got := slices.Contains(labels, DurationBucket(c.d))
 		// For boundary buckets the span may share a bucket with min/max even when
-		// just outside the window — so a true membership is only *required* when
+		// just outside the window - so a true membership is only *required* when
 		// the duration is comfortably inside. We assert the must-include cases and
 		// allow the coarse boundary to over-include.
 		if c.want && !got {

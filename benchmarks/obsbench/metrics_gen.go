@@ -5,12 +5,12 @@ import (
 	"math"
 )
 
-// Metrics workload generator behind METHODOLOGY.md §5 (Metrics): I1 steady
+// Metrics workload generator behind METHODOLOGY.md (Metrics): I1 steady
 // gauges+counters, I2 series churn, I3 exponential histograms. Unlike the log
 // dataset there is no pre-generated file: a metrics workload is a *schedule*
 // (which series emit a sample at which tick), so the generator synthesizes
 // samples on the fly, fully determined by (config, tick index). Two runs with
-// the same config produce identical series sets and identical values — the
+// the same config produce identical series sets and identical values - the
 // reproducibility contract that makes the cross-system equality gate
 // meaningful.
 //
@@ -172,7 +172,7 @@ func (g *MetricsGenerator) ScalarPoint(i, tick int) (string, SeriesLabels, int64
 }
 
 // HistPoint returns the cumulative exponential-histogram sample of hist
-// series i at the current tick state. Counts is a live view — encode before
+// series i at the current tick state. Counts is a live view - encode before
 // the next BeginTick.
 func (g *MetricsGenerator) HistPoint(i int) (SeriesLabels, ExpHistPoint) {
 	return g.labels(i), ExpHistPoint{
@@ -214,7 +214,7 @@ func (g *MetricsGenerator) labels(i int) SeriesLabels {
 	return l
 }
 
-// hash is a splitmix64-style mix over (seed, series, tick, salt) — the
+// hash is a splitmix64-style mix over (seed, series, tick, salt) - the
 // deterministic value source for everything non-cumulative.
 func (g *MetricsGenerator) hash(i, tick, salt uint64) uint64 {
 	x := g.cfg.Seed ^ i*0x9e3779b97f4a7c15 ^ tick<<24 ^ salt<<56

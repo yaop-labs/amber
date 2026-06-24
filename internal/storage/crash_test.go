@@ -62,12 +62,12 @@ func runCrashWriter(dir string) {
 		data := fmt.Appendf(nil, "crash-rec-%08d", i)
 		ts := base + int64(i)*int64(time.Microsecond)
 		if err := sm.Write(data, ts); err != nil {
-			// Write returns error only if WAL fsync failed — that record is
+			// Write returns error only if WAL fsync failed - that record is
 			// not durable. Stop here so the marker stays honest.
 			fmt.Fprintf(os.Stderr, "crash writer: write %d: %v\n", i, err)
 			return
 		}
-		// Write succeeded — record is in WAL and fsync'd. Update marker.
+		// Write succeeded - record is in WAL and fsync'd. Update marker.
 		writeMarker(dir, i)
 	}
 }
@@ -99,7 +99,7 @@ func readMarker(dir string) (int, error) {
 // TestSegmentManager_CrashDurability spawns itself as a crash writer subprocess,
 // SIGKILLs it after a short interval, then reopens the SegmentManager and
 // verifies that every record the subprocess confirmed durable (via markerFile)
-// is present exactly once — no loss, no duplicates.
+// is present exactly once - no loss, no duplicates.
 func TestSegmentManager_CrashDurability(t *testing.T) {
 	if testing.Short() {
 		t.Skip("crash durability test skipped in short mode")
@@ -125,7 +125,7 @@ func TestSegmentManager_CrashDurability(t *testing.T) {
 	// Give it time to write a meaningful number of records.
 	time.Sleep(300 * time.Millisecond)
 
-	// SIGKILL — no cleanup, no deferred Close.
+	// SIGKILL - no cleanup, no deferred Close.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill subprocess: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestSegmentManager_CrashDurability(t *testing.T) {
 
 // verifyCrashDurability recovers the killed writer's data dir and checks the
 // core invariant: every record the subprocess confirmed durable (markerFile)
-// is present exactly once — no loss, no duplicates.
+// is present exactly once - no loss, no duplicates.
 func verifyCrashDurability(t *testing.T, dir string) {
 	t.Helper()
 
@@ -172,7 +172,7 @@ func verifyCrashDurability(t *testing.T, dir string) {
 	for _, seg := range sm2.Segments() {
 		t.Logf("segment %s: records=%d sealed=%v", seg.FileName, seg.RecordCount, seg.Sealed)
 		if seg.RecordCount == 0 {
-			// Empty trailing segment created by Rotate() before Close() — no user data.
+			// Empty trailing segment created by Rotate() before Close() - no user data.
 			continue
 		}
 		path := filepath.Join(dir, seg.FileName)
@@ -229,8 +229,8 @@ func verifyCrashDurability(t *testing.T, dir string) {
 }
 
 // TestSegmentManager_CrashDurability_RotationStorm kills the writer while it
-// rotates every 100 records, so SIGKILL lands inside the seal protocol —
-// footer write, saveMeta, WAL truncate, createNewSegment — instead of the
+// rotates every 100 records, so SIGKILL lands inside the seal protocol -
+// footer write, saveMeta, WAL truncate, createNewSegment - instead of the
 // steady write loop. Several kills at randomized offsets sample different
 // points of that window; the invariant is the same: no loss, no duplicates.
 func TestSegmentManager_CrashDurability_RotationStorm(t *testing.T) {

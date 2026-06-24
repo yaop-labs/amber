@@ -12,7 +12,7 @@ import (
 // TestFTSOrdinalSearchRoundtrip is the AFT3 correctness gate: with sparse,
 // ULID-like entry IDs (so ordinals differ from IDs) and a mix of df>=2 (common
 // words) and df==1 (unique hex) tokens, Search must return exactly the records
-// containing each token — verified against a brute-force reference across all
+// containing each token - verified against a brute-force reference across all
 // three execution paths: in-memory (freshly sealed), post-Save (file-backed
 // unique section + ordinal table via pread, postings resident), and fully
 // loaded from disk.
@@ -48,7 +48,7 @@ func TestFTSOrdinalSearchRoundtrip(t *testing.T) {
 
 	// Pre-tokenize each body once; a query matches a doc iff the query's tokens
 	// are all present in the doc's tokens (exactly what Search does). Computing
-	// the expectation this way — over RAW queries — avoids re-stemming a stem
+	// the expectation this way - over RAW queries - avoids re-stemming a stem
 	// (the tokenizer is not idempotent for some tokens).
 	bodyTokens := make([]map[string]bool, len(docs))
 	for i, d := range docs {

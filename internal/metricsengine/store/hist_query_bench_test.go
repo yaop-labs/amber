@@ -16,7 +16,7 @@ import (
 
 // hist_query_bench_test.go reproduces the metrics-campaign qm3 quantile path at
 // scale: ~10k exp-histogram series over ~180 ticks sealed into ~30 blocks. The
-// campaign saw qm3-quantile p50 ~1.27s — slower than VM/prom/mimir and untouched
+// campaign saw qm3-quantile p50 ~1.27s - slower than VM/prom/mimir and untouched
 // by the scalar range-step work. The single-block histogram benches in the
 // histogram package don't exercise the multi-block CollectExp path this hits.
 //
@@ -55,7 +55,7 @@ func histBenchLabelSets(n int) []model.LabelSet {
 }
 
 // histSketchPool builds a reusable pool of distinct exp-histograms so the
-// fixture's 10k×180 ticks don't each pay an observe loop, while keeping the
+// fixture's 10kx180 ticks don't each pay an observe loop, while keeping the
 // encoded bucket counts (and thus decode/merge cost) realistic.
 func histSketchPool(size int) []*histogram.ExponentialHistogram {
 	rng := rand.New(rand.NewSource(7))
@@ -152,7 +152,7 @@ func BenchmarkHistogramQuantile_qm3(b *testing.B) {
 
 // BenchmarkHistogramQuantileBy_qm3 mirrors the obsbench qm3-quantile exactly:
 // p99 grouped by service (10 groups) over a 5-minute window (metricsWindow) at
-// an instant eval point — here the last tick. This is the multi-block CollectExp
+// an instant eval point - here the last tick. This is the multi-block CollectExp
 // path the campaign drove (p50 ~1.27s).
 func BenchmarkHistogramQuantileBy_qm3(b *testing.B) {
 	f := buildHistFixture(b)

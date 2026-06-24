@@ -13,11 +13,11 @@ import (
 // Corruption-injection tests pin the per-subsystem corruption contract:
 //
 //   - WAL: replay stops at the first bad record, counts it (WALCorruptRecords),
-//     and the store opens — records before the corruption survive, nothing
+//     and the store opens - records before the corruption survive, nothing
 //     duplicates.
 //   - Sealed segment blocks: the store opens; scanning the damaged segment
 //     reports an error (zstd CRC / magic), it does not return garbage.
-//   - Segment footer: deliberately survivable — the reader falls back to the
+//   - Segment footer: deliberately survivable - the reader falls back to the
 //     footerless block scan and every record stays readable.
 //   - meta.json: fail-stop. Meta is the durability source of truth and is
 //     written atomically, so a corrupt meta means disk-level damage; opening
@@ -149,7 +149,7 @@ func TestCorruption_WALRecord(t *testing.T) {
 	// Corrupt the 10th unreplayed WAL record (= record 110): replay must
 	// keep 101..109, stop there, and count the corruption.
 	walPath := filepath.Join(dir, walFileName)
-	// header | ts(8) | data — flip a byte inside the data region.
+	// header | ts(8) | data - flip a byte inside the data region.
 	flipByte(t, walPath, walRecordStart(t, walPath, 9)+walHeaderSize+8+2)
 
 	sm, err := OpenSegmentManager(dir, RotationPolicy{MaxRecords: 50})
@@ -178,7 +178,7 @@ func TestCorruption_WALRecord(t *testing.T) {
 
 // TestCorruption_WALSeqField pins that the record CRC covers the header's
 // seq field. An unprotected flipped bit in seq made replay silently treat
-// the record as already durable (seq <= synced watermark) — undetected loss.
+// the record as already durable (seq <= synced watermark) - undetected loss.
 func TestCorruption_WALSeqField(t *testing.T) {
 	dir := writeAbandonedFixture(t)
 
@@ -234,7 +234,7 @@ func TestCorruption_SealedSegmentBlock(t *testing.T) {
 
 			flipByte(t, segPath, segHeaderSize+blockHeaderSize+tc.off(compressedSize))
 
-			// The store opens — sealed segments are not scanned at open.
+			// The store opens - sealed segments are not scanned at open.
 			sm, err := OpenSegmentManager(dir, DefaultRotationPolicy)
 			if err != nil {
 				t.Fatalf("store must open with a damaged sealed segment, got: %v", err)

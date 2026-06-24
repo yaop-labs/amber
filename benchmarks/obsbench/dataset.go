@@ -16,7 +16,7 @@ import (
 
 // Record is one dataset log entry. Seq is the loss-accounting identity: the
 // generator assigns a dense sequence, ingest reports the acked range, and
-// verification compares queryable counts against it (METHODOLOGY.md §4).
+// verification compares queryable counts against it (METHODOLOGY.md).
 // Timestamps are assigned at send time, not generation time, so every system
 // ingests a "live" stream the way real clients produce one.
 type Record struct {
@@ -29,7 +29,7 @@ type Record struct {
 }
 
 // DatasetWriter streams records into a zstd-compressed NDJSON file. The raw
-// dataset never lands on disk uncompressed (METHODOLOGY.md §2: disk budget).
+// dataset never lands on disk uncompressed (METHODOLOGY.md: disk budget).
 type DatasetWriter struct {
 	f   *os.File
 	zw  *zstd.Encoder

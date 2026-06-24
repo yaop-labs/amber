@@ -16,7 +16,7 @@ import (
 // MemSampler externally samples RSS/PSS of matching processes at a fixed
 // interval via /proc/<pid>/smaps_rollup. External sampling (not the
 // runtime's own stats) is the methodology's defense against self-flattering
-// memory numbers (METHODOLOGY.md §3). PIDs are re-resolved every tick so the
+// memory numbers (METHODOLOGY.md). PIDs are re-resolved every tick so the
 // sampler survives restarts and the kill -9 durability test.
 type MemSampler struct {
 	Match    *regexp.Regexp // against /proc/<pid>/cmdline
@@ -32,7 +32,7 @@ type memSample struct {
 }
 
 // Run samples until ctx is canceled. CSV columns:
-// unix_ms,pid,comm,rss_kb,pss_kb — plus one "total" row per tick so stack
+// unix_ms,pid,comm,rss_kb,pss_kb - plus one "total" row per tick so stack
 // scenarios (several processes) aggregate without post-processing.
 func (s *MemSampler) Run(ctx context.Context) error {
 	w := bufio.NewWriter(s.Out)

@@ -1,5 +1,5 @@
 // Package selfobs is a hand-rolled Prometheus text-exposition exporter for
-// Amber. It keeps the dependency surface to stdlib only — runtime/process
+// Amber. It keeps the dependency surface to stdlib only - runtime/process
 // collectors are intentionally omitted; add them only when an operator
 // asks for them by name and we know what we're paying for.
 package selfobs
@@ -76,7 +76,7 @@ func (cv *CounterVec) WithLabelValues(values ...string) *Counter {
 	return c
 }
 
-// Default bucket boundaries (upper bounds, seconds). Two presets — short for
+// Default bucket boundaries (upper bounds, seconds). Two presets - short for
 // sub-second hot paths (queries, WAL writes) and long for multi-second
 // background work (segment seal). Operators usually want histograms with
 // boundaries that match their alert thresholds; if these don't, switch to
@@ -116,7 +116,7 @@ func newHistogram(buckets []float64) *Histogram {
 	return h
 }
 
-// Observe records v (in seconds). Negative values are silently dropped —
+// Observe records v (in seconds). Negative values are silently dropped -
 // a negative latency is always a bug at the call site, not data worth
 // preserving.
 func (h *Histogram) Observe(v float64) {
@@ -249,7 +249,7 @@ var (
 
 	// Seal duration covers the synchronous portion of rotate(): close +
 	// fsync of the data file, plus index builds invoked via the onSeal
-	// callback. Background S3 upload is excluded — it has its own lifecycle.
+	// callback. Background S3 upload is excluded - it has its own lifecycle.
 	SealDuration = NewHistogramVec("amber_seal_duration_seconds", "Time spent sealing a segment (sync + index builds).", LongLatencyBuckets, "kind")
 
 	// Retention. reason="max_age"|"max_segments"|"max_total_bytes".
@@ -387,7 +387,7 @@ func writeHistogramVec(w io.Writer, hv *HistogramVec) {
 	hv.mu.RUnlock()
 }
 
-// formatBucket renders a bucket upper bound. Plain decimal — avoids
+// formatBucket renders a bucket upper bound. Plain decimal - avoids
 // scientific notation so prom_histogram_quantile string-matches buckets.
 func formatBucket(ub float64) string {
 	return strconv.FormatFloat(ub, 'f', -1, 64)

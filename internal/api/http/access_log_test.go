@@ -14,7 +14,7 @@ import (
 
 // TestAccessLogMiddleware_RecordsKeyName threads the full auth + access-log
 // stack and verifies the matched key name lands in the structured log line.
-// Slog output is parsed as text — the exact field formatting comes from the
+// Slog output is parsed as text - the exact field formatting comes from the
 // stdlib handler and any drift here is a signal that the audit contract
 // shifted, which downstream log shippers care about.
 func TestAccessLogMiddleware_RecordsKeyName(t *testing.T) {

@@ -82,7 +82,7 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	if err := bitmap.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
 	}
-	// The FTS ribbon's keys come straight from the FTS build state — one key
+	// The FTS ribbon's keys come straight from the FTS build state - one key
 	// per unique token, no second tokenize pass, no separate token set. Must
 	// be taken before Save seals the index and drops that state.
 	tokenKeys := fts.TokenKeys()
@@ -91,7 +91,7 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	}
 
 	// Ribbons are best-effort prefilters: a build failure (it happens on
-	// high-cardinality token sets — pre-existing, see BuildRibbonFilter)
+	// high-cardinality token sets - pre-existing, see BuildRibbonFilter)
 	// degrades queries to scans for this segment but must not discard the
 	// core indexes built above or trigger a full re-scan retry.
 	out := &LogSealIndexes{Bitmap: bitmap, FTS: fts}

@@ -17,14 +17,14 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 )
 
-// Metrics ingest runner: tick-driven OTLP push (METHODOLOGY.md §5, I1–I3).
-// Every system under test accepts the same OTLP protobuf payload — the
+// Metrics ingest runner: tick-driven OTLP push (METHODOLOGY.md, I1-I3).
+// Every system under test accepts the same OTLP protobuf payload - the
 // same-client fairness baseline; only the mount path differs per system.
 //
 // One tick emits one sample per active series. Payload building is
 // sequential (cumulative generator state mutates between ticks); only the
 // HTTP sends are parallel. If a tick cannot start on schedule because the
-// previous tick's sends are still queued, it is counted as an overrun —
+// previous tick's sends are still queued, it is counted as an overrun -
 // the metrics twin of the log harness's rate cap being honest about
 // backpressure instead of silently stretching the interval.
 
@@ -48,7 +48,7 @@ func otlpMetricsPath(t TargetConfig) string {
 // MetricsIngestOptions drives one metrics ingest run.
 type MetricsIngestOptions struct {
 	Gen MetricsGenConfig
-	// Interval between ticks (default 10s — METHODOLOGY I1).
+	// Interval between ticks (default 10s - METHODOLOGY I1).
 	Interval time.Duration
 	// Ticks is the run length in ticks (required, > 0).
 	Ticks int
@@ -250,7 +250,7 @@ func countAcceptedMetrics(kind string, status int, body []byte, points int) (int
 }
 
 // buildScalarOTLP renders scalar series [lo, hi) at the current tick state,
-// counters as cumulative monotonic sums. Every label — service included —
+// counters as cumulative monotonic sums. Every label - service included -
 // rides as a datapoint attribute: resource attributes like service.name go
 // through system-specific renames (Prometheus and Mimir fold them into
 // job/target_info), which would break the cross-system label identity the

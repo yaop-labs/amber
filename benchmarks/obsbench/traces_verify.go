@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// Trace ingest verification (METHODOLOGY.md §4): a completeness gate.
+// Trace ingest verification (METHODOLOGY.md): a completeness gate.
 //
 // Unlike logs (exact record count) and metrics (exact scalar-sample count),
 // there is no system-independent global span count a trace store cheaply
-// exposes — Tempo and the Jaeger API answer per-trace, not "how many spans did
+// exposes - Tempo and the Jaeger API answer per-trace, not "how many spans did
 // you store". So trace verification is a sampled per-trace check: fetch a
 // deterministic spread of trace IDs and assert each returns exactly
 // SpansPerTrace spans. A trace dropped at ingest, or a partially stored trace,

@@ -21,7 +21,7 @@ import (
 
 // retryBuild runs fn up to 3 times with exponential backoff (100ms, 500ms),
 // returning early if ctx is cancelled. Bumping the metric and surrendering
-// to the on-demand build path is acceptable on persistent failure — the
+// to the on-demand build path is acceptable on persistent failure - the
 // caller (seal callback) is fire-and-forget and has no upstream to notify.
 func retryBuild(ctx context.Context, name string, log *slog.Logger, fn func() error) error {
 	delays := []time.Duration{100 * time.Millisecond, 500 * time.Millisecond}

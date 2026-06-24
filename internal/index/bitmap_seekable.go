@@ -36,7 +36,7 @@ type postingLoc struct {
 }
 
 // SeekableBitmapIndex reads individual postings from a BID3 file on demand. Only
-// the directory (field → value → blob location) is held resident; postings are
+// the directory (field -> value -> blob location) is held resident; postings are
 // pread and decoded per query, so a service+operation filter touches a few KB
 // per segment instead of decoding the whole index.
 type SeekableBitmapIndex struct {

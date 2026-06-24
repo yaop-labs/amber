@@ -2,7 +2,7 @@ package amber_test
 
 // Smoke test for the embedded metrics store. Same hard rule as the other
 // public-surface tests: only github.com/yaop-labs/amber and its public
-// metricsengine facade are allowed — no reach-around into internal/...
+// metricsengine facade are allowed - no reach-around into internal/...
 //
 // What this proves end-to-end:
 //   - Open enables the store by default and MetricStore() returns non-nil

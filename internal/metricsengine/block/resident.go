@@ -11,12 +11,12 @@ import (
 // resident.go is the compact, resident, query-shaped form of a block directory.
 //
 // The decoded block.Directory is ~40 MiB for a 100k-series campaign block
-// (100k×176 B DirectoryEntry + 500k×48 B model.Label), so the byte-budgeted
+// (100kx176 B DirectoryEntry + 500kx48 B model.Label), so the byte-budgeted
 // dirCache holds only ~8 of the ~15 in-window blocks a range-step query touches
-// and re-decodes the rest every query — ~43% of the qm2 range-step query is
+// and re-decodes the rest every query - ~43% of the qm2 range-step query is
 // decodeDirectoryBinary (see metrics-query-redesign.md, phase 2). A ResidentBlock
 // stores the same query-relevant fields columnar with dict-encoded labels at
-// ~12 MiB/block, so all blocks fit resident → decode happens once, never recurs,
+// ~12 MiB/block, so all blocks fit resident -> decode happens once, never recurs,
 // and selector matching / group resolution work on integer dict codes with no
 // per-series model.Label allocation.
 //
@@ -46,7 +46,7 @@ type ResidentBlock struct {
 	valBase        []int64
 	valStrategy    []codec.ValueStrategy
 
-	// dataEnd is the end of the contiguous chunk section [0,dataEnd) — equal to
+	// dataEnd is the end of the contiguous chunk section [0,dataEnd) - equal to
 	// the directory offset. Used to bulk-read every chunk in one syscall.
 	dataEnd int64
 
@@ -192,7 +192,7 @@ type ResidentPredicate struct {
 	// by dict code; len == len(valueDict). Nil when NameIdx < 0.
 	Allowed []bool
 	// AcceptMissing reports whether a series lacking the label matches (true for
-	// negative matchers, matching matchLabels' "missing ⇒ continue" rule).
+	// negative matchers, matching matchLabels' "missing => continue" rule).
 	AcceptMissing bool
 }
 
@@ -204,7 +204,7 @@ type ResidentFilter struct {
 }
 
 // ResidentSeriesFunc receives one matching series. Timestamps and values alias
-// reusable scratch buffers — copy if retaining past the callback.
+// reusable scratch buffers - copy if retaining past the callback.
 type ResidentSeriesFunc func(seriesID uint64, typ model.MetricType, groupValue string, timestamps, values []int64) error
 
 func (rb *ResidentBlock) matchSeries(i int, preds []ResidentPredicate) bool {
@@ -250,7 +250,7 @@ func (rb *ResidentBlock) passesFilter(i int, filter ResidentFilter) bool {
 
 // Scan walks the block, applying predicates and the time/value filter, decoding
 // the chunk of each matching series and invoking fn with its resolved group
-// value. groupNameIdx is the dict column of the group label (-1 ⇒ ""). It reads
+// value. groupNameIdx is the dict column of the group label (-1 => ""). It reads
 // the chunk section once and delegates to ScanSection, falling back to per-series
 // reads only for an oversized block.
 func (rb *ResidentBlock) Scan(path string, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, fn ResidentSeriesFunc) error {
@@ -273,7 +273,7 @@ func (rb *ResidentBlock) Scan(path string, preds []ResidentPredicate, filter Res
 // ReadChunkSection bulk-reads the block's contiguous timestamp+value region so a
 // caller can scan it in memory (the parallel range-step path reads each block's
 // section once and shares it read-only across series-partitioned workers).
-// Returns nil when the region is empty or exceeds the bulk cap — the caller then
+// Returns nil when the region is empty or exceeds the bulk cap - the caller then
 // uses the sequential file-backed Scan.
 func (rb *ResidentBlock) ReadChunkSection(path string) ([]byte, error) {
 	file, err := os.Open(path)
@@ -285,7 +285,7 @@ func (rb *ResidentBlock) ReadChunkSection(path string) ([]byte, error) {
 }
 
 // ScanSection scans an already-read chunk section in memory. own, when non-nil,
-// restricts the scan to series whose ID it accepts — the parallel path passes a
+// restricts the scan to series whose ID it accepts - the parallel path passes a
 // hash partition so each series is assembled by exactly one worker.
 func (rb *ResidentBlock) ScanSection(section []byte, preds []ResidentPredicate, filter ResidentFilter, groupNameIdx int, own func(uint64) bool, fn ResidentSeriesFunc) error {
 	return rb.scanSection(section, preds, filter, groupNameIdx, own, fn)

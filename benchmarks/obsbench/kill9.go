@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Kill9Options drives the durability-loss test (METHODOLOGY.md §4): steady
+// Kill9Options drives the durability-loss test (METHODOLOGY.md): steady
 // ingest, SIGKILL the server at a random point, restart, and compare the
 // post-recovery queryable count against what the server acknowledged.
 type Kill9Options struct {
@@ -143,7 +143,7 @@ func runKill9Once(ctx context.Context, opts Kill9Options, run int, rng *rand.Ran
 		srv.stop()
 		return Kill9RunResult{}, fmt.Errorf("ingest failed before kill: %w", err)
 	case res := <-resCh:
-		// Dataset ran out before the kill point — the run is void; the
+		// Dataset ran out before the kill point - the run is void; the
 		// caller should use a larger dataset or an earlier kill window.
 		cancelIngest()
 		srv.stop()

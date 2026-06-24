@@ -45,7 +45,7 @@ func TestFloatRoundTripIntegers(t *testing.T) {
 func TestFloatSpecialValuesAreExceptions(t *testing.T) {
 	values := []float64{1.5, math.NaN(), math.Inf(1), math.Inf(-1), math.Pi, math.Copysign(0, -1), 2.5}
 	enc := roundTripFloats(t, values)
-	// NaN, +Inf, -Inf, π (binary, non-decimal), -0.0 → 5 exceptions.
+	// NaN, +Inf, -Inf, pi (binary, non-decimal), -0.0 -> 5 exceptions.
 	if len(enc.ExceptionPositions) != 5 {
 		t.Errorf("exceptions = %d (%v), want 5", len(enc.ExceptionPositions), enc.ExceptionPositions)
 	}

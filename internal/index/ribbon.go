@@ -24,7 +24,7 @@ func BuildRibbonFilter(keys [][]byte, _ uint8) (*RibbonFilter, error) {
 	// Window width must grow with log(n) for the ribbon solve to converge;
 	// empirically (param sweep on UUID-like keys): w=16 starts failing at
 	// ~10k keys, w=24 at ~200k, while w=32 (the library max) with n/4 slack
-	// builds reliably up to at least 2M keys — which is the realistic FTS
+	// builds reliably up to at least 2M keys - which is the realistic FTS
 	// token cardinality of one 100k-record segment with UUID-bearing bodies.
 	// The wider window costs 16 extra bytes per lookup and w extra cells.
 	rf, err := filter.NewRibbonFilter(n, n/4, 32, 0)

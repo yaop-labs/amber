@@ -14,7 +14,7 @@ import (
 // telemetryCollector polls amber's /metrics endpoint (Prometheus exposition)
 // on a fixed cadence and stores per-scrape snapshots of the gauges/counters
 // the harness reports on: GC, heap, goroutines, active series, ingest
-// counters. We do NOT scrape histograms — they're cheap on the binary side
+// counters. We do NOT scrape histograms - they're cheap on the binary side
 // but rendering quantiles from cumulative buckets needs delta math we don't
 // need here.
 

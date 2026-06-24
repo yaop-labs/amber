@@ -16,7 +16,7 @@ import (
 //
 // WriteBatch fsyncs every item to the WAL first, then writes them into the
 // active segment. checkpoint() runs when a block flushes mid-batch and ends
-// with wal.Truncate(), which zeroes the WHOLE WAL — including the seqs of the
+// with wal.Truncate(), which zeroes the WHOLE WAL - including the seqs of the
 // trailing batch items that landed only in the in-memory blockBuf and never
 // reached a durable on-disk block. After a crash those items exist nowhere.
 //
@@ -24,7 +24,7 @@ import (
 // would seal+flush the tail) and reopening the data dir: only bytes that
 // actually reached the fd survive, exactly as after SIGKILL. blockBuf lives in
 // a bytes.Buffer that is never written to the fd until a block flush, so the
-// reopen sees precisely the post-crash on-disk state — deterministically.
+// reopen sees precisely the post-crash on-disk state - deterministically.
 func TestSegmentManager_WriteBatch_TailSurvivesCrash(t *testing.T) {
 	dir := t.TempDir()
 
@@ -59,7 +59,7 @@ func TestSegmentManager_WriteBatch_TailSurvivesCrash(t *testing.T) {
 
 	// Precondition: a checkpoint must have happened mid-batch, otherwise the WAL
 	// still holds everything and the bug cannot manifest. If this fails, the
-	// batch was too small to flush a block — raise n or recSize.
+	// batch was too small to flush a block - raise n or recSize.
 	meta, ok := sm.ActiveSegmentMeta()
 	if !ok || meta.LastSyncedSeq == 0 {
 		t.Fatalf("test precondition not met: no mid-batch checkpoint (LastSyncedSeq=%d) — increase batch size", meta.LastSyncedSeq)
@@ -113,7 +113,7 @@ func TestSegmentManager_WriteBatch_TailSurvivesCrash(t *testing.T) {
 // skipped on replay, so the range of a crash-recovered active segment is
 // recoverable only from the durable watermark checkpoint() persists into meta.
 // Records carry an explicit ts that appears nowhere in their bytes, so a
-// rebuild that tries to parse it from the block would get garbage — the seal
+// rebuild that tries to parse it from the block would get garbage - the seal
 // footer must instead reflect the meta-seeded range.
 //
 // The crash is modeled in-process by abandoning the manager (no Close) and
@@ -126,7 +126,7 @@ func TestSegmentManager_CrashRecovery_PreservesTimeRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSegmentManager: %v", err)
 	}
-	// Intentionally NOT closed — Close() would seal cleanly and bypass recovery.
+	// Intentionally NOT closed - Close() would seal cleanly and bypass recovery.
 
 	// Cross the 4 MiB block boundary so a checkpoint runs (persisting the range
 	// into meta) and a footerless block survives on disk for recovery to rebuild.
@@ -183,7 +183,7 @@ func TestSegmentManager_CrashRecovery_PreservesTimeRange(t *testing.T) {
 //
 // The ingest batcher calls Flush() after each batch, so records reach the
 // segment fd long before a 4 MiB block flush triggers checkpoint(). A crash
-// in that state leaves meta with LastSyncedSize=0 — and recovery used to
+// in that state leaves meta with LastSyncedSize=0 - and recovery used to
 // treat zero as "nothing to truncate", keeping the crash-surviving records
 // in the file and then replaying the complete WAL on top of them: every
 // record came back twice. Found by the obsbench kill -9 test (acked=67000,

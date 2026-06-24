@@ -1,5 +1,5 @@
 // Package indexer owns the in-memory bitmap indexes for currently-open
-// (unsealed) segments. This is writer-side state — query.Executor reads from
+// (unsealed) segments. This is writer-side state - query.Executor reads from
 // it via Lookup* but does not mutate it. Under distributed mode (Phase 1.5)
 // the indexer lives on the ingest node, while Executor lives on the query
 // node and reads sealed indexes from S3.

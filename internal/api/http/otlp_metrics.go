@@ -113,7 +113,7 @@ func (h *OTLPHandler) ingestScalar(metric *metricspb.Metric, resourceAttrs, scop
 		return 0, len(addPoints)
 	}
 	if skipped > 0 {
-		// NaN/±Inf/int64-overflow float points: unencodable in the int64
+		// NaN/+/-Inf/int64-overflow float points: unencodable in the int64
 		// value model, dropped by the adapter instead of stored as garbage.
 		selfobs.MetricsIngestRejected.WithLabelValues("value_unencodable").Add(uint64(skipped))
 	}

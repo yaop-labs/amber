@@ -34,7 +34,7 @@ func ReadResultFile(path string) (ResultFile, error) {
 
 // Mismatch is one equality-gate violation: the same query instance returned
 // different counts on different systems, so the latency comparison for that
-// instance is void (METHODOLOGY.md §6).
+// instance is void (METHODOLOGY.md).
 type Mismatch struct {
 	Scenario  string
 	Iteration int
@@ -44,7 +44,7 @@ type Mismatch struct {
 }
 
 // CompareCounts applies the equality gate across two or more result files.
-// Instances are matched by (scenario, iteration, params) — identical seeds
+// Instances are matched by (scenario, iteration, params) - identical seeds
 // produce identical params, so a params mismatch is itself a harness bug and
 // reported as such.
 func CompareCounts(files []ResultFile) []Mismatch {

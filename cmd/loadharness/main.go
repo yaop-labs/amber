@@ -7,7 +7,7 @@
 // See LOAD_HARNESS_BRIEF.md for the design and the experiments this harness
 // is supposed to enable.
 //
-// This is a MEASUREMENT tool — it does not change amber, it does not "fix"
+// This is a MEASUREMENT tool - it does not change amber, it does not "fix"
 // perf. If a number is bad, that is the signal; the fix belongs to a
 // downstream PR that uses these numbers as the regression baseline.
 package main

@@ -179,7 +179,7 @@ func TestExecutor_ExecLog_NoSegments_AfterPruning(t *testing.T) {
 
 // TestExecutor_ExecLog_CacheHit verifies that repeated identical queries
 // return the cached result with CacheHit=true on the second call. This
-// guards the hot dashboard / benchmark warm-repeat path — if this regresses,
+// guards the hot dashboard / benchmark warm-repeat path - if this regresses,
 // p50 latencies on R1-R4 explode because every query re-scans segments.
 //
 // Empty results are no longer cached (an ingest-then-query embedder would
@@ -280,7 +280,7 @@ func TestLogQuery_FromUnixNano_ZeroReturnsZero(t *testing.T) {
 // buildBodyDataset writes logs with the given bodies into one segment and
 // returns a ready executor that registers NO FTS index. The scan-time
 // full-text fallback (needScanFTS) is gated on the absence of an FTS index,
-// not on whether the segment is active — so this exercises the same code path
+// not on whether the segment is active - so this exercises the same code path
 // the production active (unsealed) segment hits, while staying readable.
 func buildBodyDataset(t *testing.T, bodies []string) (*Executor, func()) {
 	t.Helper()

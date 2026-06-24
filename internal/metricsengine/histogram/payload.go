@@ -213,7 +213,7 @@ func (s *decodeScratch) workspace(n int) []int64 {
 // applyBucketDeltas reconstructs cur buckets by applying stored deltas onto prev.
 // The deltas are stored as (indexDelta, countDelta) pairs sorted by ascending
 // absolute index, so the reconstruction copies prev's dense counts and applies
-// the sparse deltas over the union index range — no per-tick count map (the old
+// the sparse deltas over the union index range - no per-tick count map (the old
 // map build dominated the quantile decode's allocations and CPU). Transient
 // buffers come from sc; only the returned Counts array is freshly allocated.
 func applyBucketDeltas(r *reader, prev Buckets, sc *decodeScratch) (Buckets, error) {

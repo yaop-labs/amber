@@ -1,6 +1,6 @@
 // Package fslock provides an advisory per-directory lock so two processes
 // (or two embedded amber.Open calls) cannot operate on the same data
-// directory at once — concurrent writers would silently corrupt the WAL,
+// directory at once - concurrent writers would silently corrupt the WAL,
 // segments, and meta files.
 //
 // The lock is a flock(2) on a LOCK file inside the directory: it is released
@@ -30,8 +30,8 @@ type Lock struct {
 }
 
 // Acquire takes an exclusive non-blocking lock on dir. It creates the
-// directory (and the LOCK file inside it) if missing. If another process —
-// or another Lock in this process — holds the directory, it fails
+// directory (and the LOCK file inside it) if missing. If another process -
+// or another Lock in this process - holds the directory, it fails
 // immediately with an error wrapping ErrLocked.
 func Acquire(dir string) (*Lock, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {

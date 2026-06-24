@@ -70,8 +70,8 @@ func TestMetricsSelfobs_IngestCountersIncrement(t *testing.T) {
 		t.Errorf("accepted{sum} delta = %d, want 1", got)
 	}
 	// Histogram now flows through the histogram store rather than landing in
-	// unsupported — the OTLP point with Count=3 produces a single accepted
-	// series-point pair (1 series × 1 tick = 1 accepted point).
+	// unsupported - the OTLP point with Count=3 produces a single accepted
+	// series-point pair (1 series x 1 tick = 1 accepted point).
 	if got := selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Get() - beforeHist; got != 1 {
 		t.Errorf("accepted{histogram} delta = %d, want 1", got)
 	}

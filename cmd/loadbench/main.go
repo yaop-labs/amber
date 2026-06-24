@@ -52,12 +52,12 @@ var (
 )
 
 const (
-	// Body templates all carry the common token "request" — searched in R3.
+	// Body templates all carry the common token "request" - searched in R3.
 	// Templates avoid overlap so FTS index isn't degenerate.
 	commonToken = "request"
-	// Rare token planted in rareTokenRate fraction of bodies — searched in R4.
+	// Rare token planted in rareTokenRate fraction of bodies - searched in R4.
 	rareToken     = "anomalous-pattern-7f2"
-	rareTokenRate = 0.001 // 0.1% — selective enough that FTS lookup beats scan
+	rareTokenRate = 0.001 // 0.1% - selective enough that FTS lookup beats scan
 )
 
 var bodyTemplates = []string{
@@ -126,7 +126,7 @@ func main() {
 		fatal("rt.New: %v", err)
 	}
 
-	// W — Write throughput.
+	// W - Write throughput.
 	w := runWrite(stack, *flagN, *flagServices, *flagHosts, *flagSeed)
 	report.section("W — Write throughput", w.lines())
 
@@ -160,11 +160,11 @@ func main() {
 		report.printf("restart: engine reopened (cold-start RSS follows)\n\n")
 	}
 
-	// M — Storage + idle RSS after GC.
+	// M - Storage + idle RSS after GC.
 	m := measureMemory(stack, dir, *flagRestart)
 	report.section("M — Storage and idle memory", m.lines())
 
-	// R — Read latency p50/p99 across 5 scenarios.
+	// R - Read latency p50/p99 across 5 scenarios.
 	r := runReads(stack, *flagQueryIters, *flagWarmupIters, w)
 	report.section("R — Read latency", r.lines())
 
@@ -204,7 +204,7 @@ func runWrite(stack *rt.Stack, n, nServices, nHosts int, seed uint64) writeResul
 	levels := []model.Level{model.LevelDebug, model.LevelInfo, model.LevelWarn, model.LevelError, model.LevelFatal}
 
 	// PCG seeded deterministically; only used for rare-token sprinkle.
-	// Not a security context — math/rand/v2 is correct here.
+	// Not a security context - math/rand/v2 is correct here.
 	rng := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15)) //nolint:gosec
 
 	// Stretch the dataset across 24h synthetic time so R2's 1h time-range
@@ -282,7 +282,7 @@ func generateEntry(idx int, services []string, nHosts int, levels []model.Level,
 	}
 
 	// Service and level use co-prime strides so the (service, level) cross
-	// product is fully covered — otherwise idx%5 for both gives only 5 pairs
+	// product is fully covered - otherwise idx%5 for both gives only 5 pairs
 	// out of 25 possible.
 	return model.LogEntry{
 		ID:        id,
@@ -300,7 +300,7 @@ func generateEntry(idx int, services []string, nHosts int, levels []model.Level,
 
 // waitForSealing polls until every sealed segment has its .bidx and .fidx
 // sidecars on disk, or the deadline expires. onSeal runs in a goroutine and
-// has no public completion signal — checking file presence is the simplest
+// has no public completion signal - checking file presence is the simplest
 // race-free way to know index builds are done.
 //
 // .filt (bitmap ribbon) and .fts.filt are prefilters; their absence makes
@@ -371,7 +371,7 @@ func (m memResult) lines() []string {
 }
 
 func measureMemory(stack *rt.Stack, dir string, cold bool) memResult {
-	// Two GCs are the standard idiom for "settle" — the first frees young
+	// Two GCs are the standard idiom for "settle" - the first frees young
 	// garbage, the second sweeps newly-promoted objects. FreeOSMemory hints to
 	// the OS to return pages so VmRSS reflects live state, not high-water.
 	runtime.GC()
@@ -414,7 +414,7 @@ func measureMemory(stack *rt.Stack, dir string, cold bool) memResult {
 }
 
 // readRSS returns resident set size from /proc/self/status on linux, or 0
-// elsewhere. Falls back to 0 silently — we report MemStats unconditionally.
+// elsewhere. Falls back to 0 silently - we report MemStats unconditionally.
 func readRSS() uint64 {
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {

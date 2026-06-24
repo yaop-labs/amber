@@ -88,7 +88,7 @@ func (c *catalogLog) AppendRegister(seriesID uint64, labels model.LabelSet) erro
 
 // AppendRegisterBatch writes REGISTER records for all series and syncs them
 // behind a single commit wait. One ingest batch can register thousands of new
-// series; per-series Append would pay one committer tick *each* (5ms × n —
+// series; per-series Append would pay one committer tick *each* (5ms x n -
 // the ~200 samples/s ingest collapse found by the metrics benchmark), so the
 // records are concatenated into one blob and acknowledged by one fsync.
 func (c *catalogLog) AppendRegisterBatch(series []liveSeries) error {

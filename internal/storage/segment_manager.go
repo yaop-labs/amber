@@ -52,7 +52,7 @@ type SegmentManager struct {
 	// A goroutine per seal (the previous design) let slow index builds pile
 	// up without bound under sustained ingest: each in-flight build held its
 	// segment's indexes in memory and burned CPU, starving the ingest path,
-	// which made builds even slower — a feedback loop ending in swap death
+	// which made builds even slower - a feedback loop ending in swap death
 	// (found by the obsbench W1 run: 8.8 GB heap at 10M records). A backlog
 	// in this queue costs ~100 bytes per entry; queries against not-yet-
 	// indexed segments fall back to scans, which is degradation, not failure.
@@ -163,7 +163,7 @@ func (sm *SegmentManager) replayWAL() error {
 	// ran for this segment, so nothing past the header is known durable and
 	// the file is cut back to the bare header. Treating zero as "skip the
 	// truncate" kept the crash-surviving records in place and then replayed
-	// the entire WAL on top of them — every record duplicated (found by the
+	// the entire WAL on top of them - every record duplicated (found by the
 	// obsbench kill -9 test).
 	syncedSize := max(activeMeta.LastSyncedSize, segHeaderSize)
 	if info, err := os.Stat(segPath); err == nil && info.Size() > syncedSize {
@@ -235,11 +235,11 @@ func (sm *SegmentManager) createNewSegment() error {
 	if errors.Is(err, fs.ErrExist) {
 		// Crash window: the previous run died after creating this segment
 		// file but before saveMeta recorded it (found by the rotation-storm
-		// kill -9 test — recovery refused to open with "file exists").
+		// kill -9 test - recovery refused to open with "file exists").
 		// Such an orphan holds no acked data: rotate truncates the WAL
 		// before createNewSegment, and no Write is accepted until saveMeta
 		// below returns. Recreating it is safe. Anything larger than a bare
-		// header contradicts that invariant — fail stop instead of deleting
+		// header contradicts that invariant - fail stop instead of deleting
 		// what might be data.
 		if info, statErr := os.Stat(segPath); statErr == nil && info.Size() > segHeaderSize {
 			return fmt.Errorf("segmgr: segment file %s exists with %d bytes but is not in meta — refusing to overwrite", fileName, info.Size())
@@ -526,7 +526,7 @@ func (sm *SegmentManager) runSealWorker() {
 }
 
 // stopSealWorker ends the worker after the in-flight job; queued seals are
-// dropped — bootstrap rebuilds missing sidecar indexes lazily on next open.
+// dropped - bootstrap rebuilds missing sidecar indexes lazily on next open.
 func (sm *SegmentManager) stopSealWorker() {
 	sm.sealMu.Lock()
 	stop, done := sm.sealStop, sm.sealDone

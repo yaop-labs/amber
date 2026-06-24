@@ -150,7 +150,7 @@ func TestHandler_HistogramExposition(t *testing.T) {
 		`amber_test_xy_seconds_bucket{kind="log",le="0.1"} 2`,
 		`amber_test_xy_seconds_bucket{kind="log",le="+Inf"} 3`,
 		`amber_test_xy_seconds_count{kind="log"} 3`,
-		// Sum ≈ 0.555; exposition uses formatFloat which prints
+		// Sum ~ 0.555; exposition uses formatFloat which prints
 		// non-integers via g-style. The leading "0.55" prefix is enough.
 		`amber_test_xy_seconds_sum{kind="log"} 0.55`,
 	}

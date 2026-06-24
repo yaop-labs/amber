@@ -13,9 +13,9 @@ import (
 
 // measureQueryAllocs runs fn b.N times and reports the per-iteration
 // allocations as custom benchmark metrics (`query_B/op` and `query_allocs/op`).
-// Unlike b.ReportAllocs() — which includes setup that ran before
+// Unlike b.ReportAllocs() - which includes setup that ran before
 // b.ResetTimer because runtime/pprof samples allocations across the whole
-// process — this helper takes a fresh MemStats snapshot AFTER setup finished
+// process - this helper takes a fresh MemStats snapshot AFTER setup finished
 // and a forced GC, so the delta is purely the work done inside fn.
 //
 // Use this helper for any "what does the query path itself allocate" question.
@@ -175,7 +175,7 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality(b *testing.B) 
 // BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality but uses
 // measureQueryAllocs to report ONLY the per-query allocations. The standard
 // b.ReportAllocs metric for the original benchmark is inflated by store
-// setup (10k series × 10 samples ingested + flushed twice); this clean
+// setup (10k series x 10 samples ingested + flushed twice); this clean
 // variant is what we use to track sync.Pool / arena perf PRs.
 func BenchmarkRateRangeStepsMultiBlockCleanAllocs(b *testing.B) {
 	st := buildBenchStoreBlocks(b, 10_000, 10, 2)

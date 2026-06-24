@@ -131,7 +131,7 @@ func TestRegistryLastTouch(t *testing.T) {
 		t.Fatalf("after later touch: ts=%d, want 200", ts)
 	}
 
-	// An out-of-order older touch does NOT regress the value — last-touch
+	// An out-of-order older touch does NOT regress the value - last-touch
 	// tracks max-seen, so the sweep can age the series by its newest
 	// activity even when collectors backfill late.
 	reg.GetOrCreateAt(labels, 150)
@@ -139,7 +139,7 @@ func TestRegistryLastTouch(t *testing.T) {
 		t.Fatalf("after stale touch: ts=%d, want 200 (no regression)", ts)
 	}
 
-	// Bare GetOrCreate does not touch — preserves the existing value so
+	// Bare GetOrCreate does not touch - preserves the existing value so
 	// non-ingest call sites (tests, future query-path hits) cannot reset
 	// the eviction clock.
 	reg.GetOrCreate(labels)
@@ -191,7 +191,7 @@ func TestRegistrySweepEvictsColdSeries(t *testing.T) {
 	if reg.SeriesCount() != 1 {
 		t.Fatalf("SeriesCount=%d want 1", reg.SeriesCount())
 	}
-	// Evicted series must be gone from byFP / postings too — re-registering
+	// Evicted series must be gone from byFP / postings too - re-registering
 	// should yield a NEW id (not the old one).
 	newID := reg.GetOrCreateAt(model.LabelSet{{Name: "job", Value: "worker"}}, 70_000)
 	if newID == cold1 {
@@ -228,7 +228,7 @@ func TestRegistrySweepBucketingMatchesFullScan(t *testing.T) {
 		if bucketed {
 			reg.SetEvictionBucketing(60_000, 5_000)
 		} else {
-			// Set retention without bucketing — the full-scan path uses
+			// Set retention without bucketing - the full-scan path uses
 			// bucketRetention as its threshold.
 			reg.bucketRetention = 60_000
 		}

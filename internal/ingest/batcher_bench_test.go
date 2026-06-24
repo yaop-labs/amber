@@ -44,7 +44,7 @@ func discardLogger() *slog.Logger {
 }
 
 // newDrainBatcher returns a Batcher whose queue is drained by a background
-// goroutine that does no work — measures pure SendLog prelude + channel send
+// goroutine that does no work - measures pure SendLog prelude + channel send
 // without storage cost. Returned stop func ensures the drain exits.
 func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*Batcher, func()) {
 	b.Helper()
@@ -64,7 +64,7 @@ func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*
 	}
 	// Tight-loop drain: `for range` is faster than select{<-done, <-queue}
 	// because there's no extra case-comparison per recv. Stop by closing
-	// the queue — drain exits when channel closed and drained. Caller must
+	// the queue - drain exits when channel closed and drained. Caller must
 	// not SendLog after stop().
 	go func() {
 		for range bt.logQueue {
@@ -74,7 +74,7 @@ func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*
 	return bt, stop
 }
 
-// BenchmarkBatcher_Prelude_NoGuard isolates IsBreakerOpen() — guard is nil, so
+// BenchmarkBatcher_Prelude_NoGuard isolates IsBreakerOpen() - guard is nil, so
 // guard.Check returns "" immediately. This is the floor cost of every SendLog.
 func BenchmarkBatcher_Prelude_NoGuard(b *testing.B) {
 	bt := NewBatcher(Deps{Logger: discardLogger()}, Config{BreakerThreshold: 10})
@@ -110,7 +110,7 @@ func BenchmarkBatcher_Prelude_WithGuard(b *testing.B) {
 // Includes channel send. Floor cost of SendLog without guard.
 //
 // Note: with a single drain goroutine the consumer can fall behind the
-// producer under steady load — a fraction of iterations take the
+// producer under steady load - a fraction of iterations take the
 // queue_full path (Warn + metric inc, heavier than success). We tolerate
 // this and report the mixed cost. The Prelude_* benchmarks isolate the
 // pre-channel work; this one captures real SendLog under load.
@@ -159,14 +159,14 @@ func BenchmarkBatcher_SendLog_BreakerOpen(b *testing.B) {
 
 // BenchmarkBatcher_ProcessBatch_e2e drives processBatch directly with a real
 // SegmentManager, sparse index, and ActiveIndex. Measures the steady-state
-// path that the background goroutine runs: serialize → WriteBatch → sparse
-// touch → IndexLogEntries → Flush.
+// path that the background goroutine runs: serialize -> WriteBatch -> sparse
+// touch -> IndexLogEntries -> Flush.
 //
 // b.N is the number of *batches* processed, each of size batchSize.
 //
 // Per-iteration ID/timestamp churn is pre-generated outside the timed loop
 // because MustNewEntryID + time.Now together dominate CPU profile of a
-// naive setup — we'd be measuring ULID generation, not processBatch.
+// naive setup - we'd be measuring ULID generation, not processBatch.
 func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 	const batchSize = 256
 	dir := b.TempDir()
@@ -192,8 +192,8 @@ func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 	}, Config{BatchSize: batchSize, BatchTimeout: time.Second, QueueSize: batchSize})
 
 	// Synthesize IDs via counter encoding instead of MustNewEntryID. ULID
-	// generation walks crypto/rand + time.Now and at b.N≈10k×256 entries
-	// dominates CPU profile of setup — masking the real processBatch hot
+	// generation walks crypto/rand + time.Now and at b.N~10kx256 entries
+	// dominates CPU profile of setup - masking the real processBatch hot
 	// path. We just need unique 16-byte IDs; encode the counter in the low
 	// 8 bytes.
 	ids := make([]model.EntryID, b.N*batchSize)
@@ -203,7 +203,7 @@ func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 	baseTS := time.Now().UnixNano()
 
 	// One backing array of LogEntry values, pointers held by `batch`. The
-	// timed loop only mutates ID + Timestamp fields — cheap.
+	// timed loop only mutates ID + Timestamp fields - cheap.
 	entries := make([]model.LogEntry, batchSize)
 	batch := make([]item, batchSize)
 	template := benchLogEntry()

@@ -14,7 +14,7 @@ import (
 )
 
 // IngestOptions drives one ingest run (W1 burst when Rate==0, W2 sustained
-// otherwise — METHODOLOGY.md §5).
+// otherwise - METHODOLOGY.md).
 type IngestOptions struct {
 	Workers   int
 	BatchSize int
@@ -25,10 +25,10 @@ type IngestOptions struct {
 }
 
 // IngestResult is the run summary. AckedRecords counts records the server
-// actually accepted — from the response body when the system reports
+// actually accepted - from the response body when the system reports
 // per-record accept/reject counts (amber), otherwise whole 2xx batches.
 // The gap to SentRecords plus the verify step's queryable count is the loss
-// accounting (METHODOLOGY.md §4).
+// accounting (METHODOLOGY.md).
 type IngestResult struct {
 	Target string `json:"target"`
 	// StartedAt/FinishedAt bound the ingest window; the query phase derives
@@ -44,7 +44,7 @@ type IngestResult struct {
 	LatencyP95    time.Duration `json:"latency_p95_ns"`
 	LatencyP99    time.Duration `json:"latency_p99_ns"`
 	// Errors maps "status 500" / transport error strings to counts; errors
-	// are first-class results, never footnotes (METHODOLOGY.md §6).
+	// are first-class results, never footnotes (METHODOLOGY.md).
 	Errors map[string]uint64 `json:"errors,omitempty"`
 }
 
@@ -219,7 +219,7 @@ func post(ctx context.Context, client *http.Client, target TargetConfig, path, c
 
 // countAccepted extracts the per-batch accepted-record count. Amber answers
 // partial queue-full rejection with a 503 that still carries
-// {"accepted":N,"rejected":M} — trusting the status code alone undercounts
+// {"accepted":N,"rejected":M} - trusting the status code alone undercounts
 // acked records on backpressure (and a 202 with rejections would overcount).
 // Other systems ack all-or-nothing by status code.
 func countAccepted(kind string, status int, body []byte, batchLen int) (int, bool) {

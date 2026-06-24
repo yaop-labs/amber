@@ -34,7 +34,7 @@ type BlockMeta struct {
 	// SampleCount is the scalar sample total of the block, recorded at write
 	// time so Stats never has to load block directories (at 100k-series
 	// blocks the directory loads blew the heap straight through the soft
-	// memory limit — GC assist turned a stats call into minutes).
+	// memory limit - GC assist turned a stats call into minutes).
 	// 0 on manifests written before the field existed; Stats falls back to
 	// one directory read for those.
 	SampleCount int                 `json:"sample_count,omitempty"`

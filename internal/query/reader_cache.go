@@ -125,7 +125,7 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 	if err != nil && c.fetcher != nil && errors.Is(err, os.ErrNotExist) {
 		// Local miss: pull from remote store under singleflight so concurrent
 		// queriers don't each pay the network cost. After fetch, retry the
-		// open — store.Get writes the data file atomically via temp+rename.
+		// open - store.Get writes the data file atomically via temp+rename.
 		fileName := filepath.Base(path)
 		_, ferr, _ := c.flight.Do(path, func() (any, error) {
 			return nil, c.fetcher(fileName)

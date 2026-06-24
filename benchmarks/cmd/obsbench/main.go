@@ -1,17 +1,17 @@
 // Command obsbench is the benchmark harness CLI behind
 // benchmarks/METHODOLOGY.md. Subcommands cover the campaign phases:
 //
-//	preflight — environment gate (mem/disk/swap/governor)
-//	datagen   — seeded zstd-compressed log dataset
-//	sample    — 1 Hz external RSS/PSS sampler → CSV
-//	kill9     — acked-loss test (crash mid-ingest, recount survivors)
-//	compare   — cross-system equality gate over query result files
+//	preflight - environment gate (mem/disk/swap/governor)
+//	datagen   - seeded zstd-compressed log dataset
+//	sample    - 1 Hz external RSS/PSS sampler -> CSV
+//	kill9     - acked-loss test (crash mid-ingest, recount survivors)
+//	compare   - cross-system equality gate over query result files
 //
 // Each signal has its own ingest/query/verify trio against one target:
 //
-//	logs    — ingest   / query        / verify
-//	metrics — metrics-ingest / metrics-query / metrics-verify
-//	traces  — traces-ingest  / traces-query  / traces-verify
+//	logs    - ingest   / query        / verify
+//	metrics - metrics-ingest / metrics-query / metrics-verify
+//	traces  - traces-ingest  / traces-query  / traces-verify
 //
 // Each run's raw outputs (JSON summaries, sampler CSVs) are the publishable
 // artifacts; tables are derived from them, never typed by hand.

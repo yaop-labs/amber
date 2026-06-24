@@ -87,7 +87,7 @@ func main() {
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	// W — Write throughput via HTTP POST /api/v1/logs.
+	// W - Write throughput via HTTP POST /api/v1/logs.
 	fmt.Println("W — Write throughput (HTTP)")
 	fmt.Println("--------------------------")
 
@@ -134,7 +134,7 @@ func main() {
 	fmt.Printf("  throughput: %.0f rec/s\n", float64(flagN-dropped)/dur.Seconds())
 	fmt.Printf("  dropped:    %d\n\n", dropped)
 
-	// Drain — wait for batcher to flush.
+	// Drain - wait for batcher to flush.
 	fmt.Println("draining batcher...")
 	time.Sleep(2 * time.Second)
 
@@ -145,7 +145,7 @@ func main() {
 	}
 	time.Sleep(5 * time.Second)
 
-	// R — Read latency via GET /api/v1/logs.
+	// R - Read latency via GET /api/v1/logs.
 	fmt.Println("R — Read latency (HTTP, 100 iterations)")
 	fmt.Println("----------------------------------------")
 

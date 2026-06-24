@@ -7,8 +7,8 @@ import (
 )
 
 // Sketch (de)serialization. The on-disk form of an ExponentialHistogram is the
-// OTLP-native sketch — scale, zero_count, zero_threshold, positive/negative
-// {offset, counts[]}, sum, count, min, max — encoded losslessly so a sketch
+// OTLP-native sketch - scale, zero_count, zero_threshold, positive/negative
+// {offset, counts[]}, sum, count, min, max - encoded losslessly so a sketch
 // round-trips byte-for-byte equal to the source OTLP data point.
 
 const flagHasMinMax = 1 << 0

@@ -107,7 +107,7 @@ type Registry struct {
 	// lastTouch is the most recent ingest timestamp (Unix ms) per series.
 	// Updated by GetOrCreateAt on every append; read by the eviction sweep
 	// to decide whether a series is cold (now-lastTouch > retention).
-	// INDEX_EVICTION_SPEC_v0.md §1: cold-criterion = last_touch + retention.
+	// INDEX_EVICTION_SPEC_v0.md: cold-criterion = last_touch + retention.
 	lastTouch map[SeriesID]int64
 
 	// Bucketed timing wheel for the eviction sweep. Each series is in one

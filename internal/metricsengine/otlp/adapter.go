@@ -54,8 +54,8 @@ type Batch struct {
 const maxScaledFloat = float64(math.MaxInt64)
 
 // scaledFloatValue converts a float to the int64 value model as
-// round(value*scale). ok is false for NaN, ±Inf, and values whose scaled
-// form overflows int64 — storing those would produce garbage samples.
+// round(value*scale). ok is false for NaN, +/-Inf, and values whose scaled
+// form overflows int64 - storing those would produce garbage samples.
 func scaledFloatValue(value float64, scale int64) (int64, bool) {
 	scaled := math.Round(value * float64(scale))
 	if math.IsNaN(scaled) || scaled >= maxScaledFloat || scaled <= -maxScaledFloat {
@@ -65,8 +65,8 @@ func scaledFloatValue(value float64, scale int64) (int64, bool) {
 }
 
 // Samples converts a batch to storage samples. Float points that cannot be
-// represented in the int64 value model (NaN — OTLP uses it as a staleness
-// marker — ±Inf, and overflow at the point's scale) are skipped, not stored
+// represented in the int64 value model (NaN - OTLP uses it as a staleness
+// marker - +/-Inf, and overflow at the point's scale) are skipped, not stored
 // as garbage. Use SamplesSkipped to observe how many were dropped.
 func Samples(batch Batch) ([]model.Sample, error) {
 	samples, _, err := SamplesSkipped(batch)
@@ -74,7 +74,7 @@ func Samples(batch Batch) ([]model.Sample, error) {
 }
 
 // SamplesSkipped is Samples plus the count of float points that were dropped
-// because their value cannot be encoded (NaN, ±Inf, int64 overflow).
+// because their value cannot be encoded (NaN, +/-Inf, int64 overflow).
 func SamplesSkipped(batch Batch) ([]model.Sample, int, error) {
 	samples := make([]model.Sample, 0, len(batch.Points))
 	skipped := 0

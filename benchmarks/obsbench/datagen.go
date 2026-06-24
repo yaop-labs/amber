@@ -6,8 +6,8 @@ import (
 )
 
 // GenConfig parameterizes dataset generation. Everything derives from Seed so
-// two runs with the same config produce byte-identical datasets — the
-// reproducibility contract of METHODOLOGY.md §5.
+// two runs with the same config produce byte-identical datasets - the
+// reproducibility contract of METHODOLOGY.md.
 type GenConfig struct {
 	Count uint64
 	Seed  uint64

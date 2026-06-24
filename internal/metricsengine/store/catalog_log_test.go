@@ -24,7 +24,7 @@ import (
 // E.6 Full rotation matrix:     TestCatalogLogRotationCrashMatrix
 // orphaned .tmp recovery:       TestCatalogLogOrphanedTmpRecovery
 
-// --- E.1 — round-trip --------------------------------------------------------
+// --- E.1 - round-trip --------------------------------------------------------
 
 func TestCatalogLogRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -66,7 +66,7 @@ func TestCatalogLogRoundTrip(t *testing.T) {
 	}
 }
 
-// --- E.2 — torn write at EOF ------------------------------------------------
+// --- E.2 - torn write at EOF ------------------------------------------------
 
 func TestCatalogLogTornAtEOF(t *testing.T) {
 	dir := t.TempDir()
@@ -83,7 +83,7 @@ func TestCatalogLogTornAtEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Append 5 bytes of garbage (simulates a partial fsync — header
+	// Append 5 bytes of garbage (simulates a partial fsync - header
 	// started but body didn't make it). Truncate at that should be the
 	// post-recovery state.
 	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0)
@@ -139,7 +139,7 @@ func TestCatalogLogTornTailIsIdempotentAcrossReboots(t *testing.T) {
 	sizeAfter1, _ := os.Stat(logPath)
 
 	// Second load must yield identical state and the file must not
-	// shrink further — the truncate from the first load was final.
+	// shrink further - the truncate from the first load was final.
 	live2, highest2, err := loadCatalogLogState(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestCatalogLogTornTailIsIdempotentAcrossReboots(t *testing.T) {
 	}
 }
 
-// --- E.3 — CRC mismatch refuses to proceed ----------------------------------
+// --- E.3 - CRC mismatch refuses to proceed ----------------------------------
 
 func TestCatalogLogCRCMismatchRefuses(t *testing.T) {
 	dir := t.TempDir()
@@ -172,7 +172,7 @@ func TestCatalogLogCRCMismatchRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Flip a bit inside the SECOND record's body (not in total_len —
+	// Flip a bit inside the SECOND record's body (not in total_len -
 	// otherwise we hit the "invalid record length" branch instead of
 	// CRC failure). Body of record 1 starts at offset catalogHeaderLen.
 	rec1Len := int(binary.LittleEndian.Uint32(data[0:4]))
@@ -187,7 +187,7 @@ func TestCatalogLogCRCMismatchRefuses(t *testing.T) {
 	}
 }
 
-// --- E.4 — snapshot then log -----------------------------------------------
+// --- E.4 - snapshot then log -----------------------------------------------
 
 func TestCatalogLogSnapshotThenLog(t *testing.T) {
 	dir := t.TempDir()
@@ -238,11 +238,11 @@ func TestCatalogLogSnapshotThenLog(t *testing.T) {
 	}
 }
 
-// --- E.5 — crash between snapshot rename and log truncate -------------------
+// --- E.5 - crash between snapshot rename and log truncate -------------------
 // (Specifically: the rotation completes step 3a but not 3b; or 3a+3b but not
 // 3c. Recovery yields the live set in both cases.)
 //
-// This is the "old log still present + new snapshot exists" transition —
+// This is the "old log still present + new snapshot exists" transition -
 // recovery's job is to replay snapshot then log.old, which is idempotent
 // for any REGISTER that pre-dates the snapshot.
 
@@ -264,7 +264,7 @@ func TestCatalogLogCrashBetweenSnapshotAndTruncate(t *testing.T) {
 	}
 
 	// Simulate a crash AFTER 3a (snapshot rename) but BEFORE 3b (log
-	// rename) — the live log is still in place, the snapshot is new.
+	// rename) - the live log is still in place, the snapshot is new.
 	cl.rotationStop = "post-3a"
 	if err := cl.rotateLog(); !errors.Is(err, errSimulatedCrash) {
 		t.Fatalf("rotation err=%v, want errSimulatedCrash", err)
@@ -283,7 +283,7 @@ func TestCatalogLogCrashBetweenSnapshotAndTruncate(t *testing.T) {
 	}
 }
 
-// --- E.6 — full crash matrix + concurrent append survives -------------------
+// --- E.6 - full crash matrix + concurrent append survives -------------------
 
 func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 	// Test every transition in the lifecycle's crash matrix. For each
@@ -299,7 +299,7 @@ func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 	//
 	// "Concurrently arrived" here means "arrived in the brief window
 	// where ingest could still see the OLD log fd before the rotation
-	// swapped it" — which under the WRITE LOCK should not happen in
+	// swapped it" - which under the WRITE LOCK should not happen in
 	// production (the lock blocks ingest for the duration of rotateLog).
 	// We exercise the more aggressive scenario where we crash with a
 	// dirty log to prove recovery still merges correctly.
@@ -315,7 +315,7 @@ func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 		{"post-3a", "old"},
 		{"post-3b", "old"}, // log was renamed to log.old; no new log yet.
 		// We treat this as "concurrent write attempted but had no
-		// target" — assert the prior records survive without the
+		// target" - assert the prior records survive without the
 		// concurrent one.
 		{"post-3c", "new"},
 		{"post-3d", "new"},
@@ -355,7 +355,7 @@ func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 			// the production writer would have targeted at this
 			// instant. For post-3a, the writer still has the old log
 			// fd, which is still named catalog.log. For post-3b, the
-			// log has been renamed to catalog.log.old — a writer with
+			// log has been renamed to catalog.log.old - a writer with
 			// the old fd would still be writing to that inode. For
 			// post-3c onward, the new log fd is live.
 			var targetFile string
@@ -415,10 +415,10 @@ func TestCatalogLogRotationCrashMatrix(t *testing.T) {
 
 func TestCatalogLogOrphanedTmpRecovery(t *testing.T) {
 	// Two scenarios:
-	//   a) .tmp exists, snapshot does NOT — writeSnapshot crashed
+	//   a) .tmp exists, snapshot does NOT - writeSnapshot crashed
 	//      mid-flight. Recovery removes the .tmp and proceeds with
 	//      whatever the log says.
-	//   b) .tmp exists, snapshot ALSO exists — rename succeeded but
+	//   b) .tmp exists, snapshot ALSO exists - rename succeeded but
 	//      dir-fsync didn't get to flush the tmp's directory-entry
 	//      removal. Recovery removes the .tmp; snapshot is authoritative.
 
@@ -458,7 +458,7 @@ func TestCatalogLogOrphanedTmpRecovery(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		// Promote it to .snapshot by hand (no rotate call here — we want
+		// Promote it to .snapshot by hand (no rotate call here - we want
 		// to leave a .tmp in place after).
 		if err := os.Rename(
 			filepath.Join(dir, catalogSnapshotTmpFileName),

@@ -9,7 +9,7 @@ import (
 // CardinalityGuard rejects entries that would blow up storage cardinality:
 // attrs-per-entry, attr-value length, and unique attr keys per service. Zero
 // for any limit disables that check. Per-service key sets grow without
-// eviction — fine for stable workloads, revisit with a sliding window if
+// eviction - fine for stable workloads, revisit with a sliding window if
 // services churn keys at deploy.
 type CardinalityGuard struct {
 	maxAttrsPerEntry int
