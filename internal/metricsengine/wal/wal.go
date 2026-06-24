@@ -22,7 +22,7 @@ const maxRecordSize = 16 << 20
 type RecordKind uint8
 
 const (
-	// KindSeries declares id → labels. Written once per series per WAL
+	// KindSeries declares id -> labels. Written once per series per WAL
 	// generation (between truncates), so samples don't repeat the label set.
 	KindSeries RecordKind = 1
 	// KindSample is one (id, type, timestamp, value) point.
@@ -68,7 +68,7 @@ type WAL struct {
 
 	// failed fail-stops the writer. After a failed fsync the kernel may have
 	// dropped the dirty pages without retrying (PostgreSQL's "fsyncgate"), and
-	// after a partial write the tail is torn — replay stops there, so records
+	// after a partial write the tail is torn - replay stops there, so records
 	// appended past it would be silently lost. Either way the durable state
 	// is unknowable; no further append may be acknowledged. Guarded by mu.
 	failed error
@@ -170,7 +170,7 @@ func (w *WAL) Sync() error {
 	return nil
 }
 
-// Binary payload layouts (framing — len[4]|crc[4] — is unchanged, so the
+// Binary payload layouts (framing - len[4]|crc[4] - is unchanged, so the
 // tolerant replay/repair logic applies to both formats):
 //
 //	series: kind[1] | uvarint id | uvarint nLabels | (uvarint len|name, uvarint len|value)*
@@ -450,7 +450,7 @@ func replayValid(path string, fn func(Record) error, repair bool) (RecoverStats,
 		record, err := decodeRecord(payload)
 		if err != nil {
 			// CRC matched but the payload does not decode: still treat as
-			// corruption rather than failing open — the alternative is a
+			// corruption rather than failing open - the alternative is a
 			// store that cannot start without manual surgery.
 			corrupt = true
 			break

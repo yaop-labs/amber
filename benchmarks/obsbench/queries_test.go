@@ -6,12 +6,12 @@ import (
 	"time"
 )
 
-// TestE2E_AmberQueryScenarios runs the full Q1–Q4 set against a real amber
+// TestE2E_AmberQueryScenarios runs the full Q1-Q4 set against a real amber
 // stack and pins the truths the harness depends on: deterministic instance
 // parameters, and Q4's count matching the dataset's known rare-token total.
 func TestE2E_AmberQueryScenarios(t *testing.T) {
 	const n = 2000
-	path := genDataset(t, n, 11) // RareTokenEvery=100 → 20 rare records
+	path := genDataset(t, n, 11) // RareTokenEvery=100 -> 20 rare records
 	stack, srv := startAmber(t)
 	target := TargetConfig{Kind: "amber", BaseURL: srv.URL, Protocol: "native"}
 
@@ -60,7 +60,7 @@ func TestE2E_AmberQueryScenarios(t *testing.T) {
 		}
 	}
 
-	// Same seed → identical instances and counts: a re-run must agree with
+	// Same seed -> identical instances and counts: a re-run must agree with
 	// itself, which is the equality gate's own sanity check.
 	again, err := RunQueries(context.Background(), target, opts)
 	if err != nil {

@@ -64,7 +64,7 @@ func TestBitPackedBeatsVarintOnSmallResiduals(t *testing.T) {
 	if len(packed) >= len(varint) {
 		t.Fatalf("packed %d bytes >= varint %d bytes on small residuals", len(packed), len(varint))
 	}
-	// 3 bits/value + width byte ≈ 376 bytes vs 1000.
+	// 3 bits/value + width byte ~ 376 bytes vs 1000.
 	if len(packed) > 400 {
 		t.Errorf("packed = %d bytes, expected ~376", len(packed))
 	}

@@ -77,7 +77,7 @@ func TestMeta_MigrateLocalPresent_FileMissing(t *testing.T) {
 }
 
 // TestMeta_RoundTrip_PreservesLocalPresent confirms that an explicit false
-// survives marshal/unmarshal — important because the field is a pointer
+// survives marshal/unmarshal - important because the field is a pointer
 // with omitempty.
 func TestMeta_RoundTrip_PreservesLocalPresent(t *testing.T) {
 	absent := false

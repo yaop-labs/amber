@@ -1,7 +1,7 @@
 package engine
 
 // Histogram (sketch) ingest: sketches share the engine's WAL, registry, flush
-// gate, and head lifecycle with scalar samples — one durability protocol for
+// gate, and head lifecycle with scalar samples - one durability protocol for
 // every signal shape.
 
 import (

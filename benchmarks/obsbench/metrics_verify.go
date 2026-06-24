@@ -11,7 +11,7 @@ import (
 )
 
 // CountQueryableMetricSamples returns the durable/queryable *scalar* sample
-// count — the metrics side of the loss-accounting gate (METHODOLOGY.md §4):
+// count - the metrics side of the loss-accounting gate (METHODOLOGY.md):
 // sent == acked == queryable before any number is recorded.
 //
 // Scalar samples only: every system stores one stored sample per scalar OTLP
@@ -33,7 +33,7 @@ func CountQueryableMetricSamples(ctx context.Context, target TargetConfig, from,
 }
 
 // amberMetricSampleCount reads the scalar store's sealed + buffered sample
-// counters from /api/v1/metrics/stats — exact and O(1).
+// counters from /api/v1/metrics/stats - exact and O(1).
 func amberMetricSampleCount(ctx context.Context, client *http.Client, target TargetConfig) (uint64, error) {
 	body, err := getBody(ctx, client, target, "/api/v1/metrics/stats")
 	if err != nil {

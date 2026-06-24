@@ -15,7 +15,7 @@ import (
 // ResidentGroupFunc receives one matching series with its group value resolved.
 type ResidentGroupFunc func(seriesID uint64, typ model.MetricType, groupValue string, timestamps, values []int64) error
 
-// ResidentScan is a selector resolved against one block's dict — reusable across
+// ResidentScan is a selector resolved against one block's dict - reusable across
 // the block's chunk section so the parallel range-step path can scan a
 // pre-read section once per series-partitioned worker without re-resolving.
 type ResidentScan struct {
@@ -52,13 +52,13 @@ func PrepareResidentScan(rb *block.ResidentBlock, selector index.Selector, opts 
 // Possible reports whether the block can contribute any series.
 func (rs *ResidentScan) Possible() bool { return rs.possible }
 
-// ReadChunkSection bulk-reads the block's chunk section (nil ⇒ oversized, use the
+// ReadChunkSection bulk-reads the block's chunk section (nil => oversized, use the
 // sequential path).
 func (rs *ResidentScan) ReadChunkSection(path string) ([]byte, error) {
 	return rs.rb.ReadChunkSection(path)
 }
 
-// ScanSection scans a pre-read section, restricted to series own accepts (nil ⇒
+// ScanSection scans a pre-read section, restricted to series own accepts (nil =>
 // all). Safe to call concurrently with the same read-only section.
 func (rs *ResidentScan) ScanSection(section []byte, own func(uint64) bool, fn ResidentGroupFunc) error {
 	if !rs.possible {
@@ -95,7 +95,7 @@ func buildResidentPredicates(rb *block.ResidentBlock, selector index.Selector) (
 			return nil, false
 		}
 		// matchLabels treats a missing label as a match only for negative ops
-		// (the "ok==false ⇒ continue" branch).
+		// (the "ok==false => continue" branch).
 		acceptMissing := matcher.Op == index.MatchNotEqual || matcher.Op == index.MatchNotRegexp
 		nameIdx := rb.NameIndex(matcher.Name)
 		if nameIdx < 0 {

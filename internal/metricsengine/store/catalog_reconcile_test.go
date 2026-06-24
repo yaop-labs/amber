@@ -12,7 +12,7 @@ import (
 // TestReconcileLastTouchFromBlocks proves the boot-time reconcile sets a
 // non-zero last-touch on series whose only evidence-of-life is on-disk
 // blocks. Without this the sweep would treat them as "never touched"
-// (lastTouch=0 sentinel from a bare Import) and never evict them —
+// (lastTouch=0 sentinel from a bare Import) and never evict them -
 // re-introducing the leak the eviction work is closing.
 func TestReconcileLastTouchFromBlocks(t *testing.T) {
 	dir := t.TempDir()
@@ -69,7 +69,7 @@ func TestReconcileLastTouchFromBlocks(t *testing.T) {
 		t.Fatalf("after second reconcile id=1 ts=%d want 1000 unchanged", ts)
 	}
 
-	// A later UpdateLastTouch with an OLDER ts must not regress either —
+	// A later UpdateLastTouch with an OLDER ts must not regress either -
 	// the monotonic-max contract holds across the reconcile and ingest
 	// paths together.
 	registry.UpdateLastTouch(1, 750)

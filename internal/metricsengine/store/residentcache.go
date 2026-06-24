@@ -4,9 +4,9 @@ import "github.com/yaop-labs/amber/internal/metricsengine/block"
 
 // residentCache is a byte-budgeted cache of compact resident block indexes
 // (block.ResidentBlock). It mirrors dirCache but holds the resident form, which
-// is ~3.5× smaller than a decoded Directory (~12 vs ~40 MiB for a 100k-series
+// is ~3.5x smaller than a decoded Directory (~12 vs ~40 MiB for a 100k-series
 // block), so every in-window block of a campaign-scale range-step query fits at
-// once — the directory decode that was ~43% of the qm2 query happens once per
+// once - the directory decode that was ~43% of the qm2 query happens once per
 // block instead of every query (see metrics-query-redesign.md, phase 2).
 //
 // All methods require the caller to hold the owning store's lock, like dirCache.

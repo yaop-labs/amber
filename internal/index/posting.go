@@ -15,7 +15,7 @@ import (
 //
 // Use this instead of a bitmap field when a field has near-unique values:
 // bitmap-per-value overhead dominates index size for high-cardinality fields,
-// whereas a posting list stores only the actual (key → ids) pairs.
+// whereas a posting list stores only the actual (key -> ids) pairs.
 //
 // On-disk layout:
 //
@@ -23,8 +23,8 @@ import (
 //	for each entry (sorted by key):
 //	  key[key_size] | id_count[4] | id[0..N][8 each]
 //
-// Lookup is a linear scan over entries; segments are small enough (≤100K
-// records, ≤a few thousand unique trace_ids) that binary search is not worth
+// Lookup is a linear scan over entries; segments are small enough (<=100K
+// records, <=a few thousand unique trace_ids) that binary search is not worth
 // the complexity. Add it if profiling shows this as a bottleneck.
 const (
 	postingMagic   = uint32(0x504C4958) // "PLIX"
@@ -64,7 +64,7 @@ type rawPair struct {
 	id  uint64
 }
 
-// PostingListBuilder accumulates (key → record IDs) pairs during a segment
+// PostingListBuilder accumulates (key -> record IDs) pairs during a segment
 // scan and produces a PostingList.
 type PostingListBuilder struct {
 	keySize int
@@ -174,7 +174,7 @@ func LoadPostingList(path string) (*PostingList, error) {
 	defer f.Close()
 	// Buffer the file: readPostingList does many small io.ReadFull calls (key,
 	// count, and each id separately), so an unbuffered *os.File turns one .pidx
-	// load into ~100k read syscalls — the dominant cost of a trace-id lookup.
+	// load into ~100k read syscalls - the dominant cost of a trace-id lookup.
 	return readPostingList(bufio.NewReaderSize(f, 1<<20))
 }
 

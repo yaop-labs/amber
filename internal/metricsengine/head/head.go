@@ -44,7 +44,7 @@ func (h *Head) Append(labels model.LabelSet, typ model.MetricType, timestamp int
 }
 
 // AppendWithID appends a sample for an already-resolved series ID, skipping
-// the registry lookup (the caller did it — and touched eviction bookkeeping —
+// the registry lookup (the caller did it - and touched eviction bookkeeping -
 // when it resolved the ID).
 func (h *Head) AppendWithID(id index.SeriesID, labels model.LabelSet, typ model.MetricType, timestamp int64, value int64) index.SeriesID {
 	h.mu.Lock()

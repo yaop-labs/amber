@@ -242,7 +242,7 @@ func MetricNamesForPaths(paths []string) ([]string, error) {
 }
 
 // MergeBlocks reads the given blocks and merges their series: grouped by
-// canonical labels (explicit series additionally by bounds — a series holds
+// canonical labels (explicit series additionally by bounds - a series holds
 // one bounds set), ticks sorted by timestamp, ticks older than cutoffMillis
 // dropped (0 disables the cutoff). Series IDs keep the first-seen entry ID.
 func MergeBlocks(paths []string, cutoffMillis int64) ([]ExpSeries, []ExplicitSeries, error) {

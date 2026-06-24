@@ -20,7 +20,7 @@ import (
 //
 // It replaces the fts-engine radix snapshot, which stored every posting as a
 // decimal-string DocID inside serialized tree nodes: ~38 MB on disk and
-// ~150 MB in memory per 100k-record segment, ~400 ms to parse — measured in
+// ~150 MB in memory per 100k-record segment, ~400 ms to parse - measured in
 // the first comparison run, where .fidx files were 92% of amber's storage
 // and the dominant share of its RSS. This format holds the same data in a
 // few MB, loads with a single linear pass, and searches by binary search
@@ -31,10 +31,10 @@ import (
 // time; multi-token queries AND their posting lists.
 type FTSIndex struct {
 	// Build-mode state, nil after seal or load. Unique tokens are
-	// deduplicated through a hash → entry-index map with byte-verified
+	// deduplicated through a hash -> entry-index map with byte-verified
 	// collision chains; token bytes live in one shared arena. The previous
 	// map[string]*postingBuilder cost four allocations per unique token
-	// (map key string, builder, its ids slice, map growth) — ~1M tokens per
+	// (map key string, builder, its ids slice, map growth) - ~1M tokens per
 	// 100k-record segment made the build state the dominant transient heap
 	// during seals. byHash has pointer-free keys and values, so the GC never
 	// scans it.
@@ -55,8 +55,8 @@ type FTSIndex struct {
 	// searched in place: fnv64a(token) sorted ascending and the parallel
 	// full entry ID, 8 bytes each. Colliding hashes stay adjacent and
 	// lookup returns all of them, so a 64-bit collision within a segment
-	// (~1M tokens → P ≈ 3e-8) can only surface one foreign record in a
-	// result, never lose one; accepted deliberately — the result-count
+	// (~1M tokens -> P ~ 3e-8) can only surface one foreign record in a
+	// result, never lose one; accepted deliberately - the result-count
 	// equality gate in benchmarks would flag it.
 	uniqHashes []byte // 8-byte big-endian hashes, sorted
 	uniqIDs    []byte // 4-byte big-endian ORDINALS (index into table), parallel
@@ -67,13 +67,13 @@ type FTSIndex struct {
 	// ordinals are dense 0..N-1, so delta-varint posting gaps shrink to ~1
 	// byte and a unique-token record fits in 4 bytes instead of 8. Lookups
 	// intersect in ordinal space (order-preserving, the table is sorted by
-	// ID) and map only the final ≤limit results back to real IDs, so the
+	// ID) and map only the final <=limit results back to real IDs, so the
 	// table is read on demand (pread when file-backed) and never inflates
-	// resident memory — amber trades disk for nothing on RSS here.
+	// resident memory - amber trades disk for nothing on RSS here.
 	table []uint64 // resident only between seal and Save (then file-backed)
 
 	// Loaded (file-backed) mode: the unique section and ordinal table are NOT
-	// resident — they are read with pread on demand. Explicit reads, not mmap,
+	// resident - they are read with pread on demand. Explicit reads, not mmap,
 	// on purpose: page faults would make tail latency depend on page-cache
 	// state and turn storage errors into SIGBUS process kills ("Are You Sure
 	// You Want to Use MMAP in Your DBMS?", CIDR 2022), while pread returns
@@ -368,8 +368,8 @@ func (f *FTSIndex) Search(_ context.Context, query string, limit int) ([]uint64,
 		return nil, nil
 	}
 
-	// Intersect in ordinal space (order-preserving — the table is sorted by ID),
-	// then map only the final ≤limit results back to entry IDs.
+	// Intersect in ordinal space (order-preserving - the table is sorted by ID),
+	// then map only the final <=limit results back to entry IDs.
 	var acc []uint64
 	for i, tok := range tokens {
 		ords := f.lookup(tok)
@@ -416,9 +416,9 @@ func (f *FTSIndex) lookup(token string) []uint64 {
 	return ords
 }
 
-// mapOrdinalsToIDs resolves ordinals to entry IDs via the table — resident for a
+// mapOrdinalsToIDs resolves ordinals to entry IDs via the table - resident for a
 // freshly sealed index, pread on demand once file-backed (so the table never
-// inflates resident memory). Only the final ≤limit results are mapped.
+// inflates resident memory). Only the final <=limit results are mapped.
 func (f *FTSIndex) mapOrdinalsToIDs(ords []uint64) ([]uint64, error) {
 	out := make([]uint64, len(ords))
 	if f.table != nil {
@@ -458,11 +458,11 @@ func (f *FTSIndex) mapOrdinalsToIDs(ords []uint64) ([]uint64, error) {
 	}
 	defer file.Close()
 
-	// One ranged read when the results are clustered (the common case — a query
+	// One ranged read when the results are clustered (the common case - a query
 	// returns the lowest ordinals of a posting, so the span is tight). If the
 	// results are sparse across the table (e.g. after an intersection), reading
 	// the whole span would pull far more than needed, so fall back to a pread per
-	// result — never worse than the per-result baseline either way.
+	// result - never worse than the per-result baseline either way.
 	span := int(maxOrd-minOrd) + 1
 	if span <= 8*len(ords) {
 		buf := make([]byte, span*8)
@@ -507,8 +507,8 @@ func intersectSorted(a, b []uint64) []uint64 {
 //	magic [4] | uvarint dictTokenCount
 //	per dict token, sorted: uvarint len | bytes | uvarint postingCount |
 //	                        uvarint blobLen | delta-varint ORDINALS
-//	uvarint uniqCount | uniqCount×8B BE sorted hashes | uniqCount×4B BE ordinals
-//	uvarint tableCount | tableCount×8B BE sorted entry IDs (ordinal -> id)
+//	uvarint uniqCount | uniqCountx8B BE sorted hashes | uniqCountx4B BE ordinals
+//	uvarint tableCount | tableCountx8B BE sorted entry IDs (ordinal -> id)
 //	crc32 IEEE over everything above [4, little-endian]
 //
 // AFT3 replaces AFT2's full 8-byte entry IDs with ordinals (positions in the
@@ -652,7 +652,7 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 			return nil, errors.New("fts: load index: token length out of range")
 		}
 		// Clone dictionary bytes out of the file buffer: retaining
-		// sub-slices would pin the whole file — including the unique
+		// sub-slices would pin the whole file - including the unique
 		// section, which deliberately stays on disk.
 		tok := string(r[:tl])
 		r = r[tl:]
@@ -677,7 +677,7 @@ func LoadFTSIndex(path string) (*FTSIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Unique section: uniqCount × (8B hash + 4B ordinal). Searched via pread;
+	// Unique section: uniqCount x (8B hash + 4B ordinal). Searched via pread;
 	// record its position only.
 	if uniqCount*12 > uint64(len(r)) {
 		return nil, errors.New("fts: load index: unique section out of range")

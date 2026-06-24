@@ -78,12 +78,12 @@ func TestStoreEvictionBoundaryEqualsBlockRetention(t *testing.T) {
 // block path).
 //
 // The predicate the codebase carries is documented at
-// internal/metricsengine/index/index.go:Sweep — "evict if lastTouch
+// internal/metricsengine/index/index.go:Sweep - "evict if lastTouch
 // is older than now-retention AND ts != 0". Empirically the boundary
 // behaviour at `lastTouch == now - retention` is "evictable" (per
 // Sweep's `lt > threshold ? skip : evict` branch, equivalent to
 // `lt <= threshold => evict`). Match the block side: DeleteBefore
-// drops a block whose `MaxTime < cutoffMillis` — strict less-than,
+// drops a block whose `MaxTime < cutoffMillis` - strict less-than,
 // boundary block STAYS. So:
 //   - block side: drops if MaxTime <  now-retention (boundary stays)
 //   - index side: evicts if lastTouch <= now-retention (boundary GOES)
@@ -92,8 +92,8 @@ func TestStoreEvictionBoundaryEqualsBlockRetention(t *testing.T) {
 // the block keeps data through the moment the series goes cold, so
 // the small window where index says "gone" + block says "here" is
 // covered by the query path that matches labels on the block
-// directory regardless of registry state. The opposite — block gone
-// while index keeps the series — would be the bad direction. Pinned
+// directory regardless of registry state. The opposite - block gone
+// while index keeps the series - would be the bad direction. Pinned
 // here so a refactor flipping either comparison doesn't go unnoticed.
 func TestStoreEvictionBoundaryShapeIsStable(t *testing.T) {
 	const retentionMs = int64(60_000)

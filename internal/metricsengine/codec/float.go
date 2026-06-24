@@ -11,11 +11,11 @@ import (
 // readings, SDK-rounded seconds, percentages): v == m / 10^e for a small
 // integer mantissa m. EncodeFloatValues detects the cheapest block-wide
 // exponent e, routes the mantissas through the existing int64 strategy race
-// (EncodeIntegerValues — residual/delta/dod × varint/bitpacked), and stores
-// the minority of non-conforming values (NaN, ±Inf, true binary floats,
+// (EncodeIntegerValues - residual/delta/dod x varint/bitpacked), and stores
+// the minority of non-conforming values (NaN, +/-Inf, true binary floats,
 // overflow at the chosen e) verbatim as positional exceptions.
 //
-// The round trip is exact for every input, including NaN bit patterns —
+// The round trip is exact for every input, including NaN bit patterns -
 // conformance is verified with the same division the decoder performs, and
 // non-conforming values bypass the decimal path entirely.
 //
@@ -23,11 +23,11 @@ import (
 // model/WAL/head/block is staged separately (see the metricsengine ROADMAP).
 
 // maxDecimalExp bounds the per-block exponent: 10^14 keeps mantissas of
-// magnitudes up to ~9·10^4 comfortably inside both float64 integer exactness
+// magnitudes up to ~9-10^4 comfortably inside both float64 integer exactness
 // checks and int64.
 const maxDecimalExp = 14
 
-// pow10 holds exactly-representable powers of ten (every 10^k for k ≤ 22 is
+// pow10 holds exactly-representable powers of ten (every 10^k for k <= 22 is
 // exact in float64).
 var pow10 = [maxDecimalExp + 1]float64{
 	1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14,
@@ -104,7 +104,7 @@ func EncodeFloatValues(values []float64) FloatEncoding {
 	// Evaluate every candidate exponent 0..maxNeeded: conforming values cost
 	// their mantissa varint length (a cheap, codec-agnostic proxy for the
 	// strategy race's input entropy), non-conforming ones a flat exception
-	// cost. A value with minimal exponent ev conforms at e ≥ ev only if the
+	// cost. A value with minimal exponent ev conforms at e >= ev only if the
 	// exact division still holds, so conformance is re-checked per candidate.
 	bestExp, bestCost := 0, math.MaxInt64>>1
 	for e := 0; e <= maxNeeded; e++ {

@@ -3,7 +3,7 @@ package index
 // Covering span index (.cidx): a seekable side structure that lets trace-summary
 // queries answer service[/operation/duration] searches WITHOUT decompressing row
 // blocks. For each service value it stores a column-strided projection of its
-// spans — (trace-ordinal, start, duration, status, operation, is-root) — in the
+// spans - (trace-ordinal, start, duration, status, operation, is-root) - in the
 // SAME sorted-id order as the BID3 service posting, plus per-segment trace_id and
 // operation dictionaries. The full spans stay in the row store; this is a derived
 // covering index, not a columnar layout. See traces-covering-index-design.md.
@@ -44,7 +44,7 @@ func coverDec() *zstd.Decoder {
 }
 
 // Projection is one service's decoded covering rows, parallel arrays in sorted-id
-// (≈ time) order. End is reconstructed as Start+Duration.
+// (~ time) order. End is reconstructed as Start+Duration.
 type Projection struct {
 	TraceOrd []uint32
 	Start    []int64 // unix nanos
@@ -238,7 +238,7 @@ func (b *CoverBuilder) Save(path string) error {
 }
 
 // encodeServiceBlob builds [crc32][zstd(SoA streams)] for one service's rows
-// (already id-sorted). The id stream is omitted — it comes from the BID3 posting.
+// (already id-sorted). The id stream is omitted - it comes from the BID3 posting.
 func encodeServiceBlob(rows []coverRow) []byte {
 	var body []byte
 	body = binary.AppendUvarint(body, uint64(len(rows)))

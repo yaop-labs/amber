@@ -85,7 +85,7 @@ func main() {
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	// W — Write throughput.
+	// W - Write throughput.
 	fmt.Println("W — Write throughput")
 	fmt.Println("--------------------")
 
@@ -158,7 +158,7 @@ func main() {
 	fmt.Printf("  throughput: %.0f rec/s\n", throughput)
 	fmt.Printf("  dropped:    %d\n\n", dropped)
 
-	// Wait for flush — Loki flushes chunks periodically.
+	// Wait for flush - Loki flushes chunks periodically.
 	// Hit the flush endpoint to force it.
 	fmt.Println("flushing Loki chunks...")
 	resp, err := client.Post(flagLoki+"/flush", "application/json", nil)
@@ -167,7 +167,7 @@ func main() {
 	}
 	time.Sleep(3 * time.Second)
 
-	// M — Storage footprint.
+	// M - Storage footprint.
 	fmt.Println("M — Storage and memory")
 	fmt.Println("----------------------")
 
@@ -198,7 +198,7 @@ func main() {
 	fmt.Printf("  wal:        %s\n", humanBytes(walBytes))
 	fmt.Printf("  loki VmRSS: %s (external process — see /proc)\n\n", humanBytes(int64(rss)))
 
-	// R — Read latency.
+	// R - Read latency.
 	fmt.Println("R — Read latency (100 iterations each)")
 	fmt.Println("---------------------------------------")
 

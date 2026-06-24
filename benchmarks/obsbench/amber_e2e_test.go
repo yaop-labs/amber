@@ -14,7 +14,7 @@ import (
 )
 
 // startAmber boots a real amber stack behind an httptest server, so the
-// builders are exercised against the actual ingest handlers — payload-format
+// builders are exercised against the actual ingest handlers - payload-format
 // drift fails here instead of silently producing zero-record benchmarks.
 func startAmber(t *testing.T) (*runtime.Stack, *httptest.Server) {
 	t.Helper()
@@ -65,7 +65,7 @@ func ingestIntoAmber(t *testing.T, protocol string) {
 
 	// Durability barrier, then count durable records the way the verify
 	// subcommand does (segment metadata, exact). TotalHits is unsuitable: it
-	// is a lower bound by design — heap-threshold skips drop segments and
+	// is a lower bound by design - heap-threshold skips drop segments and
 	// blocks that cannot reach the top-k result.
 	if err := stack.Batcher.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)

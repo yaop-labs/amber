@@ -127,7 +127,7 @@ func TestIngestRateCap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 500 records at 1000 rec/s should take ~0.5s; assert ≥ 0.35s so the
+	// 500 records at 1000 rec/s should take ~0.5s; assert >= 0.35s so the
 	// limiter is provably engaged without making the test timing-fragile.
 	start := time.Now()
 	res, err := Ingest(context.Background(), "test", TargetConfig{

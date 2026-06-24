@@ -21,7 +21,7 @@ import (
 // completed. Each event lands on a bounded queue; workers drain it and
 // record latency = now(at completion) - Ti. If the binary stalls, the
 // queue back-pressures the scheduler and stall events accumulate proper
-// latency — they don't disappear from the dataset.
+// latency - they don't disappear from the dataset.
 //
 // A common bug: latency = now(at completion) - now(at send dispatch).
 // That hides the queueing delay caused by the stall; the binary looks
@@ -98,7 +98,7 @@ func (g *generator) Run(ctx context.Context) runResult {
 
 	// Scheduler. Intended-send-time Ti = startWall + tick * reqInterval.
 	// rate is REQUESTS per second, so reqInterval = 1/rate. Total samples/sec
-	// = rate × batch — this matches how a real OTLP collector pushes (one
+	// = rate x batch - this matches how a real OTLP collector pushes (one
 	// HTTP POST per batch, batch sized by collector config). We do NOT
 	// divide rate by batch internally because then the schedule would only
 	// fire (rate/batch) ticks/sec and absolute throughput in the report
@@ -149,7 +149,7 @@ func (g *generator) Run(ctx context.Context) runResult {
 			g.sent.Add(uint64(samplesPerReq))
 		default:
 			// Queue full: binary is stalling. We record the drop but do
-			// NOT block the scheduler — blocking re-introduces the CO
+			// NOT block the scheduler - blocking re-introduces the CO
 			// bug from a different angle. The drop count itself is a
 			// signal that the binary is past its knee.
 			g.queueDrops.Add(uint64(samplesPerReq))
@@ -234,7 +234,7 @@ func (g *generator) churnLoop(ctx context.Context, endWall time.Time) {
 	}
 }
 
-// --- OTLP JSON shape (reused — and simpler — than cmd/loadgen since this
+// --- OTLP JSON shape (reused - and simpler - than cmd/loadgen since this
 // harness does not need to mix traces/logs). We emit one batch per request,
 // covering --batch samples across whatever series we sampled. service.name
 // goes on Resource so amber's grouping path is exercised.
@@ -386,7 +386,7 @@ func (g *generator) buildOne(lbl seriesLabels, kind metricKind, tsStr string, rn
 }
 
 // zipfRank returns a series index in [0, n) with heavier weight on small
-// indices. Inverse transform on a u^0.6 distribution — heavy head, long
+// indices. Inverse transform on a u^0.6 distribution - heavy head, long
 // tail. Not a real Zipf, just a smooth skew good enough for "hot core +
 // tail" workloads.
 func zipfRank(n int, rng *rand.Rand) int {

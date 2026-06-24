@@ -82,7 +82,7 @@ func TestIntersectSortedGallopMatchesLinear(t *testing.T) {
 }
 
 // BenchmarkIntersectSortedSkewed mirrors the span case: a small posting (one
-// operation) galloped through a huge one (a whole service ≈ 1/N of all spans).
+// operation) galloped through a huge one (a whole service ~1/N of all spans).
 func BenchmarkIntersectSortedSkewed(b *testing.B) {
 	rng := rand.New(rand.NewSource(7))
 	large := sortedSet(rng, 4_000_000, 36_000_000)

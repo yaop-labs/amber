@@ -6,7 +6,7 @@ package query
 // per-trace accumulator and early-terminates once it has enough traces. Because
 // a trace's spans are time-local (emitted within seconds), the newest traces
 // live in the most recent segment or two, so this reads ~1-2 segments' tiny
-// projections instead of ~10 — the path from ~0.5s to tens of ms. The row scan
+// projections instead of ~10 - the path from ~0.5s to tens of ms. The row scan
 // remains the fallback for segments without a .cidx (active/legacy).
 
 import (
@@ -167,7 +167,7 @@ func (e *Executor) coverFold(ci *index.CoverIndex, q *SpanQuery, acc map[model.T
 		if err != nil {
 			return err
 		}
-		// Rows are id-sorted (≈ start asc); walk reverse for newest-first.
+		// Rows are id-sorted (~ start asc); walk reverse for newest-first.
 		var ords []uint32
 		var rows []int
 		for i := p.Len() - 1; i >= 0; i-- {

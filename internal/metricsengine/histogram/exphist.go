@@ -258,7 +258,7 @@ func MergeAll(hists []*ExponentialHistogram) *ExponentialHistogram {
 // final MergeAll. acc==nil starts a fresh owned copy (h is the right scale until
 // a coarser sketch arrives); h is never mutated. Merge is commutative and
 // associative and downscaling is monotonic ((x>>a)>>b == x>>(a+b)), so folding
-// is bucket-identical to MergeAll over the same inputs — only the peak memory
+// is bucket-identical to MergeAll over the same inputs - only the peak memory
 // differs (O(1) accumulator vs O(all sketches)).
 func foldExp(acc, h *ExponentialHistogram) *ExponentialHistogram {
 	if h == nil {

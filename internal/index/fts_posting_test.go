@@ -52,7 +52,7 @@ func TestFTSIndex_SnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFTSIndex_BuildSpeed is a coarse guard against the O(docs²) addDoc
+// TestFTSIndex_BuildSpeed is a coarse guard against the O(docs^2) addDoc
 // regression: 50k UUID-bearing bodies must index in seconds, not minutes.
 func TestFTSIndex_BuildSpeed(t *testing.T) {
 	if testing.Short() {
@@ -106,7 +106,7 @@ func TestFTSIndex_HashCollisionChain(t *testing.T) {
 	idx.arena = []byte("aaaabbbb")
 	idx.entries = []ftsBuildEntry{
 		{firstID: 1, tokOff: 0, tokLen: 4, next: -1}, // "aaaa"
-		{firstID: 2, tokOff: 4, tokLen: 4, next: 0},  // "bbbb" → chains to "aaaa"
+		{firstID: 2, tokOff: 4, tokLen: 4, next: 0},  // "bbbb" -> chains to "aaaa"
 	}
 	h := tokenHash("aaaa")
 	idx.byHash = map[uint64]int32{h: 1}
@@ -121,7 +121,7 @@ func TestFTSIndex_HashCollisionChain(t *testing.T) {
 	}
 
 	idx.seal()
-	// "aaaa" is now df==2 → dictionary; "bbbb" stays unique under h.
+	// "aaaa" is now df==2 -> dictionary; "bbbb" stays unique under h.
 	if len(idx.tokens) != 1 || idx.tokens[0] != "aaaa" {
 		t.Fatalf("dict = %v, want [aaaa]", idx.tokens)
 	}
@@ -230,7 +230,7 @@ func TestFTSIndex_SizeOnDisk(t *testing.T) {
 func TestFTSIndex_UniqueSectionPreadPath(t *testing.T) {
 	idx := NewFTSIndex()
 	ctx := context.Background()
-	// "deadbeefcafe" appears once (df==1 → unique section); "timeout" twice
+	// "deadbeefcafe" appears once (df==1 -> unique section); "timeout" twice
 	// (dictionary).
 	_ = idx.Index(ctx, 100, "timeout while calling deadbeefcafe")
 	_ = idx.Index(ctx, 200, "timeout retrying")

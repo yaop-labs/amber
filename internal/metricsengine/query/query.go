@@ -840,7 +840,7 @@ func RateSummaryForSamples(seriesID uint64, timestamps []int64, values []int64, 
 // step for one series, reusing buf's scratch across calls so a scan over many
 // series allocates the summary slice and prefix arrays once. The returned
 // slice aliases buf and is only valid until the next call with the same buf;
-// callers must consume it before reusing — the range-step scan does. A nil buf
+// callers must consume it before reusing - the range-step scan does. A nil buf
 // allocates fresh.
 func RateWindowSummariesForStepsReuse(buf *RateStepBuf, seriesID uint64, timestamps []int64, values []int64, steps []int64, window time.Duration, opts Options) ([]RateSummary, error) {
 	return rateSummariesForSteps(buf, seriesID, timestamps, values, steps, window, opts, 1)
@@ -850,7 +850,7 @@ func RateWindowSummariesForStepsReuse(buf *RateStepBuf, seriesID uint64, timesta
 // scan over many series allocates the summary slice and the counter/stale
 // prefix arrays once instead of per series. It is not safe for concurrent use;
 // the range-step scan calls into it sequentially. A nil *RateStepBuf means
-// "allocate fresh" — the behavior for one-shot callers.
+// "allocate fresh" - the behavior for one-shot callers.
 type RateStepBuf struct {
 	out         []RateSummary
 	incPrefix   []int64

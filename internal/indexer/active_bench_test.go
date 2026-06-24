@@ -1,7 +1,7 @@
 package indexer
 
 // ActiveIndex.IndexLogEntries benchmarks. White-box so we can reset the
-// internal bitmap between iterations — otherwise the bitmap grows unboundedly
+// internal bitmap between iterations - otherwise the bitmap grows unboundedly
 // across b.N iterations and we end up measuring memory pressure on the
 // roaring backing store, not the per-batch cost.
 //
@@ -52,7 +52,7 @@ func setupActiveIndex(b *testing.B) *ActiveIndex {
 	}
 	b.Cleanup(func() { mgr.Close(); spanMgr.Close() })
 
-	// IndexLogEntries calls ensure() which calls mgr.ActiveSegmentMeta() —
+	// IndexLogEntries calls ensure() which calls mgr.ActiveSegmentMeta() -
 	// that returns ok=false until at least one record exists. Write one
 	// throwaway record so an active segment exists.
 	if err := mgr.WriteBatch([]storage.BatchItem{{Data: []byte("seed"), TS: time.Now().UnixNano()}}); err != nil {

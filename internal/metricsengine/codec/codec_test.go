@@ -86,7 +86,7 @@ func TestConstantValueEncoding(t *testing.T) {
 // property: encode-all-keep-min is provably never worse than any
 // single strategy in the candidate set. Pinning it as a test makes
 // the property a contract the codec must keep even if a future
-// strategy is added — adding a strategy to candidates can only ever
+// strategy is added - adding a strategy to candidates can only ever
 // shrink the chosen payload, never grow it.
 //
 // The property:
@@ -100,7 +100,7 @@ func TestConstantValueEncoding(t *testing.T) {
 //	    )
 //
 // (Constant inputs are special-cased upstream so they encode to
-// zero-byte payloads — covered by TestConstantValueEncoding above.)
+// zero-byte payloads - covered by TestConstantValueEncoding above.)
 //
 // Inputs span the four real-world shapes the codec exists to absorb:
 // monotonic counters (delta wins), gauges with low-frequency jitter
@@ -161,7 +161,7 @@ func TestEncodeIntegerValuesDominatesEveryStrategy(t *testing.T) {
 
 			// Round-trip property: every selected strategy must
 			// decode back to the original input. Without this the
-			// dominance check is meaningless — a strategy that
+			// dominance check is meaningless - a strategy that
 			// encodes to zero bytes by losing data would "win".
 			decoded, err := DecodeIntegerValues(chosen)
 			if err != nil {

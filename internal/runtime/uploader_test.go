@@ -139,7 +139,7 @@ func TestUploader_RetriesAfterFailure(t *testing.T) {
 }
 
 func TestBackoffDelay_BoundsAndJitter(t *testing.T) {
-	// Attempt 1: roughly uploadBackoffInitial ± 25%.
+	// Attempt 1: roughly uploadBackoffInitial +/- 25%.
 	for i := 0; i < 100; i++ {
 		d := backoffDelay(1)
 		if d < uploadBackoffInitial*3/4 || d > uploadBackoffInitial*5/4 {

@@ -7,10 +7,10 @@ import (
 )
 
 // latencyHist is a log-spaced histogram for nanosecond durations. We pick
-// concrete bucket edges from 1 µs to 60 s, ~6 buckets/decade. That's coarse
+// concrete bucket edges from 1 us to 60 s, ~6 buckets/decade. That's coarse
 // vs HDRHistogram but enough for p50/p99/p999/max reporting at the precision
 // the load harness needs (a few percent on quantile values). The hot path
-// inserts via a binary search on a sorted edges slice — no allocations.
+// inserts via a binary search on a sorted edges slice - no allocations.
 //
 // All operations are lock-free using atomics for the counts; the bucket
 // search is purely arithmetic. We avoid contention by sharding internally:
@@ -18,8 +18,8 @@ import (
 // merge shards into a single snapshot.
 
 const (
-	// 1 µs to 60 s, exponential. Edges generated lazily on first use.
-	latencyMinNs     = 1_000          // 1 µs
+	// 1 us to 60 s, exponential. Edges generated lazily on first use.
+	latencyMinNs     = 1_000          // 1 us
 	latencyMaxNs     = 60_000_000_000 // 60 s
 	bucketsPerDecade = 6
 )

@@ -39,10 +39,10 @@ type Engine struct {
 	// read side from WAL enqueue through the head update; flush holds the
 	// write side from snapshot through WAL truncate. Without it a sample
 	// could be acked (WAL fsynced), miss the flush snapshot, have its WAL
-	// record truncated, and survive only in the head — i.e. an acked sample
+	// record truncated, and survive only in the head - i.e. an acked sample
 	// lost on the next crash.
 	flushGate sync.RWMutex
-	// gateHeld tracks the Prepare→Commit/Abort pairing so releasing is
+	// gateHeld tracks the Prepare->Commit/Abort pairing so releasing is
 	// idempotent and a Commit without a Prepare cannot unlock an unheld gate.
 	gateHeld bool
 	gateMu   sync.Mutex
@@ -227,7 +227,7 @@ func (e *Engine) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 const maxScaledFloat = float64(math.MaxInt64)
 
 // AppendScaledFloat stores a float64 as round(value*scale) in the int64
-// value model. Values smaller than 1/scale collapse to 0; NaN, ±Inf, and
+// value model. Values smaller than 1/scale collapse to 0; NaN, +/-Inf, and
 // values whose scaled form overflows int64 are rejected instead of being
 // stored as garbage.
 func (e *Engine) AppendScaledFloat(labels model.LabelSet, typ model.MetricType, timestamp int64, value float64, scale int64) (index.SeriesID, error) {
@@ -351,7 +351,7 @@ func (e *Engine) Registry() *index.Registry {
 }
 
 // WALRecoveryStats reports what the open-time WAL replay found. A non-zero
-// TruncatedBytes means a corrupt or torn tail was dropped — worth surfacing
+// TruncatedBytes means a corrupt or torn tail was dropped - worth surfacing
 // as a metric or log line by the embedding layer.
 func (e *Engine) WALRecoveryStats() wal.RecoverStats {
 	return e.walRecovery

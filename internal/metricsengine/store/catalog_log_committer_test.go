@@ -31,7 +31,7 @@ func TestCatalogLogLostRegisterRecoveredFromBlocks(t *testing.T) {
 	}
 
 	// Step 2: a manifest that points at the block. The catalog log
-	// stays empty — simulates "REGISTER never fsync'd before crash".
+	// stays empty - simulates "REGISTER never fsync'd before crash".
 	manifest := Manifest{Blocks: []BlockMeta{{
 		Path:        blockName,
 		MinTime:     1000,
@@ -77,7 +77,7 @@ func TestCatalogLogLostRegisterRecoveredFromBlocks(t *testing.T) {
 // tail didn't, AND the rebuild branch's "len(catalog.Series) == 0" guard
 // skips the rebuild. Without the reconcile's resurrect-by-labels path,
 // the block's series would only be reachable by labels-on-block-directory
-// — but the registry wouldn't track it and the active-series gauge would
+// - but the registry wouldn't track it and the active-series gauge would
 // undercount.
 func TestCatalogLogLostRegisterByBlockReconcileAlone(t *testing.T) {
 	dir := t.TempDir()
@@ -146,7 +146,7 @@ func TestCatalogLogLostRegisterByBlockReconcileAlone(t *testing.T) {
 }
 
 // TestCatalogLogCommitterBatchesFsyncs is a basic smoke test for the
-// group-commit committer — proves Append returns successfully and the
+// group-commit committer - proves Append returns successfully and the
 // records land durably. Doesn't try to count fsyncs (that's an
 // observation, not a contract); the real perf signal is the post-fix
 // control_3a run.
@@ -180,7 +180,7 @@ func TestCatalogLogCommitterBatchesFsyncs(t *testing.T) {
 }
 
 // TestCatalogLogCommitterRecoversAcrossReopen catches the regression
-// where the committer's pending writes don't get flushed by Close —
+// where the committer's pending writes don't get flushed by Close -
 // would manifest as the last few REGISTERs being absent after restart.
 func TestCatalogLogCommitterRecoversAcrossReopen(t *testing.T) {
 	dir := t.TempDir()

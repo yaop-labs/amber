@@ -16,7 +16,7 @@ import (
 //
 // Sets are plain sorted []uint64, not roaring bitmaps: entry IDs derive from
 // ULIDs, whose high bits are millisecond timestamps, so roaring64 degraded
-// to one container per handful of IDs — in the first comparison run the
+// to one container per handful of IDs - in the first comparison run the
 // parsed .bidx bitmaps were 76% of amber's live heap and 82% of all live
 // objects (9.9M roaring containers for ~5M records). Sorted slices hold the
 // same sets in a few flat allocations and intersect/union by merge.
@@ -268,21 +268,21 @@ func (m *MultiFieldIndex) FilterAny(field string, values []string) []uint64 {
 	return result
 }
 
-// IntersectSorted returns the sorted intersection in a fresh slice — inputs
+// IntersectSorted returns the sorted intersection in a fresh slice - inputs
 // are often shared cache state and must not be mutated.
 //
 // A plain linear merge costs O(len(a)+len(b)), which walks the larger set in
 // full even when the smaller set is tiny. Span postings are highly skewed (a
-// single-service trace means one service's posting ≈ 1/N of all spans), so when
+// single-service trace means one service's posting ~1/N of all spans), so when
 // the sets differ a lot in size we gallop the small set through the large one in
-// O(len(small)·log len(large)) instead. Balanced sizes stay on the linear merge,
+// O(len(small)-log len(large)) instead. Balanced sizes stay on the linear merge,
 // which is faster there and has no binary-search overhead.
 func IntersectSorted(a, b []uint64) []uint64 {
 	if len(b) < len(a) {
 		a, b = b, a
 	}
 	// a is the smaller set. Gallop only when b dwarfs a enough that
-	// len(a)·log2(len(b)) beats len(a)+len(b); the 8× gate is conservative.
+	// len(a)-log2(len(b)) beats len(a)+len(b); the 8x gate is conservative.
 	if len(a) > 0 && len(b) >= len(a)*8 {
 		return intersectGalloping(a, b)
 	}
@@ -305,7 +305,7 @@ func IntersectSorted(a, b []uint64) []uint64 {
 
 // intersectGalloping intersects a sorted small set a into a sorted large set b
 // by exponential+binary search, advancing the cursor in b so total work is
-// O(len(a)·log len(b)). a must be the smaller set.
+// O(len(a)-log len(b)). a must be the smaller set.
 func intersectGalloping(a, b []uint64) []uint64 {
 	out := make([]uint64, 0, len(a))
 	j := 0
@@ -372,14 +372,14 @@ func UnionSorted(a, b []uint64) []uint64 {
 
 // On-disk formats:
 //
-//	"BIDX" — legacy roaring serialization. Rejected on load (rebuild/scan).
-//	"BID2" — per field/value delta-varint postings, trailing whole-file CRC.
+//	"BIDX" - legacy roaring serialization. Rejected on load (rebuild/scan).
+//	"BID2" - per field/value delta-varint postings, trailing whole-file CRC.
 //	         Still read for back-compat, no longer written.
-//	"BID3" — seekable: a postings region (each blob = CRC32 + count + deltas)
-//	         followed by a directory (field → value → blob offset+length) and a
+//	"BID3" - seekable: a postings region (each blob = CRC32 + count + deltas)
+//	         followed by a directory (field -> value -> blob offset+length) and a
 //	         12-byte footer (dirOffset:u64, fileCRC:u32). A reader can pull one
 //	         field+value posting with a directory lookup and a single pread,
-//	         instead of decoding the whole index — see SeekableBitmapIndex. The
+//	         instead of decoding the whole index - see SeekableBitmapIndex. The
 //	         span query path consumed ~34% of QT2/QT3 CPU re-parsing full .bidx
 //	         files on every query (a 32-slot cache vs 361 segments); BID3 reads
 //	         only the postings a query actually needs.

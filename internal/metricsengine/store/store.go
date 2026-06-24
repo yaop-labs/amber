@@ -270,7 +270,7 @@ func (s *Store) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 }
 
 // AppendScaledFloat appends a float64 as round(value*scale) in the int64 value
-// model, rejecting NaN, ±Inf, and values that overflow at the given scale.
+// model, rejecting NaN, +/-Inf, and values that overflow at the given scale.
 func (s *Store) AppendScaledFloat(labels model.LabelSet, typ model.MetricType, timestamp int64, value float64, scale int64) (index.SeriesID, error) {
 	if err := s.ensureCatalog([]model.LabelSet{labels}); err != nil {
 		return 0, err
@@ -350,12 +350,12 @@ func (s *Store) ensureCatalog(labelSets []model.LabelSet) error {
 		registered = append(registered, liveSeries{ID: id, Labels: labels})
 	}
 	// Persist to the append-only catalog log. INDEX_EVICTION_SPEC_v0
-	// §2: REGISTER per new series, O(1) per add. Replaces the legacy
-	// JSON saveCatalog rewrite (which was O(N) per add under s.mu —
-	// the catalog-mutex bottleneck identified in loadtest_v0 §4).
+	// REGISTER per new series, O(1) per add. Replaces the legacy
+	// JSON saveCatalog rewrite (which was O(N) per add under s.mu -
+	// the catalog-mutex bottleneck identified in loadtest_v0).
 	// loadCatalog (JSON) is still read at boot as a rollback-safety
 	// fallback for stores that pre-date 3a. The whole batch rides one
-	// commit wait — per-series waits collapse ingest when a batch
+	// commit wait - per-series waits collapse ingest when a batch
 	// introduces thousands of series (metrics bench, 2026-06-12).
 	if s.catalogLog != nil {
 		if err := s.catalogLog.AppendRegisterBatch(registered); err != nil {
@@ -840,7 +840,7 @@ type blockTimeRange struct {
 // blocksAndRangesForQueryLocked returns the matched block paths and, when the
 // manifest drives the query, each block's stored time range (aligned with
 // paths). The ranges let range-step queries decide from metadata alone whether
-// a step window can straddle a block boundary — i.e. whether to run the streamed
+// a step window can straddle a block boundary - i.e. whether to run the streamed
 // exact path instead of the per-step summary pass. ranges is nil for the glob
 // fallback (no manifest), where callers keep the summary path's own check.
 func (s *Store) blocksAndRangesForQueryLocked(selector index.Selector, opts query.Options) ([]string, []blockTimeRange, error) {
@@ -884,7 +884,7 @@ func (s *Store) blocksAndRangesForQueryLocked(selector index.Selector, opts quer
 // blockWindowsCanStraddle reports whether a range-step window of the given
 // length can span two of these blocks. When it can, a continuous series'
 // per-step summaries from adjacent blocks would have to be merged across the
-// boundary — which the speculative summary pass detects only after decoding
+// boundary - which the speculative summary pass detects only after decoding
 // every in-window block to compute per-step windows, then discards for the
 // exact path. At campaign scale (100k series, ~15 in-window blocks) that summary
 // pass is slower than going straight to the streamed exact path. This predicate
@@ -1169,7 +1169,7 @@ func (s *Store) RateByLabel(selector index.Selector, opts query.Options, label s
 		return s.rateByLabelExact(selector, opts, label)
 	}
 	// Instant rate (qm1/qm4) runs on the resident index, the same compact form
-	// the range-step path builds — so a mixed rate workload populates only the
+	// the range-step path builds - so a mixed rate workload populates only the
 	// resident cache instead of also filling the directory cache for the same
 	// blocks. Each series is assembled once across all in-window blocks and its
 	// rate computed exactly, which subsumes the old summary-merge + overlap
@@ -1431,8 +1431,8 @@ func (s *Store) Stats() (Stats, error) {
 			continue
 		}
 		// Legacy manifest entry without sample_count: one directory read.
-		// Loading every directory here is what Stats must never go back to —
-		// 100k-series directories × all blocks blew the heap through the
+		// Loading every directory here is what Stats must never go back to -
+		// 100k-series directories x all blocks blew the heap through the
 		// soft memory limit and a stats call took minutes of GC assist.
 		dir, err := s.readDirectory(path)
 		if err != nil {
@@ -1800,7 +1800,7 @@ type groupedRateSeries struct {
 
 // collectRangeStepSeriesGrouped is the resident-index range-step collector. It
 // reads each in-window block's compact resident index (built once, cached) and
-// scans matching series by dict code, resolving the group value from the dict —
+// scans matching series by dict code, resolving the group value from the dict -
 // eliminating the per-query directory decode and the per-series label-string
 // allocation that dominated the campaign range-step query.
 func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Selector, opts query.Options, groupLabel string) (map[uint64]*groupedRateSeries, error) {
@@ -1880,7 +1880,7 @@ type headRangeStepMatch struct {
 // reduces them into a thread-local accumulator; the accumulators merge at the
 // end. This parallelises the residual cost Phase 2 left CPU-bound (chunk decode +
 // per-series rate math) without the per-block sample duplication that made the
-// earlier block-parallel attempt GC-bound — a series lives in exactly one worker,
+// earlier block-parallel attempt GC-bound - a series lives in exactly one worker,
 // so total sample memory matches the sequential path. ok=false signals the caller
 // to use the sequential path (a block too large for an in-memory section).
 func parallelRangeStepReduce[A any](
@@ -2201,7 +2201,7 @@ func sampleMatchesOptions(timestamp int64, value int64, opts query.Options) bool
 
 func (s *Store) collectRangeStepSummaries(paths []string, selector index.Selector, opts query.Options, steps []int64, window time.Duration) (map[uint64]*rangeStepRateSeries, error) {
 	grouped := make(map[uint64]*rangeStepRateSeries)
-	// One scratch buffer reused across every series of every block — the scan
+	// One scratch buffer reused across every series of every block - the scan
 	// callbacks run sequentially, so rateSummariesForSteps stops allocating a
 	// fresh summary/prefix set per series (the qm2 hotspot).
 	buf := &query.RateStepBuf{}
@@ -2294,7 +2294,7 @@ func addIncreaseSummarySteps(out []query.IntStep, series *rangeStepRateSeries, g
 
 func preferRangeStepSummaries(stepCount int, blockCount int, headSeries int) bool {
 	// Shares query.SummaryStepCeiling with the planner so Explain matches the
-	// path that actually runs. Beyond the ceiling the steps × series summary
+	// path that actually runs. Beyond the ceiling the steps x series summary
 	// map outgrows the exact materialization it would replace.
 	return stepCount <= query.SummaryStepCeiling && blockCount > 1 && headSeries == 0
 }

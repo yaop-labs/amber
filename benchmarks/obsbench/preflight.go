@@ -17,7 +17,7 @@ type PreflightResult struct {
 	Note  string
 }
 
-// Preflight enforces the workstation rules of METHODOLOGY.md §2: enough
+// Preflight enforces the workstation rules of METHODOLOGY.md: enough
 // available memory and disk, swap off, performance governor. dataDir is the
 // filesystem the systems under test will write to.
 func Preflight(dataDir string) []PreflightResult {

@@ -15,7 +15,7 @@ import (
 //
 // Varint floors at 1 byte per non-zero value; packing goes below it whenever
 // residuals are small and uniform (the common case for regular telemetry).
-// A single outlier inflates width for the whole stream — the strategy race
+// A single outlier inflates width for the whole stream - the strategy race
 // in EncodeIntegerValues keeps the varint candidate around for exactly that
 // case, so packing never has to handle exceptions itself.
 

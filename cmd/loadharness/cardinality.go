@@ -9,7 +9,7 @@ import (
 
 // catalog holds the active series population: a stable subset whose labels
 // never change, plus an ephemeral subset whose labels rotate on demand
-// (Rotate()). Series are addressable by integer index — the generator picks
+// (Rotate()). Series are addressable by integer index - the generator picks
 // indices according to a Zipfian-ish skew, then dereferences here. Reads
 // from the hot generator path are lock-free via atomic.Pointer; rotations
 // briefly take a write lock to swap in a new ephemeral slice.

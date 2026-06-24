@@ -17,8 +17,8 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
-// Trace ingest runner: rate-capped continuous OTLP push (METHODOLOGY.md §5,
-// T1). Every system under test accepts the same OTLP protobuf payload — the
+// Trace ingest runner: rate-capped continuous OTLP push (METHODOLOGY.md,
+// T1). Every system under test accepts the same OTLP protobuf payload - the
 // same-client fairness baseline; only the mount path differs per system.
 //
 // Unlike the metrics runner (tick-driven, one sample per series per tick), a

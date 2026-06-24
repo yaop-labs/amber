@@ -10,7 +10,7 @@ const (
 	TimestampStrategyDeltaOfDelta TimestampStrategy = iota + 1
 	TimestampStrategyRegular
 	// TimestampStrategyDeltaOfDeltaPacked carries the same delta-of-delta
-	// stream with a fixed-width bit-packed payload (bitpack.go) — wins on
+	// stream with a fixed-width bit-packed payload (bitpack.go) - wins on
 	// jittered-but-bounded scrape grids where every residual is small.
 	TimestampStrategyDeltaOfDeltaPacked
 )
@@ -80,7 +80,7 @@ func EncodeTimestamps(timestamps []int64) TimestampEncoding {
 	// Packed candidate: transformed[0] (absolute first timestamp) and
 	// transformed[1] (first delta) would poison the fixed width, so they ride
 	// in the Base/Step fields and only the dod residuals are packed.
-	// isRegular returns true for len ≤ 2, so this branch always has ≥ 3.
+	// isRegular returns true for len <= 2, so this branch always has >= 3.
 	packed := EncodeBitPacked(transformed[2:])
 	if len(packed) < len(varint) {
 		return TimestampEncoding{

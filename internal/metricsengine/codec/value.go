@@ -57,7 +57,7 @@ func valueBaseStrategy(s ValueStrategy) (ValueStrategy, bool) {
 }
 
 // ValueEncoding is the encoded form of one series' integer values. Base holds
-// the residual mean, the constant value, or — for packed delta strategies —
+// the residual mean, the constant value, or - for packed delta strategies -
 // the stream's absolute first element; Payload holds the transformed remainder.
 type ValueEncoding struct {
 	Strategy ValueStrategy
@@ -262,7 +262,7 @@ func deltaTransform(values []int64) valueTransform {
 }
 
 // deltaOfDeltaTransform keeps values[0] and the first delta verbatim, then the
-// difference between each consecutive delta — near-zero for evenly spaced data.
+// difference between each consecutive delta - near-zero for evenly spaced data.
 func deltaOfDeltaTransform(values []int64) valueTransform {
 	transformed := make([]int64, len(values))
 	switch len(values) {

@@ -152,7 +152,7 @@ func TestWALRedeclaresSeriesAfterFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Fresh registry — labels must come from the WAL's own series records.
+	// Fresh registry - labels must come from the WAL's own series records.
 	e2, err := Open(Options{WALPath: walPath})
 	if err != nil {
 		t.Fatal(err)

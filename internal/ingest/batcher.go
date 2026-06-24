@@ -90,7 +90,7 @@ func newKindMetrics(kind string) kindMetrics {
 }
 
 // dropCardinality dispatches a guard.Check return string to the right
-// counter. Mirrors the reason strings defined in cardinality.go — keep in
+// counter. Mirrors the reason strings defined in cardinality.go - keep in
 // sync. Returns nil for unknown reasons (defensive; caller checks).
 func (m *kindMetrics) dropCardinality(reason string) *selfobs.Counter {
 	switch reason {
@@ -356,7 +356,7 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 
 // Flush blocks until both lanes have processed everything enqueued before the
 // call: queued entries are handed to storage (WAL write + sync) or counted as
-// dropped. Write failures don't fail Flush — they surface through the
+// dropped. Write failures don't fail Flush - they surface through the
 // circuit breaker and ingest metrics.
 func (b *Batcher) Flush(ctx context.Context) error {
 	lanes := [2]chan item{b.logQueue, b.spanQueue}

@@ -12,7 +12,7 @@ import (
 
 const catalogFileName = "catalog.json"
 
-// Catalog is the persisted series directory: the id→labels assignments and the
+// Catalog is the persisted series directory: the id->labels assignments and the
 // next ID to hand out. It is the durable form of the in-memory index.Registry.
 type Catalog struct {
 	NextID uint64         `json:"next_id"`
@@ -126,7 +126,7 @@ func rebuildCatalogFromManifest(dir string, manifest Manifest) (Catalog, error) 
 // fsync. Labels are treated as the durable identity in that fallback path.
 func reconcileLastTouchFromBlocks(dir string, manifest Manifest, registry *index.Registry) error {
 	for _, meta := range manifest.Blocks {
-		// Scalar blocks only — a histogram block (Kind != "") carries MHB1
+		// Scalar blocks only - a histogram block (Kind != "") carries MHB1
 		// magic and made every reopen of a store with hist data fail with
 		// "invalid file magic" (found by the metrics campaign, 2026-06-12).
 		if meta.Kind != "" {

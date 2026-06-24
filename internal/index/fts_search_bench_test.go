@@ -10,7 +10,7 @@ import (
 
 // BenchmarkFTSSearchCommonToken models the logs q3 scenario: a common-token
 // full-text query over a loaded (file-backed) 100k-record segment, returning a
-// full page. It exercises the AFT3 ordinal→ID mapping on the result set, which
+// full page. It exercises the AFT3 ordinal->ID mapping on the result set, which
 // reads the ordinal table from disk; the point of the bench is that mapping cost.
 func BenchmarkFTSSearchCommonToken(b *testing.B) {
 	ctx := context.Background()

@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// Trace workload generator behind METHODOLOGY.md §5 (Traces): T1 ingest
+// Trace workload generator behind METHODOLOGY.md (Traces): T1 ingest
 // (~10 spans/trace), QT1 trace-ID lookup, QT2 service+operation search, QT3
 // duration-threshold search. Like the metrics workload there is no dataset
-// file — a trace is fully determined by (seed, trace index), so two runs with
+// file - a trace is fully determined by (seed, trace index), so two runs with
 // the same config produce byte-identical traces. That reproducibility is what
 // lets the cross-system equality gate match instances across systems.
 //
@@ -49,7 +49,7 @@ const (
 // TracesGenConfig parameterizes the trace workload.
 type TracesGenConfig struct {
 	Seed uint64
-	// SpansPerTrace is the span count of every trace (default 10 — METHODOLOGY
+	// SpansPerTrace is the span count of every trace (default 10 - METHODOLOGY
 	// T1 "~10 spans/trace"). Fixed per run so QT1's span-count gate is exact.
 	SpansPerTrace int
 	// ErrorPercent of traces carry an error status on their root span (default
@@ -81,7 +81,7 @@ type GenSpan struct {
 func (s GenSpan) IsRoot() bool { return s.ParentIndex < 0 }
 
 // TracesGenerator synthesizes the deterministic trace stream. Stateless beyond
-// its config — every accessor is a pure function of (seed, trace index), so it
+// its config - every accessor is a pure function of (seed, trace index), so it
 // is safe for concurrent use by the ingest workers.
 type TracesGenerator struct {
 	cfg TracesGenConfig
@@ -117,7 +117,7 @@ func (g *TracesGenerator) Service(i int) string {
 	return genServices[g.hash(uint64(i), 0, 0x53)%uint64(len(genServices))]
 }
 
-// RootOperation is the operation name carried by trace i's root span — the
+// RootOperation is the operation name carried by trace i's root span - the
 // QT2 search target.
 func (g *TracesGenerator) RootOperation(i int) string {
 	return rootOpName(int(g.hash(uint64(i), 0, 0x52) % traceRootOpCount))
@@ -155,7 +155,7 @@ func (g *TracesGenerator) Trace(i int) []GenSpan {
 func rootOpName(k int) string  { return fmt.Sprintf("HTTP GET /v%d/resource", k) }
 func childOpName(k int) string { return fmt.Sprintf("internal.call.%d", k) }
 
-// hash is a splitmix64-style mix over (seed, trace, span, salt) — the
+// hash is a splitmix64-style mix over (seed, trace, span, salt) - the
 // deterministic source for every non-structural value, matching the metrics
 // generator's mixer so the two phases share one reproducibility story.
 func (g *TracesGenerator) hash(i, span, salt uint64) uint64 {

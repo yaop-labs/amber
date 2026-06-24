@@ -84,7 +84,7 @@ type otlpMetricsExportReq struct {
 
 // sendOTLPMetrics emits a synthetic mix of counters and gauges across the same
 // service/host taxonomy used by traces+logs. We batch all points into a single
-// request keyed by service.name to mirror real collector behavior — and to
+// request keyed by service.name to mirror real collector behavior - and to
 // stress the per-resource grouping path in the ingest handler.
 func sendOTLPMetrics(client *http.Client, addr string, rng *rand.Rand, n int) error {
 	methods := []string{"GET", "POST", "PUT", "DELETE"}
@@ -151,7 +151,7 @@ func sendOTLPMetrics(client *http.Client, addr string, rng *rand.Rand, n int) er
 			})
 		case 3:
 			// Exponential histogram with 8 positive buckets, weighted toward
-			// the center — this gives the quantile path something meaningful
+			// the center - this gives the quantile path something meaningful
 			// to estimate. Offset shifts the distribution so different hosts
 			// land at slightly different latency centers.
 			counts := []uint64{1, 2, 4, 8, 8, 4, 2, 1}

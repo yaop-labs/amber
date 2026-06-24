@@ -14,12 +14,12 @@ import (
 	"time"
 )
 
-// Log query scenarios per METHODOLOGY.md §5. Q5 (trace-ID lookup) belongs to
-// the traces phase — the log dataset carries no trace IDs by design.
+// Log query scenarios per METHODOLOGY.md. Q5 (trace-ID lookup) belongs to
+// the traces phase - the log dataset carries no trace IDs by design.
 //
 // Every instance derives its parameters from (seed, iteration), so two
-// systems given the same seed answer the *same* query sequence — that is
-// what makes the result-count equality gate (§6) meaningful.
+// systems given the same seed answer the *same* query sequence - that is
+// what makes the result-count equality gate meaningful.
 const (
 	ScenarioQ1Point = "q1-point"    // service + level
 	ScenarioQ2Range = "q2-range"    // service over a sub-window
@@ -42,14 +42,14 @@ type QueryInstance struct {
 	To       time.Time
 	Limit    int
 
-	// windowFrac is q2's window start as 1/1000ths of the ingest window —
+	// windowFrac is q2's window start as 1/1000ths of the ingest window -
 	// the system-independent identity of the sub-window (absolute times
 	// differ per system because each ingested at a different wall-clock).
 	windowFrac int64
 }
 
 // QueryOutcome is the per-instance record written to the results file. Count
-// is the number of returned entries (capped by Limit) — the equality-gate
+// is the number of returned entries (capped by Limit) - the equality-gate
 // quantity. Total carries the system's own total-hits figure when the API
 // reports one (amber does; informational only).
 type QueryOutcome struct {

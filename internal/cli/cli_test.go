@@ -246,7 +246,7 @@ func TestRunMetricsStats_EmptyTimeRange(t *testing.T) {
 	}
 	out := buf.String()
 	// Both halves must render a dash when their respective store has no
-	// time range — the CLI relies on this to distinguish "empty" from
+	// time range - the CLI relies on this to distinguish "empty" from
 	// "actual data at epoch 0". tabwriter pads with spaces, so we check
 	// each line carries the dash.
 	for _, line := range []string{"scalar.min_time", "histogram.min_time"} {
@@ -282,7 +282,7 @@ func TestRunMetricsQuantilePlain(t *testing.T) {
 		if got := qp.Get("by"); got != "job" {
 			t.Errorf("by param = %q", got)
 		}
-		// Window flag was zero on the CLI side → must be absent so the
+		// Window flag was zero on the CLI side -> must be absent so the
 		// server treats the query as unbounded.
 		if qp.Has("window") {
 			t.Errorf("window should be absent when --window is zero, got %q", qp.Get("window"))

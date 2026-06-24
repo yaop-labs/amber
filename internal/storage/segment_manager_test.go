@@ -132,7 +132,7 @@ func TestSegmentManager_Rotate_Manual(t *testing.T) {
 // BEFORE the next segment is created. The old order (createNewSegment, then
 // wal.Truncate) had a crash window where meta already contained a fresh
 // unsealed segment with LastSyncedSeq=0, so replayWAL re-applied the entire
-// WAL into it — duplicating every record of the just-sealed segment.
+// WAL into it - duplicating every record of the just-sealed segment.
 //
 // With the fixed order the only reachable crash state is "sealed segment in
 // meta, no unsealed segment, WAL not yet truncated". This test constructs

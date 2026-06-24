@@ -13,10 +13,10 @@ import (
 	"time"
 )
 
-// Trace query scenarios per METHODOLOGY.md §5 (QT1–QT3). As with metrics,
+// Trace query scenarios per METHODOLOGY.md (QT1-QT3). As with metrics,
 // every instance derives its parameters from (seed, iteration) and identifies
 // itself by parameters that are system-independent (trace index, service,
-// operation, duration threshold), never by absolute times — each system
+// operation, duration threshold), never by absolute times - each system
 // ingested over its own wall clock.
 //
 // The gate quantity differs by scenario:
@@ -27,8 +27,8 @@ import (
 //     At campaign scale a service+operation or duration predicate matches far
 //     more than L traces, and every trace search API caps its result page, so
 //     the honest, comparable unit of work is "return a full page of L matching
-//     traces". The gate is count==L on every system — the trace analogue of
-//     the metrics group-cardinality gate (a documented coarse gate, §6), not a
+//     traces". The gate is count==L on every system - the trace analogue of
+//     the metrics group-cardinality gate (a documented coarse gate), not a
 //     claim that the systems returned the identical L traces.
 const (
 	ScenarioQT1Lookup    = "qt1-trace-lookup"

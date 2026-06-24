@@ -348,7 +348,7 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 }
 
 // TestWAL_FailStopAfterWriteError pins the fsync-failure policy: once a
-// write/flush/fsync fails, the writer is fail-stopped — no later append may
+// write/flush/fsync fails, the writer is fail-stopped - no later append may
 // ack (the durable state is unknowable) and Truncate refuses to destroy the
 // on-disk evidence.
 func TestWAL_FailStopAfterWriteError(t *testing.T) {

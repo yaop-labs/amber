@@ -48,7 +48,7 @@ func coveringSummaryShape(q *SpanQuery) bool {
 // SpanSummaryFetch returns up to maxSpans newest matching spans for a trace-
 // summary query (newest-first), using each sealed segment's .cidx projection
 // when present and falling back to the row scan for segments without one
-// (active/legacy). Returned spans carry only summary fields — use them solely
+// (active/legacy). Returned spans carry only summary fields - use them solely
 // for buildTraceSummaries. The bool reports whether the maxSpans cap truncated.
 func (e *Executor) SpanSummaryFetch(ctx context.Context, q *SpanQuery, maxSpans int) ([]model.SpanEntry, bool, error) {
 	if err := q.Validate(); err != nil {

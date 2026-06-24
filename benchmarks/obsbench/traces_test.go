@@ -8,7 +8,7 @@ import (
 )
 
 // TestTracesGenerator_Deterministic: two generators with the same config must
-// produce identical traces — IDs, services, operations, durations — so every
+// produce identical traces - IDs, services, operations, durations - so every
 // system ingests byte-identical work and the equality gate is meaningful.
 func TestTracesGenerator_Deterministic(t *testing.T) {
 	cfg := TracesGenConfig{Seed: 42, SpansPerTrace: 10}
@@ -69,7 +69,7 @@ func TestTracesGenerator_Invariants(t *testing.T) {
 }
 
 // TestTraceInstance_CrossSystemIdentity: the same (seed, iteration) over two
-// different absolute ingest windows must produce the same paramsKey — that
+// different absolute ingest windows must produce the same paramsKey - that
 // equality is what lets the gate match instances across systems.
 func TestTraceInstance_CrossSystemIdentity(t *testing.T) {
 	mk := func(from time.Time) TraceQueryRunOptions {
@@ -89,7 +89,7 @@ func TestTraceInstance_CrossSystemIdentity(t *testing.T) {
 }
 
 // TestE2E_AmberTracesIngestVerifyQuery drives the full trace phase against a
-// real amber stack: OTLP ingest -> sampled completeness verify -> QT1–QT3
+// real amber stack: OTLP ingest -> sampled completeness verify -> QT1-QT3
 // natively. Payload-format or endpoint drift (including the operation /
 // min_duration query params wired for QT2/QT3) fails here instead of producing
 // a zero-result benchmark.

@@ -11,11 +11,11 @@ import (
 	"time"
 )
 
-// Metrics query scenarios per METHODOLOGY.md §5 (QM1–QM4). As with logs,
+// Metrics query scenarios per METHODOLOGY.md (QM1-QM4). As with logs,
 // every instance derives its parameters from (seed, iteration) and identifies
-// itself by window *fractions*, never absolute times — each system ingested
+// itself by window *fractions*, never absolute times - each system ingested
 // over its own wall clock, so equal fractions select comparable slices and
-// the equality gate (§6) stays meaningful.
+// the equality gate stays meaningful.
 //
 // The gate quantity for metrics is the result-group cardinality (number of
 // series/groups returned), not values: rate math differs across engines by
@@ -269,8 +269,8 @@ func (promQuerier) Execute(ctx context.Context, client *http.Client, target Targ
 			if target.Kind == "victoriametrics" {
 				// VictoriaMetrics rewrites OTLP exponential histograms into
 				// its own vmrange bucket series; MetricsQL histogram_quantile
-				// consumes those. Same group count, different sketch — a
-				// documented semantic difference (METHODOLOGY.md §6).
+				// consumes those. Same group count, different sketch - a
+				// documented semantic difference (METHODOLOGY.md).
 				q = fmt.Sprintf(`histogram_quantile(%g, sum by (%s, vmrange) (rate(%s_bucket[%ds])))`,
 					qi.Quantile, qi.By, qi.Metric, winSec)
 			} else {

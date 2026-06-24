@@ -7,7 +7,7 @@ import (
 )
 
 // TestMetricsGenerator_Deterministic: two generators with the same config
-// must produce identical series and values tick for tick — the cross-system
+// must produce identical series and values tick for tick - the cross-system
 // reproducibility contract.
 func TestMetricsGenerator_Deterministic(t *testing.T) {
 	cfg := MetricsGenConfig{Seed: 42, ScalarSeries: 200, HistSeries: 20, Routes: 50, ChurnPercent: 20}
@@ -111,7 +111,7 @@ func TestMetricsGenerator_Churn(t *testing.T) {
 }
 
 // TestMetricsInstance_CrossSystemIdentity: the same (seed, iteration) over
-// two different absolute ingest windows must produce the same paramsKey —
+// two different absolute ingest windows must produce the same paramsKey -
 // that equality is what lets the gate match instances across systems.
 func TestMetricsInstance_CrossSystemIdentity(t *testing.T) {
 	mk := func(from time.Time) MetricsQueryRunOptions {
@@ -134,7 +134,7 @@ func TestMetricsInstance_CrossSystemIdentity(t *testing.T) {
 }
 
 // TestE2E_AmberMetricsIngestVerifyQuery drives the full metrics phase against
-// a real amber stack: OTLP ingest -> sample-count verify -> QM1–QM4 natively.
+// a real amber stack: OTLP ingest -> sample-count verify -> QM1-QM4 natively.
 // Payload-format or endpoint drift fails here instead of producing a
 // zero-sample benchmark.
 func TestE2E_AmberMetricsIngestVerifyQuery(t *testing.T) {

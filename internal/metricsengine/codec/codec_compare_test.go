@@ -2,14 +2,14 @@ package codec
 
 // bytes/sample comparison: amber's strategy-race codec vs the reference
 // Gorilla encoder (gorilla_ref_test.go). This is the falsifiable check from
-// ARCHITECTURE.md §6 criterion #1 ("байт/сэмпл — обязан бить Gorilla").
+// ARCHITECTURE.md criterion #1 ("байт/сэмпл - обязан бить Gorilla").
 // Run with `go test -run TestBytesPerSampleVsGorilla -v` to see the table.
 //
 // Methodology notes:
 //   - amber numbers are payload bytes only; per-series directory overhead
 //     (~fixed JSON entry) is excluded on both sides (Gorilla's chunk header
 //     is likewise excluded beyond the first-sample cost).
-//   - int shapes go to Gorilla as float64 — exactly what a Prometheus chunk
+//   - int shapes go to Gorilla as float64 - exactly what a Prometheus chunk
 //     stores for the same data.
 //   - decimal float shapes use the ALP path (EncodeFloatValues) for amber.
 
@@ -30,7 +30,7 @@ func TestBytesPerSampleVsGorilla(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 
 	// --- int shapes ---
-	counter := make([]int64, n) // Poisson-ish increments, λ≈5
+	counter := make([]int64, n) // Poisson-ish increments, lambda~5
 	cum := int64(0)
 	for i := range counter {
 		inc := int64(0)
@@ -43,7 +43,7 @@ func TestBytesPerSampleVsGorilla(t *testing.T) {
 		counter[i] = cum
 	}
 
-	noisyGauge := make([]int64, n) // level 5000 ± 3
+	noisyGauge := make([]int64, n) // level 5000 +/- 3
 	for i := range noisyGauge {
 		noisyGauge[i] = 5000 + rng.Int63n(7) - 3
 	}
@@ -92,7 +92,7 @@ func TestBytesPerSampleVsGorilla(t *testing.T) {
 	}
 
 	// --- float shapes (ALP path vs XOR) ---
-	decimal2 := make([]float64, n) // sine, 2 decimal digits — SDK-rounded gauge
+	decimal2 := make([]float64, n) // sine, 2 decimal digits - SDK-rounded gauge
 	for i := range decimal2 {
 		decimal2[i] = math.Round((50+40*math.Sin(float64(i)/30)+rng.Float64()*2)*100) / 100
 	}
@@ -100,7 +100,7 @@ func TestBytesPerSampleVsGorilla(t *testing.T) {
 	for i := range decimal0 {
 		decimal0[i] = float64(20 + rng.Intn(10))
 	}
-	binaryFloat := make([]float64, n) // true binary floats — ALP worst case
+	binaryFloat := make([]float64, n) // true binary floats - ALP worst case
 	for i := range binaryFloat {
 		binaryFloat[i] = rng.NormFloat64() * 1e3
 	}
@@ -149,7 +149,7 @@ func TestBytesPerSampleVsGorilla(t *testing.T) {
 		ts   []int64
 	}{{"regular_10s", regular}, {"jitter_pm3ms", jittered}} {
 		enc := EncodeTimestamps(row.ts)
-		aBytes := len(enc.Payload) // Regular: 0 bytes — base/step live in the directory
+		aBytes := len(enc.Payload) // Regular: 0 bytes - base/step live in the directory
 		gBytes := (gorillaTimestampBits(row.ts) + 7) / 8
 		t.Logf("%-22s %14.3f %14.3f %8.2f  %s",
 			row.name, float64(aBytes)/n, float64(gBytes)/n, float64(aBytes)/float64(gBytes), enc.Strategy)

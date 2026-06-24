@@ -15,7 +15,7 @@ import (
 // CountQueryable returns the system's durable/queryable log-record count.
 // This is the right-hand side of the loss accounting: sent == acked ==
 // queryable is the gate every ingest run must pass before its numbers count
-// (METHODOLOGY.md §4–5), and the post-restart count is what the kill -9 test
+// (METHODOLOGY.md), and the post-restart count is what the kill -9 test
 // compares against acked.
 func CountQueryable(ctx context.Context, target TargetConfig) (uint64, error) {
 	client := &http.Client{Timeout: 120 * time.Second}
@@ -31,7 +31,7 @@ func CountQueryable(ctx context.Context, target TargetConfig) (uint64, error) {
 	}
 }
 
-// amberCount reads segments.total_records from the admin stats endpoint —
+// amberCount reads segments.total_records from the admin stats endpoint -
 // exact (sealed + active) and O(1), unlike a full-scan query whose
 // total_hits is allowed to skip segments once the result heap fills.
 func amberCount(ctx context.Context, client *http.Client, target TargetConfig) (uint64, error) {

@@ -1,5 +1,5 @@
 // Package cli implements amberctl's one-shot, scriptable commands on top of
-// internal/client. It is intentionally built on the stdlib flag package — the
+// internal/client. It is intentionally built on the stdlib flag package - the
 // command surface is small and amber already carries a heavy dependency set,
 // so a framework like cobra is not worth the weight.
 package cli
@@ -170,7 +170,7 @@ func cmdLogs(ctx context.Context, args []string, out io.Writer) error {
 
 // followLogs polls for new entries, advancing the window to the newest
 // timestamp seen and de-duplicating only the entries that sit exactly on that
-// boundary — so the seen-set stays bounded regardless of how long it runs.
+// boundary - so the seen-set stays bounded regardless of how long it runs.
 func followLogs(ctx context.Context, c *client.Client, base client.LogQuery, interval time.Duration, out io.Writer) error {
 	if base.From.IsZero() {
 		base.From = time.Now()

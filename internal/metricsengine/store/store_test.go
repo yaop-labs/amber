@@ -77,7 +77,7 @@ func TestStoreSelectIncludesHead(t *testing.T) {
 
 // TestStoreReopenWithHistogramBlocks pins the reopen path for a store that
 // holds both scalar and histogram blocks: rebuildCatalogFromManifest and
-// reconcileLastTouchFromBlocks must skip Kind=histogram entries — reading an
+// reconcileLastTouchFromBlocks must skip Kind=histogram entries - reading an
 // MHB1 file with the scalar (MEB1) reader made every such store unopenable
 // ("invalid file magic"; found by the metrics benchmark campaign).
 func TestStoreReopenWithHistogramBlocks(t *testing.T) {
@@ -175,7 +175,7 @@ func TestStoreRebuildsMissingCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Remove every catalog persistence file so the reopen has to
-	// rebuild from blocks. As of INDEX_EVICTION_SPEC_v0 §2 the source
+	// rebuild from blocks. As of INDEX_EVICTION_SPEC_v0 the source
 	// of truth is the append-only log (catalog.log + catalog.snapshot);
 	// the legacy JSON catalog (catalogFileName) is kept as a fallback
 	// but is no longer the primary write target. Remove all of them.
@@ -917,7 +917,7 @@ func TestStoreRateByLabelRangeStepsParallelMergeAcrossSeries(t *testing.T) {
 	if len(steps) != 1 {
 		t.Fatalf("len(steps) = %d, want 1", len(steps))
 	}
-	// Each series rises 10/s; two series per group → 20/s per group.
+	// Each series rises 10/s; two series per group -> 20/s per group.
 	if got := steps[0].Values["api"]; got != 20 {
 		t.Fatalf("api rate = %v, want 20", got)
 	}
@@ -1264,7 +1264,7 @@ func TestStoreRateByLabelRangeStepsManyStepsStreamingMatches(t *testing.T) {
 		Selector: index.NewSelector(index.MetricName("http_requests_total")),
 		Window:   2 * time.Second,
 	}
-	// 10 steps over [2s, 11s] — exercises the widened summary path.
+	// 10 steps over [2s, 11s] - exercises the widened summary path.
 	plan := query.Plan{
 		Operation:     query.OpRateByLabelRangeSteps,
 		RangeSelector: rangeSelector,
@@ -2152,7 +2152,7 @@ func TestStoreOpensAfterTornWALTail(t *testing.T) {
 	if _, err := st.Append(labels, model.MetricTypeCounter, 2000, 20); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate crash: no store Close, no Flush — samples live only in the
+	// Simulate crash: no store Close, no Flush - samples live only in the
 	// WAL. Engine/catalog committers are stopped directly so their file
 	// handles do not interfere with the corruption below, and the dir lock
 	// is released the way the kernel would on process death.

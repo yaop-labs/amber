@@ -16,7 +16,7 @@ func TestAcquireRelease(t *testing.T) {
 	}
 
 	// flock conflicts apply across file descriptors, including within one
-	// process — exactly the double-Open case we guard against.
+	// process - exactly the double-Open case we guard against.
 	if _, err := Acquire(dir); !errors.Is(err, ErrLocked) {
 		t.Fatalf("second Acquire: want ErrLocked, got %v", err)
 	}

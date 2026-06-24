@@ -14,8 +14,8 @@ import (
 
 // TestBuildLogSealIndexes_OnePass pins the one-pass seal build contract:
 // every sidecar is written, the FTS index finds the indexed bodies, and the
-// FTS ribbon — built from the FTS build state's token keys, not a separate
-// tokenize pass — contains every indexed token (a false negative there
+// FTS ribbon - built from the FTS build state's token keys, not a separate
+// tokenize pass - contains every indexed token (a false negative there
 // silently prunes segments out of full-text queries).
 func TestBuildLogSealIndexes_OnePass(t *testing.T) {
 	dir := t.TempDir()

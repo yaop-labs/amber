@@ -82,7 +82,7 @@ func buildFixture(tb testing.TB) *benchFixture {
 		ticks := benchEnvInt("AMBER_BENCH_TICKS", 180)
 		flushEvery := benchEnvInt("AMBER_BENCH_FLUSH", 6)
 
-		// /tmp is tmpfs (RAM) on Fedora — a campaign-scale fixture is ~2GB and
+		// /tmp is tmpfs (RAM) on Fedora - a campaign-scale fixture is ~2GB and
 		// several leaked runs once exhausted RAM and froze the desktop. Write
 		// to /var/tmp (real disk) and clean up in TestMain. Honor TMPDIR if set.
 		tmpBase := os.Getenv("TMPDIR")
@@ -203,7 +203,7 @@ func BenchmarkRateByLabelRangeSteps_qm2(b *testing.B) {
 // BenchmarkRateByLabelRangeSteps_qm2_campaign mirrors the obsbench qm2-range-rate
 // query exactly: range = half the ingest span, step = (span/2)/20, 1m window
 // (see benchmarks/obsbench/metrics_queries.go ScenarioQM2Range). For the 180-tick
-// fixture that is a ~15m range over ~15 in-window blocks — the query that EOF'd
+// fixture that is a ~15m range over ~15 in-window blocks - the query that EOF'd
 // the campaign at 71-101s.
 func BenchmarkRateByLabelRangeSteps_qm2_campaign(b *testing.B) {
 	f := buildFixture(b)
@@ -228,7 +228,7 @@ func BenchmarkRateByLabelRangeSteps_qm2_campaign(b *testing.B) {
 }
 
 // BenchmarkRateByLabelRangeSteps_qm2_wide drives the full ingest span (every
-// block in-window) as a worst-case upper bound — wider than the campaign query.
+// block in-window) as a worst-case upper bound - wider than the campaign query.
 func BenchmarkRateByLabelRangeSteps_qm2_wide(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("service", time.Minute)

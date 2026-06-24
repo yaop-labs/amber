@@ -56,7 +56,7 @@ func TestFlushRespectsContext(t *testing.T) {
 	// The workers are alive, so the barrier itself would succeed; a canceled
 	// context must still win the race deterministically when it is already
 	// done before any waiting starts. Both outcomes are valid only if err is
-	// either nil (barrier won) or ctx.Err() — never a hang.
+	// either nil (barrier won) or ctx.Err() - never a hang.
 	done := make(chan error, 1)
 	go func() { done <- db.Flush(ctx) }()
 	select {

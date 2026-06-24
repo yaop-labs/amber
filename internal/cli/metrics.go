@@ -171,7 +171,7 @@ func cmdMetricsRate(ctx context.Context, args []string, out io.Writer) error {
 }
 
 // parseEndTime accepts either RFC3339 or raw unix milliseconds. The CLI's
-// "now-relative" forms (5m, 1h) are not supported here — RangeSelector.Window
+// "now-relative" forms (5m, 1h) are not supported here - RangeSelector.Window
 // already captures the lookback, and adding ambiguity (does "5m" mean window
 // or evaluation offset?) would only confuse.
 func parseEndTime(raw string) (time.Time, error) {
@@ -268,7 +268,7 @@ func cmdMetricsQuantile(ctx context.Context, args []string, out io.Writer) error
 
 func renderMetricQuantile(out io.Writer, res *client.MetricQuantileResult) {
 	// Header line mirrors rate's: surface metric, q, and the actual window
-	// the server applied (zero means unbounded — we render that as "-" so
+	// the server applied (zero means unbounded - we render that as "-" so
 	// the reader doesn't confuse it with "0ms window").
 	windowStr := "-"
 	endStr := "-"

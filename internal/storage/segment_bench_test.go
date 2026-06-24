@@ -2,9 +2,9 @@ package storage
 
 // Storage primitive benchmarks. Three things matter for Phase 1 (S3):
 //
-//  1. WriteBatch throughput — sets the ceiling on ingest.
-//  2. OpenSegmentReader cold (no hint, has footer) — first read after S3 GET.
-//  3. scanBlockOffsets — what we pay when footer is missing/corrupt and we
+//  1. WriteBatch throughput - sets the ceiling on ingest.
+//  2. OpenSegmentReader cold (no hint, has footer) - first read after S3 GET.
+//  3. scanBlockOffsets - what we pay when footer is missing/corrupt and we
 //     must rebuild the block index by streaming through the segment. S3
 //     latency on top of this is the worst-case cold-segment cost.
 
@@ -52,7 +52,7 @@ func benchSetupBatch(b *testing.B, batchSize int) []BatchItem {
 func benchRunWriteBatch(b *testing.B, batchSize int) {
 	b.Helper()
 	dir := b.TempDir()
-	// Huge thresholds so rotation never trips during the bench — we want
+	// Huge thresholds so rotation never trips during the bench - we want
 	// pure WriteBatch cost, not rotation overhead.
 	policy := RotationPolicy{MaxRecords: 1_000_000_000, MaxBytes: 64 << 30}
 	mgr, err := OpenSegmentManager(dir, policy)
@@ -115,7 +115,7 @@ func BenchmarkSegmentReader_ScanFiltered_100k(b *testing.B) {
 	path := prepareSealedSegment(b, 100_000)
 
 	// Build a bitmap with every 25th ID to simulate 4% selectivity
-	// (service=svc-00 AND level=ERROR with 5 services × 5 levels).
+	// (service=svc-00 AND level=ERROR with 5 services x 5 levels).
 	allowed := make(map[uint64]struct{}, 4000)
 	for i := uint64(15); i < 100_000; i += 25 {
 		allowed[i] = struct{}{}
@@ -166,7 +166,7 @@ func BenchmarkOpenSegmentReader_WithFooter_10k(b *testing.B) {
 
 // BenchmarkScanBlockOffsets_10k forces the no-footer recovery path: we open
 // the segment, then directly invoke scanBlockOffsets. This is the cost we'd
-// pay every cold open if footers were lost — and what S3-cold reads look like
+// pay every cold open if footers were lost - and what S3-cold reads look like
 // if we ever cache only data, not footers.
 func BenchmarkScanBlockOffsets_10k(b *testing.B) {
 	path := prepareSealedSegment(b, 10_000)
@@ -189,7 +189,7 @@ func BenchmarkScanBlockOffsets_10k(b *testing.B) {
 }
 
 // BenchmarkSegmentReader_ScanAll_10k measures full sequential scan over a
-// sealed segment — what a no-filter query pays per segment.
+// sealed segment - what a no-filter query pays per segment.
 func BenchmarkSegmentReader_ScanAll_10k(b *testing.B) {
 	path := prepareSealedSegment(b, 10_000)
 	b.ResetTimer()

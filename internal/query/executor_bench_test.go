@@ -1,7 +1,7 @@
 package query
 
 // Executor benchmarks. White-box so we can clear resultCache between
-// iterations — otherwise benchmarks that reuse the same *LogQuery measure
+// iterations - otherwise benchmarks that reuse the same *LogQuery measure
 // map+mutex lookup cost on iterations 2..N, not real execution.
 //
 // The integration benchmarks under /benchmarks all have this skew. Trust the
@@ -32,7 +32,7 @@ import (
 // Synthetic time placement: segment k covers [base + k*hour, base + (k+1)*hour)
 // so time-range pruning benchmarks can target specific windows.
 // templatedBodies are the handful of recurring log lines used by most
-// benchmarks — realistic in that production logs are highly templated.
+// benchmarks - realistic in that production logs are highly templated.
 var templatedBodies = []string{
 	"connection refused to postgres:5432 error",
 	"timeout waiting for redis response",
@@ -56,7 +56,7 @@ func buildSealedDatasetBodied(b *testing.B, numSegments, recsPerSeg int, bodyFn 
 
 	// MaxRecords / MaxBytes set high so we control rotation manually via
 	// Rotate(). Rotation policy thresholds would conflict with the explicit
-	// numSegments × recsPerSeg layout.
+	// numSegments x recsPerSeg layout.
 	policy := storage.RotationPolicy{MaxRecords: 1_000_000_000, MaxBytes: 64 << 30}
 	mgr, err := storage.OpenSegmentManager(logDir, policy)
 	if err != nil {
@@ -175,7 +175,7 @@ func BenchmarkExecLog_Sealed_100seg_1k(b *testing.B) {
 // fallback: buildSealedDataset registers no FTS index, so a FullText query
 // takes the per-record TokenizeFTS body match (needScanFTS). Compare ns/op
 // against BenchmarkExecLog_Sealed_1seg_* (identical scan, no full text) to read
-// the tokenization overhead. This is the worst case — no bitmap pre-filter, so
+// the tokenization overhead. This is the worst case - no bitmap pre-filter, so
 // every record in the segment is tokenized.
 func BenchmarkExecLog_FullTextScanFallback_1seg_10k(b *testing.B) {
 	exec, cleanup := buildSealedDataset(b, 1, 10_000)
@@ -199,7 +199,7 @@ func BenchmarkExecLog_FullTextScanFallback_ServiceFilter_1seg_100k(b *testing.B)
 
 // uniqueBody keeps the templated prefix (so the "error" token recurs at the
 // same rate) but appends a unique id, mimicking real logs that embed request
-// IDs in the message. The per-scan body memo gets no hits here — this is the
+// IDs in the message. The per-scan body memo gets no hits here - this is the
 // worst case for the memo optimization.
 func uniqueBody(idx int) string {
 	return fmt.Sprintf("%s req=%d id=%08x", templatedBodies[idx%len(templatedBodies)], idx, idx*2654435761)
@@ -222,7 +222,7 @@ func BenchmarkExecLog_ServiceFilter_Bitmap_10seg_10k(b *testing.B) {
 }
 
 // BenchmarkExecLog_TimeRangePruning_100seg targets only 2 of 100 segments via
-// q.From/q.To. Number to watch: SegScanned in the LogResult — should be ~2,
+// q.From/q.To. Number to watch: SegScanned in the LogResult - should be ~2,
 // not 100. If sparse pruning regresses this benchmark times out or the
 // queries/sec drops by ~50x.
 func BenchmarkExecLog_TimeRangePruning_100seg(b *testing.B) {
@@ -266,9 +266,9 @@ func BenchmarkExecLog_LazyDecode_TimeRangeOnly(b *testing.B) {
 
 // BenchmarkExecLog_LazyDecode_SelectiveService combines a service filter
 // (bitmap pre-filter ~1/5 of records) with a wide time range. Hot path:
-// allowedIDs bitmap test → DecodeBytes → matchesAttrs. The wasted work
+// allowedIDs bitmap test -> DecodeBytes -> matchesAttrs. The wasted work
 // is decoding records that pass the bitmap but fail attrs (which here
-// is the `env=prod` attr — set on every record, so this should be 0%
+// is the `env=prod` attr - set on every record, so this should be 0%
 // waste in this dataset). The dataset is intentionally homogeneous so
 // we can isolate decode cost from filter cost.
 func BenchmarkExecLog_LazyDecode_SelectiveService(b *testing.B) {
@@ -284,7 +284,7 @@ func BenchmarkExecLog_LazyDecode_SelectiveService(b *testing.B) {
 // BenchmarkExecLog_ResultCacheHit measures the warm path that the existing
 // /benchmarks suite accidentally measures everywhere: identical query, cache
 // stays populated. The delta versus _Sealed_10seg_10k is the value of the
-// cache. Keep this benchmark — if cache lookup ever gets more expensive than
+// cache. Keep this benchmark - if cache lookup ever gets more expensive than
 // a small scan, that's a signal to revisit the cache design.
 func BenchmarkExecLog_ResultCacheHit(b *testing.B) {
 	exec, cleanup := buildSealedDataset(b, 10, 10_000)

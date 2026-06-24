@@ -126,7 +126,7 @@ func TestEmbedded_DurabilityAcrossClose(t *testing.T) {
 // and queries return data after that signal. The contract being pinned:
 // "after IsReady is true, the embedder can serve traffic without
 // partial-result risk." Sealed segments give bootstrap real work, so the
-// false→true transition is meaningful (not a vacuous always-true).
+// false->true transition is meaningful (not a vacuous always-true).
 func TestEmbedded_IsReadyOnPopulatedDir(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -158,7 +158,7 @@ func TestEmbedded_IsReadyOnPopulatedDir(t *testing.T) {
 
 	// Phase 2: reopen against the populated dir. Bootstrap has actual
 	// sealed segments to load (ribbon filters, bitmap caches), so the
-	// false→true transition is observable rather than instantaneous.
+	// false->true transition is observable rather than instantaneous.
 	db2, err := amber.Open(dir, defaultOpts())
 	if err != nil {
 		t.Fatalf("open #2: %v", err)
@@ -191,7 +191,7 @@ func TestEmbedded_IsReadyOnPopulatedDir(t *testing.T) {
 
 // TestEmbedded_SpanRoundTrip writes spans through DB.Span and reads them
 // back through DB.QuerySpans, covering both the service-filter and
-// trace_id-filter code paths. Span is half of the contract — the existing
+// trace_id-filter code paths. Span is half of the contract - the existing
 // example test exercises only logs.
 func TestEmbedded_SpanRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -208,7 +208,7 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 	}()
 
 	// Hand-built trace and span ids. The public surface exposes the array
-	// types but no constructors for them — an embedder passes values from
+	// types but no constructors for them - an embedder passes values from
 	// its own tracing layer (forager from OTLP). NewSpanEntry, however, is
 	// exported and produces a valid ULID-backed entry ID; using it covers
 	// the same code path real callers would.
@@ -233,7 +233,7 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 		t.Fatalf("span: %v", err)
 	}
 
-	// Poll for the span to surface — batch flush is async. Empty results
+	// Poll for the span to surface - batch flush is async. Empty results
 	// are no longer cached, so this loop will not get stuck on a stale
 	// negative.
 	if !eventually(t, 3*time.Second, 25*time.Millisecond, func() bool {
@@ -281,7 +281,7 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 // TestEmbedded_QueryTraceReturnsBothSides pins the wrapper contract: one
 // call gives back the logs AND the spans for a trace id, so the consumer
 // (UI/TUI/gateway) does not need two round trips. The wrapper does NOT
-// correlate, build trees, or order across sides — that stays upstream.
+// correlate, build trees, or order across sides - that stays upstream.
 func TestEmbedded_QueryTraceReturnsBothSides(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()

@@ -433,7 +433,7 @@ func TestMetricsStats_StoreDisabledReturns503(t *testing.T) {
 
 // seedExpHistogram POSTs an exponential-histogram OTLP request into the
 // harness. We go through the public ingest path on purpose: it forces the
-// same OTLP → SketchSample → Store.AppendSketches flow that real clients
+// same OTLP -> SketchSample -> Store.AppendSketches flow that real clients
 // take, so the quantile test catches regressions in the whole chain instead
 // of just the store-level math.
 func seedExpHistogram(t *testing.T, h *metricsHarness, name string, attrs map[string]string, scale int32, positiveOffset int32, counts []uint64, sum float64, count uint64) {
@@ -538,7 +538,7 @@ func TestMetricsQuantile_ByLabel(t *testing.T) {
 	if !okA || !okW {
 		t.Fatalf("missing group; got keys=%v", resp.Quantiles)
 	}
-	// worker series sits at higher offsets → its quantile should exceed api's.
+	// worker series sits at higher offsets -> its quantile should exceed api's.
 	if !(worker > api) {
 		t.Fatalf("expected worker quantile > api; got api=%v worker=%v", api, worker)
 	}

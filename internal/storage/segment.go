@@ -30,11 +30,11 @@ const (
 	footerMagic = uint32(0x464F4F54)
 
 	// DefaultBlockSize is the uncompressed block flush threshold. 512 KiB
-	// keeps ~30 blocks per 100k-record segment — fine enough granularity for
+	// keeps ~30 blocks per 100k-record segment - fine enough granularity for
 	// the heap-threshold block skip in reverse scans. The previous 4 MiB
 	// made a segment 2-4 blocks, so a limit-100 windowed query (q2) had to
 	// decompress whole megabytes to surface a handful of records: measured
-	// 3.2 ms → 190 µs per query at 512 KiB on the same data, with no
+	// 3.2 ms -> 190 us per query at 512 KiB on the same data, with no
 	// compression-ratio loss (zstd ratio is flat down to 256 KiB on log
 	// bodies) and no write-throughput change.
 	DefaultBlockSize = 512 * 1024
@@ -57,8 +57,8 @@ var (
 )
 
 // BlockStat carries per-block pruning ranges: ULID-derived entry IDs (v2+)
-// and event-time bounds (v3+). MinTS==MaxTS==0 means "no time stats" — v2
-// footers and footerless recovery — and disables time pruning for the block.
+// and event-time bounds (v3+). MinTS==MaxTS==0 means "no time stats" - v2
+// footers and footerless recovery - and disables time pruning for the block.
 type BlockStat struct {
 	MinID uint64
 	MaxID uint64
@@ -106,7 +106,7 @@ type SegmentWriter struct {
 
 	// failed fail-stops the writer. After a failed fsync the kernel may have
 	// dropped the dirty pages (PostgreSQL's "fsyncgate"), and after a partial
-	// buffered write fileOffset no longer matches the file — later block
+	// buffered write fileOffset no longer matches the file - later block
 	// offsets would be wrong. Either way the segment can't accept more
 	// records; the manager recovers from WAL + last synced size on restart.
 	// Guarded by mu.
@@ -337,7 +337,7 @@ func (sw *SegmentWriter) Close() error {
 
 // writeFooter appends the offsets/stats footer. Deliberately no footer CRC:
 // the payload blocks are integrity-checked by their zstd frames, and a
-// corrupt or truncated footer is survivable — OpenSegmentReader falls back
+// corrupt or truncated footer is survivable - OpenSegmentReader falls back
 // to the footerless block scan (scanBlockOffsets). A CRC would only convert
 // "slow open" into "fail open" for the same corruption.
 func (sw *SegmentWriter) writeFooter() error {

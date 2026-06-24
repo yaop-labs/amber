@@ -31,7 +31,7 @@ func buildDataset(scale int32, ticks, perTick int, seed int64) (sketches []*Expo
 }
 
 // expandToPoints reconstructs raw-ish points from sketches by emitting each
-// bucket's midpoint `count` times — the work a naive decode-all-points query
+// bucket's midpoint `count` times - the work a naive decode-all-points query
 // would do before sorting.
 func expandToPoints(sketches []*ExponentialHistogram) []float64 {
 	var pts []float64
@@ -139,7 +139,7 @@ func BenchmarkHistogramQuantileDecodeAllBaseline(b *testing.B) {
 }
 
 // BenchmarkHistogramWriteBlock measures end-to-end block-write throughput for
-// a realistic batch: 100 series × 60 ticks of exp-histogram each. This is the
+// a realistic batch: 100 series x 60 ticks of exp-histogram each. This is the
 // hot path of POST /v1/metrics for histogram workloads.
 func BenchmarkHistogramWriteBlock(b *testing.B) {
 	const seriesCount, ticks, perTick = 100, 60, 500

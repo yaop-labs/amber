@@ -328,7 +328,7 @@ func syncDir(dir string) error {
 	return file.Sync()
 }
 
-// ReadDirectory reads and verifies just the directory of a block — its
+// ReadDirectory reads and verifies just the directory of a block - its
 // per-series metadata, no chunk payloads.
 func ReadDirectory(path string) (Directory, error) {
 	file, err := os.Open(path)
@@ -449,7 +449,7 @@ func scanFileFilteredWithDirectory(file *os.File, dir Directory, filter EntryFil
 	// matching series. Every series' timestamp and value payloads live in one
 	// region [0, dirOff) before the directory (WriteFile writes them
 	// sequentially), so a single read replaces ~one syscall per matching series
-	// — at campaign scale (100k series/block) the per-series ReadAt was ~21% of
+	// - at campaign scale (100k series/block) the per-series ReadAt was ~21% of
 	// the range-step query (see metrics-query-redesign.md, phase 1b). section is
 	// nil for pathologically large blocks, where we fall back to per-series reads.
 	section, err := readChunkSection(file, dir)
@@ -615,7 +615,7 @@ type timestampCacheKey struct {
 }
 
 // decodeEntryTimestampsFromPayload decodes (and caches) a series' timestamps from
-// an in-memory payload slice — the bulk-section path's counterpart to
+// an in-memory payload slice - the bulk-section path's counterpart to
 // decodeEntryTimestampsFromFileCopy. copyResult is honoured on cache hits so
 // callers that retain the slice past the section's lifetime get an independent copy.
 func decodeEntryTimestampsFromPayload(entry DirectoryEntry, cache map[timestampCacheKey][]int64, copyResult bool, payload []byte) ([]int64, error) {

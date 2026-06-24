@@ -84,7 +84,7 @@ func main() {
 
 	fmt.Printf("vlbench: n=%d batch=%d vl=%s\n\n", flagN, flagBatch, flagVL)
 
-	// W — Write throughput via POST /insert/jsonline
+	// W - Write throughput via POST /insert/jsonline
 	fmt.Println("W — Write throughput")
 	fmt.Println("--------------------")
 
@@ -144,7 +144,7 @@ func main() {
 	// Force flush.
 	time.Sleep(3 * time.Second)
 
-	// M — Storage footprint.
+	// M - Storage footprint.
 	fmt.Println("M — Storage")
 	fmt.Println("-----------")
 	var total int64
@@ -157,7 +157,7 @@ func main() {
 	fmt.Printf("  data dir:   %s\n", humanBytes(total))
 	fmt.Printf("  vl VmRSS:   %s\n\n", vlRSS())
 
-	// R — Read latency.
+	// R - Read latency.
 	fmt.Println("R — Read latency (100 iterations)")
 	fmt.Println("----------------------------------")
 
@@ -174,15 +174,15 @@ func main() {
 		from  time.Time
 		to    time.Time
 	}{
-		// R1: label filter (AND) — LogsQL: field:value AND field:value
+		// R1: label filter (AND) - LogsQL: field:value AND field:value
 		{"R1 service+level (AND)", `service:svc-00 AND level:ERROR`, fullFrom, fullTo},
-		// R2: time range — narrow window, any service
+		// R2: time range - narrow window, any service
 		{"R2 time range 1h slice", `*`, queryFrom, queryTo},
 		// R3: FTS common token
 		{"R3 FTS common token", `"` + commonToken + `"`, fullFrom, fullTo},
 		// R4: FTS rare token
 		{"R4 FTS rare token", `"` + rareToken + `"`, fullFrom, fullTo},
-		// R5: host lookup (equivalent of trace_id lookup — unique field)
+		// R5: host lookup (equivalent of trace_id lookup - unique field)
 		{"R5 host lookup", `host:host-000`, fullFrom, fullTo},
 	}
 

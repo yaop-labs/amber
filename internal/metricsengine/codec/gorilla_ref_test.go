@@ -1,11 +1,11 @@
 package codec
 
-// Reference Gorilla encoder (Pelkonen et al., VLDB 2015) — test-only code for
+// Reference Gorilla encoder (Pelkonen et al., VLDB 2015) - test-only code for
 // the bytes/sample comparison in codec_compare_test.go. Encode-only: we
 // measure stream sizes, not round-trips. The bit layouts follow the paper:
 // timestamp delta-of-delta bucket codes and XOR float compression with
 // leading/trailing-zero windows; this is also the chunk format Prometheus
-// uses, so "beats Gorilla" here ≈ "beats the Prometheus chunk codec".
+// uses, so "beats Gorilla" here ~ "beats the Prometheus chunk codec".
 
 import (
 	"math"
@@ -73,7 +73,7 @@ func gorillaValueBits(values []float64) int {
 			leading = 31 // 5-bit field cap, as in the paper
 		}
 		if prevLeading >= 0 && leading >= prevLeading && trailing >= prevTrailing {
-			// '10': meaningful bits fit the previous window — reuse it.
+			// '10': meaningful bits fit the previous window - reuse it.
 			w.writeBits(2 + (64 - prevLeading - prevTrailing))
 			continue
 		}

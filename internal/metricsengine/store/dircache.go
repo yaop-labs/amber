@@ -6,7 +6,7 @@ import "github.com/yaop-labs/amber/internal/metricsengine/block"
 // a fixed count bound (was: 8 entries): a directory's retained footprint
 // scales with its series count, so a count bound either thrashes on large
 // blocks or wastes memory on small ones. A byte budget gives a predictable
-// ceiling regardless of block shape — the campaign query path re-decodes
+// ceiling regardless of block shape - the campaign query path re-decodes
 // every in-window directory it cannot hold, and at ~30 blocks the re-decode
 // dominated both CPU and allocations (see rate_query_bench_test.go).
 //
@@ -24,8 +24,8 @@ type dirCacheEntry struct {
 }
 
 // defaultDirCacheBudget bounds cached directory memory. ~320MiB holds eight
-// 100k-series campaign blocks (~40MiB decoded each) — matching the worst case
-// of the old count=8 bound — while letting many more small blocks stay warm.
+// 100k-series campaign blocks (~40MiB decoded each) - matching the worst case
+// of the old count=8 bound - while letting many more small blocks stay warm.
 // Sized to stay clear of the metrics store's GOMEMLIMIT-class soft limit so
 // caching does not reintroduce the GC-assist pathology that motivated the
 // original bound.
