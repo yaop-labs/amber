@@ -42,3 +42,7 @@ docs/
 
 # Research artifacts — future publication, kept private
 research/
+
+# Local build output / scratch data dirs
+/bin/
+/data/
