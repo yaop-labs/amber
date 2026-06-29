@@ -203,7 +203,7 @@ func run() error {
 	}
 
 	if cfg.API.GRPCAddr != "" {
-		grpcServer := ambergrpc.NewServer(stack.Batcher, int(cfg.API.MaxRequestBytes), log)
+		grpcServer := ambergrpc.NewServer(stack.Batcher, stack.MetricStore, int(cfg.API.MaxRequestBytes), log)
 		go func() {
 			log.Info("grpc server listening", "addr", cfg.API.GRPCAddr)
 			if err := ambergrpc.ListenAndServe(grpcServer, cfg.API.GRPCAddr); err != nil {
