@@ -1,11 +1,13 @@
 package store
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1845,10 +1847,15 @@ type groupedRateSeries struct {
 func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Selector, opts query.Options, groupLabel string) (map[uint64]*groupedRateSeries, error) {
 	head := s.headSnapshot(selector)
 	grouped := make(map[uint64]*groupedRateSeries, len(head))
-	add := func(seriesID uint64, groupKey string, timestamps, values []int64) {
+	// Same pre-sizing as parallelRangeStepReduce: a block series recurs in
+	// every in-window block, so reserve for all of them at first sight. Head
+	// series never recur across blocks, so they pass hint=1 to avoid a
+	// blockCount-fold over-allocation on high-churn/head-heavy workloads.
+	blocksHint := max(len(paths), 1)
+	add := func(seriesID uint64, groupKey string, timestamps, values []int64, hint int) {
 		current := grouped[seriesID]
 		if current == nil {
-			current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values))}
+			current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values)*hint)}
 			grouped[seriesID] = current
 		}
 		for i, timestamp := range timestamps {
@@ -1865,7 +1872,7 @@ func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Sel
 			return nil, err
 		}
 		if err := query.ScanResidentBlock(path, rb, selector, opts, groupLabel, func(seriesID uint64, _ model.MetricType, groupValue string, timestamps, values []int64) error {
-			add(seriesID, groupValue, timestamps, values)
+			add(seriesID, groupValue, timestamps, values, blocksHint)
 			return nil
 		}); err != nil {
 			return nil, err
@@ -1876,7 +1883,7 @@ func (s *Store) collectRangeStepSeriesGrouped(paths []string, selector index.Sel
 		if !ok {
 			key = ""
 		}
-		add(series.Entry.SeriesID, key, series.Timestamps, series.Values)
+		add(series.Entry.SeriesID, key, series.Timestamps, series.Values, 1)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -1992,10 +1999,17 @@ func parallelRangeStepReduce[A any](
 			reduce := newReducer()
 			grouped := make(map[uint64]*groupedRateSeries)
 			own := func(id uint64) bool { return int(id%uint64(workers)) == w }
-			add := func(seriesID uint64, groupKey string, timestamps, values []int64) {
+			// A block series recurs in every in-window block, so size its
+			// sample slice for all blocks up front. Growing from one block's
+			// count through repeated doublings dominated the range-step
+			// query's allocations at campaign scale. Head series never recur
+			// across blocks, so they pass hint=1 to avoid a blockCount-fold
+			// over-allocation on high-churn/head-heavy workloads.
+			blocksHint := max(len(prepared), 1)
+			add := func(seriesID uint64, groupKey string, timestamps, values []int64, hint int) {
 				current := grouped[seriesID]
 				if current == nil {
-					current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values))}
+					current = &groupedRateSeries{groupKey: groupKey, samples: make([]rateSample, 0, len(values)*hint)}
 					grouped[seriesID] = current
 				}
 				for i, timestamp := range timestamps {
@@ -2008,7 +2022,7 @@ func parallelRangeStepReduce[A any](
 			}
 			for _, p := range prepared {
 				if err := p.scan.ScanSection(p.section, own, func(seriesID uint64, _ model.MetricType, groupValue string, timestamps, values []int64) error {
-					add(seriesID, groupValue, timestamps, values)
+					add(seriesID, groupValue, timestamps, values, blocksHint)
 					return nil
 				}); err != nil {
 					errs[w] = err
@@ -2017,7 +2031,7 @@ func parallelRangeStepReduce[A any](
 			}
 			for _, hm := range headMatches {
 				if own(hm.id) {
-					add(hm.id, hm.groupKey, hm.timestamps, hm.values)
+					add(hm.id, hm.groupKey, hm.timestamps, hm.values, 1)
 				}
 			}
 			for _, gr := range grouped {
@@ -2357,7 +2371,15 @@ func (s *Store) shouldTryRangeStepSummaries(stepCount, blockCount int, ranges []
 	return true
 }
 
-func addExactRateSampleSteps(out []query.FloatStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options) error {
+// rateStepWorkspace holds the prefix scratch the rate/increase step reducers
+// reuse across every series of a worker, mirroring aggregateStepWorkspace.
+// Callers pass a non-nil workspace (one per worker).
+type rateStepWorkspace struct {
+	prefix []int64
+	stale  []int
+}
+
+func addExactRateSampleSteps(out []query.FloatStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options, workspace *rateStepWorkspace) error {
 	windowMillis := window.Milliseconds()
 	if windowMillis <= 0 {
 		return errors.New("store: window must be at least 1ms")
@@ -2366,8 +2388,8 @@ func addExactRateSampleSteps(out []query.FloatStep, steps []int64, rawSamples []
 	if len(samples) < 2 {
 		return nil
 	}
-	increasePrefix := counterIncreasePrefix(samples)
-	stalePrefix := staleGapPrefix(samples, opts)
+	increasePrefix := counterIncreasePrefixInto(workspace, samples)
+	stalePrefix := staleGapPrefixInto(workspace, samples, opts)
 	lo := 0
 	hi := -1
 	for stepIndex, stepMillis := range steps {
@@ -2396,7 +2418,7 @@ func addExactRateSampleSteps(out []query.FloatStep, steps []int64, rawSamples []
 	return nil
 }
 
-func addExactIncreaseSampleSteps(out []query.IntStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options) error {
+func addExactIncreaseSampleSteps(out []query.IntStep, steps []int64, rawSamples []rateSample, key string, window time.Duration, opts query.Options, workspace *rateStepWorkspace) error {
 	windowMillis := window.Milliseconds()
 	if windowMillis <= 0 {
 		return errors.New("store: window must be at least 1ms")
@@ -2405,8 +2427,8 @@ func addExactIncreaseSampleSteps(out []query.IntStep, steps []int64, rawSamples 
 	if len(samples) < 2 {
 		return nil
 	}
-	increasePrefix := counterIncreasePrefix(samples)
-	stalePrefix := staleGapPrefix(samples, opts)
+	increasePrefix := counterIncreasePrefixInto(workspace, samples)
+	stalePrefix := staleGapPrefixInto(workspace, samples, opts)
 	lo := 0
 	hi := -1
 	for stepIndex, stepMillis := range steps {
@@ -2507,8 +2529,10 @@ func compactExactRateSamples(samples []rateSample) []rateSample {
 	if len(samples) == 0 {
 		return nil
 	}
-	sort.SliceStable(samples, func(i, j int) bool {
-		return samples[i].timestamp < samples[j].timestamp
+	// slices.SortStableFunc, not sort.SliceStable: the reflect-based swapper
+	// allocates per call, and this runs once per series per query.
+	slices.SortStableFunc(samples, func(a, b rateSample) int {
+		return cmp.Compare(a.timestamp, b.timestamp)
 	})
 	write := 0
 	for _, sample := range samples {
@@ -2522,8 +2546,12 @@ func compactExactRateSamples(samples []rateSample) []rateSample {
 	return samples[:write]
 }
 
-func counterIncreasePrefix(samples []rateSample) []int64 {
-	prefix := make([]int64, len(samples))
+func counterIncreasePrefixInto(workspace *rateStepWorkspace, samples []rateSample) []int64 {
+	if cap(workspace.prefix) < len(samples) {
+		workspace.prefix = make([]int64, len(samples))
+	}
+	prefix := workspace.prefix[:len(samples)]
+	prefix[0] = 0
 	for i := 1; i < len(samples); i++ {
 		prefix[i] = prefix[i-1]
 		if delta := samples[i].value - samples[i-1].value; delta > 0 {
@@ -2533,11 +2561,15 @@ func counterIncreasePrefix(samples []rateSample) []int64 {
 	return prefix
 }
 
-func staleGapPrefix(samples []rateSample, opts query.Options) []int {
+func staleGapPrefixInto(workspace *rateStepWorkspace, samples []rateSample, opts query.Options) []int {
 	if opts.MaxSampleGapMillis == nil {
 		return nil
 	}
-	prefix := make([]int, len(samples))
+	if cap(workspace.stale) < len(samples) {
+		workspace.stale = make([]int, len(samples))
+	}
+	prefix := workspace.stale[:len(samples)]
+	prefix[0] = 0
 	for i := 1; i < len(samples); i++ {
 		prefix[i] = prefix[i-1]
 		if samples[i].timestamp-samples[i-1].timestamp > *opts.MaxSampleGapMillis {
@@ -2555,8 +2587,9 @@ func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Select
 	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
 		func() []query.FloatStep { return makeFloatSteps(steps) },
 		func() func([]query.FloatStep, *groupedRateSeries) error {
+			workspace := &rateStepWorkspace{}
 			return func(acc []query.FloatStep, gr *groupedRateSeries) error {
-				return addExactRateSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts)
+				return addExactRateSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts, workspace)
 			}
 		},
 		mergeFloatSteps)
@@ -2571,8 +2604,9 @@ func (s *Store) rateByLabelRangeStepsExact(paths []string, selector index.Select
 		return nil, err
 	}
 	out = makeFloatSteps(steps)
+	workspace := &rateStepWorkspace{}
 	for _, series := range grouped {
-		if err := addExactRateSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
+		if err := addExactRateSampleSteps(out, steps, series.samples, series.groupKey, window, opts, workspace); err != nil {
 			return nil, err
 		}
 	}
@@ -2583,8 +2617,9 @@ func (s *Store) increaseByLabelRangeStepsExact(paths []string, selector index.Se
 	out, ok, err := parallelRangeStepReduce(s, paths, selector, opts, label,
 		func() []query.IntStep { return makeIntSteps(steps) },
 		func() func([]query.IntStep, *groupedRateSeries) error {
+			workspace := &rateStepWorkspace{}
 			return func(acc []query.IntStep, gr *groupedRateSeries) error {
-				return addExactIncreaseSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts)
+				return addExactIncreaseSampleSteps(acc, steps, gr.samples, gr.groupKey, window, opts, workspace)
 			}
 		},
 		mergeIntSteps)
@@ -2599,8 +2634,9 @@ func (s *Store) increaseByLabelRangeStepsExact(paths []string, selector index.Se
 		return nil, err
 	}
 	out = makeIntSteps(steps)
+	workspace := &rateStepWorkspace{}
 	for _, series := range grouped {
-		if err := addExactIncreaseSampleSteps(out, steps, series.samples, series.groupKey, window, opts); err != nil {
+		if err := addExactIncreaseSampleSteps(out, steps, series.samples, series.groupKey, window, opts, workspace); err != nil {
 			return nil, err
 		}
 	}
