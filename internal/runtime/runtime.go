@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -65,6 +66,11 @@ type MetricsOptions struct {
 	// DogfoodInterval enables the in-process selfobs scraper.
 	// Zero disables it.
 	DogfoodInterval time.Duration
+	// CacheBudget is the combined byte budget for the metric store's block
+	// caches (directories + resident indexes). Zero derives it from
+	// MemoryLimit/2 when a memory limit is set; otherwise the store
+	// defaults apply.
+	CacheBudget int64
 }
 
 // StorageOptions configures segment rotation and the optional S3 tier.
@@ -346,6 +352,20 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		if metricsDir == "" {
 			metricsDir = filepath.Join(cfg.DataDir, "metrics")
 		}
+		cacheBudget := cfg.Metrics.CacheBudget
+		if cacheBudget == 0 {
+			// Derive from the effective soft memory limit: the value set here
+			// if any, else whatever GOMEMLIMIT/env already imposed (read back
+			// via SetMemoryLimit(-1)). Half the limit for block caches leaves
+			// the other half to query scratch, ingest buffers and the head.
+			effectiveLimit := cfg.MemoryLimit
+			if effectiveLimit == 0 {
+				effectiveLimit = debug.SetMemoryLimit(-1)
+			}
+			if effectiveLimit > 0 && effectiveLimit != math.MaxInt64 {
+				cacheBudget = effectiveLimit / 2
+			}
+		}
 		ms, err := mestore.OpenWithOptions(metricsDir, mestore.Options{
 			FlushInterval:       cfg.Metrics.FlushInterval,
 			MaxBufferedSamples:  cfg.Metrics.MaxBufferedSamples,
@@ -353,6 +373,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			MaxLabelsPerSeries:  cfg.Metrics.MaxLabelsPerSeries,
 			Retention:           cfg.Metrics.Retention,
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
+			CacheBudget:         cacheBudget,
 		})
 		if err != nil {
 			if logUp != nil {
