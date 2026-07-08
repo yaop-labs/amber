@@ -1,6 +1,10 @@
 package store
 
-import "github.com/yaop-labs/amber/internal/metricsengine/block"
+import (
+	"sync/atomic"
+
+	"github.com/yaop-labs/amber/internal/metricsengine/block"
+)
 
 // dirCache is a byte-budgeted cache of decoded block directories. It replaces
 // a fixed count bound (was: 8 entries): a directory's retained footprint
@@ -12,10 +16,20 @@ import "github.com/yaop-labs/amber/internal/metricsengine/block"
 //
 // All methods require the caller to hold the owning store's lock (the cache
 // piggybacks on s.mu like the map it replaced).
+// cacheCounters holds the hit/miss/eviction tallies shared by dirCache and
+// residentCache. They are atomic because get runs under the store's RLock,
+// where plain increments would race.
+type cacheCounters struct {
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
+}
+
 type dirCache struct {
 	entries map[string]dirCacheEntry
 	bytes   int64
 	budget  int64
+	cacheCounters
 }
 
 type dirCacheEntry struct {
@@ -40,6 +54,19 @@ func newDirCache(budget int64) *dirCache {
 
 func (c *dirCache) get(path string) (block.Directory, bool) {
 	e, ok := c.entries[path]
+	if ok {
+		c.hits.Add(1)
+	} else {
+		c.misses.Add(1)
+	}
+	return e.dir, ok
+}
+
+// peek reports a cached directory without touching the hit/miss counters, for
+// callers (Stats, the singleflight double-check) that must not skew the
+// query-path cache metrics with their own probes.
+func (c *dirCache) peek(path string) (block.Directory, bool) {
+	e, ok := c.entries[path]
 	return e.dir, ok
 }
 
@@ -57,6 +84,7 @@ func (c *dirCache) put(path string, dir block.Directory) {
 		}
 		delete(c.entries, key)
 		c.bytes -= e.bytes
+		c.evictions.Add(1)
 	}
 	c.entries[path] = dirCacheEntry{dir: dir, bytes: sz}
 	c.bytes += sz

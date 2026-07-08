@@ -14,6 +14,7 @@ type residentCache struct {
 	entries map[string]residentCacheEntry
 	bytes   int64
 	budget  int64
+	cacheCounters
 }
 
 type residentCacheEntry struct {
@@ -37,6 +38,18 @@ func newResidentCache(budget int64) *residentCache {
 
 func (c *residentCache) get(path string) (*block.ResidentBlock, bool) {
 	e, ok := c.entries[path]
+	if ok {
+		c.hits.Add(1)
+	} else {
+		c.misses.Add(1)
+	}
+	return e.rb, ok
+}
+
+// peek reports a cached resident block without touching the counters, for the
+// singleflight double-check that must not skew the query-path cache metrics.
+func (c *residentCache) peek(path string) (*block.ResidentBlock, bool) {
+	e, ok := c.entries[path]
 	return e.rb, ok
 }
 
@@ -51,6 +64,7 @@ func (c *residentCache) put(path string, rb *block.ResidentBlock) {
 		}
 		delete(c.entries, key)
 		c.bytes -= e.bytes
+		c.evictions.Add(1)
 	}
 	c.entries[path] = residentCacheEntry{rb: rb, bytes: sz}
 	c.bytes += sz

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
 	"github.com/yaop-labs/amber/internal/metricsengine/engine"
@@ -42,9 +44,13 @@ type Store struct {
 	// catalogKeys indexes catalog entries by canonical label key. Kept in
 	// step with catalog.Series (register + evict) so ensureCatalog stays
 	// O(batch) instead of rebuilding an O(active series) map per append.
-	catalogKeys       map[string]uint64
-	directoryCache    *dirCache
-	residentCache     *residentCache
+	catalogKeys    map[string]uint64
+	directoryCache *dirCache
+	residentCache  *residentCache
+	// blockLoads collapses concurrent cold loads of the same block: without
+	// it, N concurrent queries hitting a cold cache (startup, post-compaction
+	// reset) each decode the same ~40MiB directory for one cache entry.
+	blockLoads        singleflight.Group
 	allowGlobFallback bool
 	stopBackground    chan struct{}
 	backgroundDone    chan struct{}
@@ -213,6 +219,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		}
 		e.Registry().SetEvictionBucketing(retentionMs, gran)
 	}
+	dirBudget, residentBudget := splitCacheBudget(opts.CacheBudget)
 	st := &Store{
 		dir:               dir,
 		engine:            e,
@@ -221,8 +228,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		manifest:          manifest,
 		catalog:           catalog,
 		catalogKeys:       catalogKeyMap(catalog),
-		directoryCache:    newDirCache(0),
-		residentCache:     newResidentCache(0),
+		directoryCache:    newDirCache(dirBudget),
+		residentCache:     newResidentCache(residentBudget),
 		allowGlobFallback: allowGlobFallback,
 		catalogLog:        catLog,
 		dirLock:           dirLock,
@@ -1428,9 +1435,18 @@ func (s *Store) Stats() (Stats, error) {
 		// Loading every directory here is what Stats must never go back to -
 		// 100k-series directories x all blocks blew the heap through the
 		// soft memory limit and a stats call took minutes of GC assist.
-		dir, err := s.readDirectory(path)
-		if err != nil {
-			return Stats{}, err
+		// Reuse a warm directory if the query path already cached it (peek,
+		// so the probe never skews the cache metrics), but never populate or
+		// evict here: a stats call must not disturb the directories the query
+		// path is using just to count one legacy block's samples.
+		s.mu.RLock()
+		dir, cached := s.directoryCache.peek(path)
+		s.mu.RUnlock()
+		if !cached {
+			var err error
+			if dir, err = block.ReadDirectory(path); err != nil {
+				return Stats{}, err
+			}
 		}
 		stats.Samples += directorySampleCount(dir)
 	}
@@ -1461,14 +1477,29 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 	if ok {
 		return dir, nil
 	}
-	dir, err := block.ReadDirectory(path)
+	v, err, _ := s.blockLoads.Do("dir:"+path, func() (any, error) {
+		// An earlier flight for this path may have completed and cached the
+		// directory between our get miss above and entering this fn; peek (no
+		// counter side effect) so we don't re-decode a now-warm block.
+		s.mu.RLock()
+		cachedDir, ok := s.directoryCache.peek(path)
+		s.mu.RUnlock()
+		if ok {
+			return cachedDir, nil
+		}
+		dir, err := block.ReadDirectory(path)
+		if err != nil {
+			return block.Directory{}, err
+		}
+		s.mu.Lock()
+		s.directoryCache.put(path, dir)
+		s.mu.Unlock()
+		return dir, nil
+	})
 	if err != nil {
 		return block.Directory{}, err
 	}
-	s.mu.Lock()
-	s.directoryCache.put(path, dir)
-	s.mu.Unlock()
-	return dir, nil
+	return v.(block.Directory), nil
 }
 
 // readResidentBlock returns the compact resident index for a block, building it
@@ -1483,15 +1514,29 @@ func (s *Store) readResidentBlock(path string) (*block.ResidentBlock, error) {
 	if ok {
 		return rb, nil
 	}
-	dir, err := block.ReadDirectory(path)
+	v, err, _ := s.blockLoads.Do("res:"+path, func() (any, error) {
+		// See readDirectory: re-check via peek so a flight that raced an
+		// earlier one to completion doesn't rebuild a now-cached block.
+		s.mu.RLock()
+		cachedRB, ok := s.residentCache.peek(path)
+		s.mu.RUnlock()
+		if ok {
+			return cachedRB, nil
+		}
+		dir, err := block.ReadDirectory(path)
+		if err != nil {
+			return nil, err
+		}
+		rb := block.BuildResidentFromDirectory(dir)
+		s.mu.Lock()
+		s.residentCache.put(path, rb)
+		s.mu.Unlock()
+		return rb, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	rb = block.BuildResidentFromDirectory(dir)
-	s.mu.Lock()
-	s.residentCache.put(path, rb)
-	s.mu.Unlock()
-	return rb, nil
+	return v.(*block.ResidentBlock), nil
 }
 
 func metaMatchesTime(meta BlockMeta, opts query.Options) bool {
