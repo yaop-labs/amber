@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	goruntime "runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
+	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
@@ -96,6 +98,7 @@ func run() error {
 			Retention:           cfg.Metrics.Retention,
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
 			DogfoodInterval:     cfg.Metrics.DogfoodInterval,
+			CacheBudget:         cfg.Metrics.CacheBudget,
 		},
 	})
 	if err != nil {
@@ -149,6 +152,45 @@ func run() error {
 		selfobs.RegisterGaugeFunc("amber_metrics_active_series", "Total distinct series tracked by the metrics index registry (head + sealed, not yet evicted).", func() float64 {
 			return float64(stack.MetricStore.ActiveSeries())
 		})
+		// One CacheStats snapshot per scrape: the gauges below are pulled in
+		// sequence, so a short TTL coalesces them onto a single consistent
+		// instant instead of taking the store's RLock once per metric
+		// (mirrors selfobs.readMemStats).
+		var (
+			cacheStatsMu   sync.Mutex
+			cacheStatsAt   time.Time
+			cacheStatsSnap mestore.CacheStats
+		)
+		cacheStats := func() mestore.CacheStats {
+			cacheStatsMu.Lock()
+			defer cacheStatsMu.Unlock()
+			if !cacheStatsAt.IsZero() && time.Since(cacheStatsAt) < 100*time.Millisecond {
+				return cacheStatsSnap
+			}
+			cacheStatsSnap = stack.MetricStore.CacheStats()
+			cacheStatsAt = time.Now()
+			return cacheStatsSnap
+		}
+		registerCacheGauge := func(name, help string, read func(mestore.CacheStats) int64) {
+			selfobs.RegisterGaugeFunc(name, help, func() float64 { return float64(read(cacheStats())) })
+		}
+		// Cumulative counters go through RegisterCounterFunc so /metrics types
+		// them as counters (matching amber_wal_corrupt_records_total above);
+		// registering a monotonic _total as a gauge breaks rate()/increase()
+		// reset handling and OpenMetrics type validation downstream.
+		registerCacheCounter := func(name, help string, read func(mestore.CacheStats) int64) {
+			selfobs.RegisterCounterFunc(name, help, func() float64 { return float64(read(cacheStats())) })
+		}
+		registerCacheGauge("amber_metrics_dircache_bytes", "Bytes held by the decoded-directory cache.", func(cs mestore.CacheStats) int64 { return cs.DirBytes })
+		registerCacheGauge("amber_metrics_dircache_budget_bytes", "Byte budget of the decoded-directory cache.", func(cs mestore.CacheStats) int64 { return cs.DirBudget })
+		registerCacheCounter("amber_metrics_dircache_hits_total", "Directory cache hits since start.", func(cs mestore.CacheStats) int64 { return cs.DirHits })
+		registerCacheCounter("amber_metrics_dircache_misses_total", "Directory cache misses since start.", func(cs mestore.CacheStats) int64 { return cs.DirMisses })
+		registerCacheCounter("amber_metrics_dircache_evictions_total", "Directory cache evictions since start.", func(cs mestore.CacheStats) int64 { return cs.DirEvictions })
+		registerCacheGauge("amber_metrics_residentcache_bytes", "Bytes held by the resident-index cache.", func(cs mestore.CacheStats) int64 { return cs.ResidentBytes })
+		registerCacheGauge("amber_metrics_residentcache_budget_bytes", "Byte budget of the resident-index cache.", func(cs mestore.CacheStats) int64 { return cs.ResidentBudget })
+		registerCacheCounter("amber_metrics_residentcache_hits_total", "Resident cache hits since start.", func(cs mestore.CacheStats) int64 { return cs.ResidentHits })
+		registerCacheCounter("amber_metrics_residentcache_misses_total", "Resident cache misses since start.", func(cs mestore.CacheStats) int64 { return cs.ResidentMisses })
+		registerCacheCounter("amber_metrics_residentcache_evictions_total", "Resident cache evictions since start.", func(cs mestore.CacheStats) int64 { return cs.ResidentEvictions })
 	}
 
 	if cfg.Retention.Logs.Enabled() || cfg.Retention.Spans.Enabled() {

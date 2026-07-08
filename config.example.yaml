@@ -58,6 +58,12 @@ retention:
     max_bytes: 0
     max_segments: 0
 
+metrics:
+  # Общий байт-бюджет двух блочных кэшей метрик-движка (декодированные
+  # директории + resident-индексы). 0 = вывести из runtime.memory_limit/2,
+  # если лимит задан; иначе — дефолты движка (320+384 MiB).
+  cache_budget: 0       # пример: 419430400 (400 MiB)
+
 runtime:
   # Soft memory limit рантайма Go в байтах (debug.SetMemoryLimit,
   # аналог GOMEMLIMIT; заданное здесь значение перекрывает env).

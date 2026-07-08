@@ -44,6 +44,10 @@ type MetricsConfig struct {
 	// DogfoodInterval enables the in-process selfobs scraper.
 	// Zero disables it.
 	DogfoodInterval time.Duration `yaml:"dogfood_interval"`
+	// CacheBudget is the combined byte budget for the metric store's block
+	// caches. Zero derives it from runtime.memory_limit/2 when a limit is
+	// set; otherwise the store defaults (320+384 MiB) apply.
+	CacheBudget int64 `yaml:"cache_budget"`
 }
 
 // DebugConfig configures debug/profiling endpoints.
@@ -282,6 +286,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Runtime.MemoryLimit < 0 {
 		return fmt.Errorf("runtime.memory_limit must be positive when set")
+	}
+	if c.Metrics.CacheBudget < 0 {
+		return fmt.Errorf("metrics.cache_budget must be positive when set")
 	}
 	return nil
 }
