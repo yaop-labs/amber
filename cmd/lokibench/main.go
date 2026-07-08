@@ -24,6 +24,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/yaop-labs/amber/internal/procmem"
 )
 
 var (
@@ -325,38 +327,9 @@ func humanBytes(b int64) string {
 }
 
 func readRSS() uint64 {
-	// Read Loki's RSS from /proc by finding its PID.
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
-		if err != nil {
-			continue
-		}
-		if !strings.Contains(string(cmdline), "loki-linux-amd64") {
-			continue
-		}
-		status, err := os.ReadFile("/proc/" + e.Name() + "/status")
-		if err != nil {
-			continue
-		}
-		for line := range strings.SplitSeq(string(status), "\n") {
-			if !strings.HasPrefix(line, "VmRSS:") {
-				continue
-			}
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				return 0
-			}
-			var kb uint64
-			fmt.Sscanf(fields[1], "%d", &kb) //nolint:errcheck
-			return kb * 1024
-		}
+	// Loki runs as an external process: find it by cmdline and read its RSS.
+	if rss, ok := procmem.ProcessVmRSS("loki-linux-amd64"); ok {
+		return uint64(rss)
 	}
 	return 0
 }

@@ -3,19 +3,18 @@
 package store
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"os"
 	"runtime"
 	"runtime/debug"
 	rtmetrics "runtime/metrics"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yaop-labs/amber/internal/procmem"
 )
 
 // TestMixedWorkloadRSS runs the campaign fixture under a concurrent query mix
@@ -162,9 +161,9 @@ func runMixed(t *testing.T, st *Store, f *benchFixture, duration time.Duration) 
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				rss, err := readVmRSS()
+				rss, err := procmem.SelfVmRSS()
 				if err != nil {
-					t.Errorf("readVmRSS: %v", err)
+					t.Errorf("SelfVmRSS: %v", err)
 					return
 				}
 				samples++
@@ -196,35 +195,4 @@ func gcCPUSeconds() float64 {
 		return 0
 	}
 	return sample[0].Value.Float64()
-}
-
-// readVmRSS parses VmRSS (bytes) from /proc/self/status. It returns an error
-// rather than calling t.Fatal so the sampler goroutine never trips the
-// FailNow-off-the-test-goroutine footgun.
-func readVmRSS() (int64, error) {
-	file, err := os.Open("/proc/self/status")
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-	sc := bufio.NewScanner(file)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "VmRSS:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			break
-		}
-		kb, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		return kb << 10, nil
-	}
-	if err := sc.Err(); err != nil {
-		return 0, err
-	}
-	return 0, errors.New("VmRSS not found in /proc/self/status")
 }

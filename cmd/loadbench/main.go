@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/procmem"
 	"github.com/yaop-labs/amber/internal/query"
 	rt "github.com/yaop-labs/amber/internal/runtime"
 )
@@ -416,23 +417,11 @@ func measureMemory(stack *rt.Stack, dir string, cold bool) memResult {
 // readRSS returns resident set size from /proc/self/status on linux, or 0
 // elsewhere. Falls back to 0 silently - we report MemStats unconditionally.
 func readRSS() uint64 {
-	data, err := os.ReadFile("/proc/self/status")
+	rss, err := procmem.SelfVmRSS()
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "VmRSS:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			return 0
-		}
-		var kb uint64
-		_, _ = fmt.Sscanf(fields[1], "%d", &kb)
-		return kb * 1024
-	}
-	return 0
+	return uint64(rss)
 }
 
 // --- Phase R -----------------------------------------------------------------
