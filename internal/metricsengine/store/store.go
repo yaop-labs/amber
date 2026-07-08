@@ -52,7 +52,11 @@ type Store struct {
 	// blockLoads collapses concurrent cold loads of the same block: without
 	// it, N concurrent queries hitting a cold cache (startup, post-compaction
 	// reset) each decode the same ~40MiB directory for one cache entry.
-	blockLoads        singleflight.Group
+	blockLoads singleflight.Group
+	// cacheGen is bumped (under s.mu) whenever the block caches are reset so an
+	// in-flight cold load that started before a compaction/retention reset can
+	// detect it and skip caching a directory for a just-deleted block.
+	cacheGen          uint64
 	allowGlobFallback bool
 	stopBackground    chan struct{}
 	backgroundDone    chan struct{}
@@ -646,8 +650,7 @@ func (s *Store) DeleteBefore(cutoffMillis int64) (int, error) {
 		removePaths = append(removePaths, filepath.Join(s.dir, meta.Path))
 	}
 	s.manifest.Blocks = kept
-	s.directoryCache.reset()
-	s.residentCache.reset()
+	s.resetBlockCaches()
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return 0, err
 	}
@@ -734,8 +737,7 @@ func (s *Store) Compact() (string, error) {
 		for _, meta := range oldBlocks {
 			_ = os.Remove(filepath.Join(s.dir, meta.Path))
 		}
-		s.directoryCache.reset()
-		s.residentCache.reset()
+		s.resetBlockCaches()
 		return "", nil
 	}
 
@@ -772,8 +774,7 @@ func (s *Store) Compact() (string, error) {
 	for _, meta := range oldBlocks {
 		_ = os.Remove(filepath.Join(s.dir, meta.Path))
 	}
-	s.directoryCache.reset()
-	s.residentCache.reset()
+	s.resetBlockCaches()
 	s.directoryCache.put(path, dir)
 	if _, err := s.compactHistLocked(); err != nil {
 		return path, err
@@ -1472,6 +1473,40 @@ func (s *Store) setBackgroundError(err error) {
 	s.backgroundErrMu.Unlock()
 }
 
+// resetBlockCaches drops both block caches and bumps the generation so any
+// in-flight cold load that started before this reset skips its cache put - the
+// directory it read may belong to a block compaction/retention just deleted.
+// The caller must hold s.mu for writing.
+func (s *Store) resetBlockCaches() {
+	s.directoryCache.reset()
+	s.residentCache.reset()
+	s.cacheGen++
+}
+
+// putDirectoryIfCurrent caches dir under path only if gen still matches the
+// live cache generation, i.e. no reset happened while the cold load ran.
+// Returns whether the entry was cached.
+func (s *Store) putDirectoryIfCurrent(path string, dir block.Directory, gen uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cacheGen != gen {
+		return false
+	}
+	s.directoryCache.put(path, dir)
+	return true
+}
+
+// putResidentIfCurrent is putDirectoryIfCurrent for the resident cache.
+func (s *Store) putResidentIfCurrent(path string, rb *block.ResidentBlock, gen uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cacheGen != gen {
+		return false
+	}
+	s.residentCache.put(path, rb)
+	return true
+}
+
 func (s *Store) readDirectory(path string) (block.Directory, error) {
 	s.mu.RLock()
 	dir, ok := s.directoryCache.get(path)
@@ -1482,9 +1517,12 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 	v, err, _ := s.blockLoads.Do("dir:"+path, func() (any, error) {
 		// An earlier flight for this path may have completed and cached the
 		// directory between our get miss above and entering this fn; peek (no
-		// counter side effect) so we don't re-decode a now-warm block.
+		// counter side effect) so we don't re-decode a now-warm block. Capture
+		// the cache generation here so a reset (compaction/retention) racing
+		// our read cancels the put below rather than caching a dead block.
 		s.mu.RLock()
 		cachedDir, ok := s.directoryCache.peek(path)
+		gen := s.cacheGen
 		s.mu.RUnlock()
 		if ok {
 			return cachedDir, nil
@@ -1493,9 +1531,7 @@ func (s *Store) readDirectory(path string) (block.Directory, error) {
 		if err != nil {
 			return block.Directory{}, err
 		}
-		s.mu.Lock()
-		s.directoryCache.put(path, dir)
-		s.mu.Unlock()
+		s.putDirectoryIfCurrent(path, dir, gen)
 		return dir, nil
 	})
 	if err != nil {
@@ -1518,9 +1554,11 @@ func (s *Store) readResidentBlock(path string) (*block.ResidentBlock, error) {
 	}
 	v, err, _ := s.blockLoads.Do("res:"+path, func() (any, error) {
 		// See readDirectory: re-check via peek so a flight that raced an
-		// earlier one to completion doesn't rebuild a now-cached block.
+		// earlier one to completion doesn't rebuild a now-cached block, and
+		// capture the generation so a reset racing our read cancels the put.
 		s.mu.RLock()
 		cachedRB, ok := s.residentCache.peek(path)
+		gen := s.cacheGen
 		s.mu.RUnlock()
 		if ok {
 			return cachedRB, nil
@@ -1530,9 +1568,7 @@ func (s *Store) readResidentBlock(path string) (*block.ResidentBlock, error) {
 			return nil, err
 		}
 		rb := block.BuildResidentFromDirectory(dir)
-		s.mu.Lock()
-		s.residentCache.put(path, rb)
-		s.mu.Unlock()
+		s.putResidentIfCurrent(path, rb, gen)
 		return rb, nil
 	})
 	if err != nil {

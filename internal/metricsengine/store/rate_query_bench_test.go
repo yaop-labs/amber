@@ -157,8 +157,7 @@ func warmCaches(b *testing.B, op func() error) {
 
 func (s *Store) testResetCaches() {
 	s.mu.Lock()
-	s.directoryCache.reset()
-	s.residentCache.reset()
+	s.resetBlockCaches()
 	s.mu.Unlock()
 }
 
