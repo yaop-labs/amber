@@ -145,11 +145,29 @@ func benchRangeSelector(by string, window time.Duration) (query.RangeSelector, s
 	return query.RangeSelector{Selector: sel, Window: window}, by
 }
 
+// warmCaches runs op once before the timed loop so B/op reflects the
+// steady-state query, not a cold cache amortized over b.N. The cold cost is
+// measured separately by the _cold variants.
+func warmCaches(b *testing.B, op func() error) {
+	b.Helper()
+	if err := op(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func (s *Store) testResetCaches() {
+	s.mu.Lock()
+	s.directoryCache.reset()
+	s.residentCache.reset()
+	s.mu.Unlock()
+}
+
 // BenchmarkRateByLabelRange_qm1 is the campaign qm1-rate: instant rate of
 // http_requests_total by service (10 groups), 1m window at the last tick.
 func BenchmarkRateByLabelRange_qm1(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("service", time.Minute)
+	warmCaches(b, func() error { _, err := f.st.RateByLabelRange(rs, f.lastTS, by); return err })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out, err := f.st.RateByLabelRange(rs, f.lastTS, by)
@@ -167,6 +185,7 @@ func BenchmarkRateByLabelRange_qm1(b *testing.B) {
 func BenchmarkRateByLabelRange_qm4(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("route", time.Minute)
+	warmCaches(b, func() error { _, err := f.st.RateByLabelRange(rs, f.lastTS, by); return err })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out, err := f.st.RateByLabelRange(rs, f.lastTS, by)
@@ -188,6 +207,7 @@ func BenchmarkRateByLabelRangeSteps_qm2(b *testing.B) {
 	// 5-minute query range ending at the last tick, 45s step.
 	from := f.lastTS - 5*60_000
 	step := 45 * time.Second
+	warmCaches(b, func() error { _, err := f.st.RateByLabelRangeSteps(rs, from, f.lastTS, step, by); return err })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, f.lastTS, step, by)
@@ -215,8 +235,37 @@ func BenchmarkRateByLabelRangeSteps_qm2_campaign(b *testing.B) {
 	if step < time.Second {
 		step = time.Second
 	}
+	warmCaches(b, func() error { _, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by); return err })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		steps, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(steps) == 0 {
+			b.Fatal("empty result")
+		}
+	}
+}
+
+// BenchmarkRateByLabelRangeSteps_qm2_campaign_cold measures the same query
+// against a fully cold cache every iteration: the cost the first query pays
+// after startup or a post-compaction cache reset (30 directory decodes at
+// campaign scale). Kept separate so the steady-state benchmark above stays an
+// honest steady-state number.
+func BenchmarkRateByLabelRangeSteps_qm2_campaign_cold(b *testing.B) {
+	f := buildFixture(b)
+	rs, by := benchRangeSelector("service", time.Minute)
+	span := f.lastTS - f.baseTS
+	from := f.baseTS
+	to := from + span/2
+	step := (time.Duration(span/2/20) * time.Millisecond).Round(time.Second)
+	if step < time.Second {
+		step = time.Second
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		f.st.testResetCaches()
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by)
 		if err != nil {
 			b.Fatal(err)
