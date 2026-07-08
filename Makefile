@@ -1,4 +1,4 @@
-.PHONY: build test bench lint fmt tidy clean run docker docker-run hooks
+.PHONY: build test bench bench-mixed lint fmt tidy clean run docker docker-run hooks
 
 BINARY := amber
 BUILD_FLAGS := -ldflags="-s -w"
@@ -15,6 +15,12 @@ test:
 
 bench:
 	go test ./benchmarks/ -bench=. -benchtime=2s -run=^$$ -timeout=30m
+
+# Mixed-query RSS measurement over the campaign fixture: defaults vs a
+# production-like 800MiB memory limit with the derived cache budget.
+# Tune with AMBER_MIXED_SECS / AMBER_BENCH_SERIES / AMBER_BENCH_TICKS.
+bench-mixed:
+	AMBER_MIXED=1 go test ./internal/metricsengine/store/ -run TestMixedWorkloadRSS -v -count=1 -timeout=30m
 
 lint:
 	go vet ./...
