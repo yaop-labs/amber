@@ -22,8 +22,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
+
+	"github.com/yaop-labs/amber/internal/procmem"
 )
 
 var (
@@ -234,35 +235,8 @@ func runVLQuery(client *http.Client, query string, start, end time.Time) (int, t
 }
 
 func vlRSS() string {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return "unknown"
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
-		if err != nil {
-			continue
-		}
-		if !strings.Contains(string(cmdline), "victoria-logs") {
-			continue
-		}
-		status, err := os.ReadFile("/proc/" + e.Name() + "/status")
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(status), "\n") {
-			if strings.HasPrefix(line, "VmRSS:") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					var kb uint64
-					fmt.Sscanf(fields[1], "%d", &kb) //nolint:errcheck
-					return humanBytes(int64(kb * 1024))
-				}
-			}
-		}
+	if rss, ok := procmem.ProcessVmRSS("victoria-logs"); ok {
+		return humanBytes(rss)
 	}
 	return "unknown"
 }
