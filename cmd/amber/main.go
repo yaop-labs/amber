@@ -16,12 +16,9 @@ import (
 	ambergrpc "github.com/yaop-labs/amber/internal/api/grpc"
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
-	"github.com/yaop-labs/amber/internal/index"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
-	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
-	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func main() {
@@ -52,10 +49,11 @@ func run() error {
 	defer stop()
 
 	stack, err := runtime.New(ctx, runtime.Options{
-		DataDir:        cfg.Storage.DataDir,
-		Logger:         log,
-		IndexCacheSize: cfg.Storage.IndexCacheSize,
-		MemoryLimit:    cfg.Runtime.MemoryLimit,
+		DataDir:               cfg.Storage.DataDir,
+		Logger:                log,
+		IndexCacheSize:        cfg.Storage.IndexCacheSize,
+		IndexBootstrapWorkers: cfg.Runtime.IndexBootstrapWorkers,
+		MemoryLimit:           cfg.Runtime.MemoryLimit,
 		Storage: runtime.StorageOptions{
 			SegmentMaxRecords:  cfg.Storage.SegmentMaxRecords,
 			SegmentMaxBytes:    cfg.Storage.SegmentMaxBytes,
@@ -87,6 +85,7 @@ func run() error {
 			MaxAttrsPerEntry:      cfg.Ingest.MaxAttrsPerEntry,
 			MaxAttrValueBytes:     cfg.Ingest.MaxAttrValueBytes,
 			MaxAttrKeysPerService: cfg.Ingest.MaxAttrKeysPerService,
+			MaxServices:           cfg.Ingest.MaxServices,
 		},
 		Metrics: runtime.MetricsOptions{
 			Disabled:            !cfg.Metrics.Enabled,
@@ -99,6 +98,17 @@ func run() error {
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
 			DogfoodInterval:     cfg.Metrics.DogfoodInterval,
 			CacheBudget:         cfg.Metrics.CacheBudget,
+		},
+		Retention: runtime.RetentionOptions{
+			Interval: cfg.Retention.Interval,
+			Logs: runtime.StreamRetentionOptions{
+				LocalMaxAge: cfg.Retention.Logs.LocalMaxAge, LocalMaxBytes: cfg.Retention.Logs.LocalMaxBytes,
+				MaxAge: cfg.Retention.Logs.MaxAge, MaxTotalBytes: cfg.Retention.Logs.MaxBytes, MaxSegments: cfg.Retention.Logs.MaxSegments,
+			},
+			Spans: runtime.StreamRetentionOptions{
+				LocalMaxAge: cfg.Retention.Spans.LocalMaxAge, LocalMaxBytes: cfg.Retention.Spans.LocalMaxBytes,
+				MaxAge: cfg.Retention.Spans.MaxAge, MaxTotalBytes: cfg.Retention.Spans.MaxBytes, MaxSegments: cfg.Retention.Spans.MaxSegments,
+			},
 		},
 	})
 	if err != nil {
@@ -193,57 +203,6 @@ func run() error {
 		registerCacheCounter("amber_metrics_residentcache_evictions_total", "Resident cache evictions since start.", func(cs mestore.CacheStats) int64 { return cs.ResidentEvictions })
 	}
 
-	if cfg.Retention.Logs.Enabled() || cfg.Retention.Spans.Enabled() {
-		interval := cfg.Retention.Interval
-		if interval == 0 {
-			interval = time.Hour
-		}
-		s3Enabled := cfg.Storage.S3.Bucket != ""
-
-		startCleaner := func(
-			stream string,
-			scfg config.StreamRetentionConfig,
-			mgr *storage.SegmentManager,
-			sparse *index.SparseIndex,
-			dir string,
-			onDelete func(storage.SegmentMeta),
-		) {
-			if !scfg.Enabled() {
-				return
-			}
-			if scfg.HasLocalTier() && !s3Enabled {
-				log.Error("retention local_max_age / local_max_bytes set but storage.s3 is not configured",
-					"stream", stream)
-				return
-			}
-			policy := retention.Policy{
-				LocalMaxAge:   scfg.LocalMaxAge,
-				LocalMaxBytes: scfg.LocalMaxBytes,
-				MaxAge:        scfg.MaxAge,
-				MaxTotalBytes: scfg.MaxBytes,
-				MaxSegments:   scfg.MaxSegments,
-			}
-			cleaner := retention.NewCleaner(mgr, sparse, policy, dir, stream, log)
-			cleaner.SetOnDelete(onDelete)
-			if s3Enabled {
-				cleaner.RequireUploaded(true)
-			}
-			go cleaner.StartLoop(interval, ctx.Done())
-			log.Info("retention enabled",
-				"stream", stream,
-				"local_max_age", scfg.LocalMaxAge,
-				"local_max_bytes", scfg.LocalMaxBytes,
-				"max_age", scfg.MaxAge,
-				"max_bytes", scfg.MaxBytes,
-				"max_segments", scfg.MaxSegments,
-				"interval", interval,
-			)
-		}
-
-		startCleaner("logs", cfg.Retention.Logs, stack.LogManager, stack.LogSparse, stack.LogDir, stack.Executor.InvalidateLogSegment)
-		startCleaner("spans", cfg.Retention.Spans, stack.SpanManager, stack.SpanSparse, stack.SpanDir, stack.Executor.InvalidateSpanSegment)
-	}
-
 	if cfg.API.GRPCAddr != "" {
 		grpcServer := ambergrpc.NewServer(stack.Batcher, stack.MetricStore, int(cfg.API.MaxRequestBytes), log)
 		go func() {
@@ -300,6 +259,7 @@ func run() error {
 		LogSparse:   stack.LogSparse,
 		MetricStore: stack.MetricStore,
 		IsReady:     stack.IsReady,
+		Status:      func() any { return stack.Status() },
 		Logger:      log,
 	}, amberhttp.RoutesConfig{
 		APIKeys:         cfg.API.ResolvedAPIKeys(),

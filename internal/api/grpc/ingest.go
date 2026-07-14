@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -20,13 +21,15 @@ type logsServer struct {
 }
 
 // Export implements the OTLP logs collector service: it converts the request's
-// records and enqueues them, returning Unavailable when the breaker is open.
+// records and waits for their lane durability barrier. A successful response
+// is a durable handoff; temporary admission/storage failures are retryable.
 func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsServiceRequest) (*collectorlogs.ExportLogsServiceResponse, error) {
 	if s.batcher.IsLogBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
 	}
 	var rejected int64
 	var firstErr error
+	var transient error
 	for _, rl := range req.ResourceLogs {
 		service, host := ingest.ExtractResource(rl.Resource.GetAttributes())
 		for _, sl := range rl.ScopeLogs {
@@ -42,13 +45,26 @@ func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSe
 				}
 				if err := s.batcher.SendLog(entry); err != nil {
 					s.log.Debug("grpc: send log failed", "err", err)
-					rejected++
-					if firstErr == nil {
-						firstErr = err
+					if retryableIngestError(err) {
+						transient = err
+					} else {
+						rejected++
+						if firstErr == nil {
+							firstErr = err
+						}
 					}
 				}
 			}
 		}
+	}
+	if err := s.batcher.FlushLogs(ctx); err != nil && transient == nil {
+		transient = err
+	}
+	if transient != nil {
+		if errors.Is(transient, context.Canceled) || errors.Is(transient, context.DeadlineExceeded) {
+			return nil, status.FromContextError(transient).Err()
+		}
+		return nil, status.Error(codes.Unavailable, "durable ingest handoff failed; retry request")
 	}
 	return logExportResponse(rejected, firstErr), nil
 }
@@ -66,6 +82,7 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 	}
 	var rejected int64
 	var firstErr error
+	var transient error
 	for _, rs := range req.ResourceSpans {
 		service, _ := ingest.ExtractResource(rs.Resource.GetAttributes())
 		for _, ss := range rs.ScopeSpans {
@@ -81,15 +98,32 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 				}
 				if err := s.batcher.SendSpan(entry); err != nil {
 					s.log.Debug("grpc: send span failed", "err", err)
-					rejected++
-					if firstErr == nil {
-						firstErr = err
+					if retryableIngestError(err) {
+						transient = err
+					} else {
+						rejected++
+						if firstErr == nil {
+							firstErr = err
+						}
 					}
 				}
 			}
 		}
 	}
+	if err := s.batcher.FlushSpans(ctx); err != nil && transient == nil {
+		transient = err
+	}
+	if transient != nil {
+		if errors.Is(transient, context.Canceled) || errors.Is(transient, context.DeadlineExceeded) {
+			return nil, status.FromContextError(transient).Err()
+		}
+		return nil, status.Error(codes.Unavailable, "durable ingest handoff failed; retry request")
+	}
 	return traceExportResponse(rejected, firstErr), nil
+}
+
+func retryableIngestError(err error) bool {
+	return errors.Is(err, ingest.ErrQueueFull) || errors.Is(err, ingest.ErrBreakerOpen) || errors.Is(err, ingest.ErrClosed)
 }
 
 func logExportResponse(rejected int64, err error) *collectorlogs.ExportLogsServiceResponse {

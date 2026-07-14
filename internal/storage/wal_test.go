@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -158,6 +159,31 @@ func TestWAL_Write_LargePayload(t *testing.T) {
 	}
 }
 
+func TestWALRejectsPayloadLargerThanReplayLimit(t *testing.T) {
+	wal, _ := newTestWAL(t)
+
+	tooLarge := make([]byte, MaxWALRecordBytes+1)
+	if _, err := wal.Write(tooLarge); !errors.Is(err, ErrWALRecordTooLarge) {
+		t.Fatalf("Write oversized error = %v, want ErrWALRecordTooLarge", err)
+	}
+	if _, err := wal.WriteBatch([][]byte{tooLarge}); !errors.Is(err, ErrWALRecordTooLarge) {
+		t.Fatalf("WriteBatch oversized error = %v, want ErrWALRecordTooLarge", err)
+	}
+	// WriteBatchTS adds an 8-byte timestamp to the WAL payload.
+	if _, err := wal.WriteBatchTS([]BatchItem{{Data: make([]byte, MaxWALRecordBytes-7), TS: 1}}); !errors.Is(err, ErrWALRecordTooLarge) {
+		t.Fatalf("WriteBatchTS oversized error = %v, want ErrWALRecordTooLarge", err)
+	}
+	if size, err := wal.Size(); err != nil || size != 0 {
+		t.Fatalf("WAL size after rejected writes = %d, %v; want 0", size, err)
+	}
+	if wal.NextSeq() != 1 {
+		t.Fatalf("NextSeq after rejected writes = %d, want 1", wal.NextSeq())
+	}
+	if _, err := wal.Write([]byte("valid-after-rejection")); err != nil {
+		t.Fatalf("size validation must not fail-stop WAL: %v", err)
+	}
+}
+
 func TestWAL_Replay_Empty(t *testing.T) {
 	wal, _ := newTestWAL(t)
 
@@ -273,6 +299,74 @@ func TestWAL_Replay_TruncatedPayload_StopsGracefully(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected 1 complete record, got %d", count)
+	}
+}
+
+func TestWAL_ReplayRepairsIncompleteTailBeforeAppend(t *testing.T) {
+	dir := t.TempDir()
+
+	wal1, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal1.Write([]byte("before-tail")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, walFileName)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var torn [walHeaderSize]byte
+	binary.LittleEndian.PutUint32(torn[0:4], walMagic)
+	binary.LittleEndian.PutUint32(torn[8:12], 100)
+	if _, err := f.Write(torn[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wal2, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := wal2.Replay(func([]byte) error { return nil })
+	if err != nil || count != 1 {
+		t.Fatalf("Replay repaired tail = count %d, err %v; want 1, nil", count, err)
+	}
+	wantSize := int64(walHeaderSize + len("before-tail"))
+	if size, err := wal2.Size(); err != nil || size != wantSize {
+		t.Fatalf("repaired WAL size = %d, %v; want %d", size, err, wantSize)
+	}
+	if _, err := wal2.Write([]byte("after-repair")); err != nil {
+		t.Fatalf("append after repair: %v", err)
+	}
+	if err := wal2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wal3, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal3.Close()
+	var got []string
+	if _, err := wal3.Replay(func(payload []byte) error {
+		got = append(got, string(payload))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "before-tail" || got[1] != "after-repair" {
+		t.Fatalf("replay after repair+append = %v", got)
 	}
 }
 

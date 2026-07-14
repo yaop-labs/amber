@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -51,6 +52,31 @@ func TestSegmentManager_Open_CreatesStructure(t *testing.T) {
 	}
 }
 
+func TestActiveSegmentMetaReflectsUncheckpointedWriterState(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := OpenSegmentManager(dir, RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sm.Close()
+
+	items := []BatchItem{
+		{Data: []byte("one"), TS: 300},
+		{Data: []byte("two"), TS: 100},
+		{Data: []byte("three"), TS: 200},
+	}
+	if err := sm.WriteBatch(items); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := sm.ActiveSegmentMeta()
+	if !ok {
+		t.Fatal("active segment metadata missing")
+	}
+	if meta.RecordCount != 3 || meta.MinTS != 100 || meta.MaxTS != 300 {
+		t.Fatalf("active metadata = count:%d range:[%d,%d], want count:3 range:[100,300]", meta.RecordCount, meta.MinTS, meta.MaxTS)
+	}
+}
+
 func TestSegmentManager_Open_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 	sm1, _ := OpenSegmentManager(dir, DefaultRotationPolicy)
@@ -78,6 +104,219 @@ func TestSegmentManager_Write_Single(t *testing.T) {
 func TestSegmentManager_Write_Many(t *testing.T) {
 	sm, _ := newTestManager(t)
 	writeN(t, sm, 100)
+}
+
+func TestSegmentManagerTransitionFailureIsSticky(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := OpenSegmentManager(dir, RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.Write([]byte("before failure"), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject a deterministic seal transition failure.
+	if err := sm.active.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := sm.Rotate()
+	if first == nil {
+		t.Fatal("Rotate succeeded with closed active segment file")
+	}
+	second := sm.Write([]byte("must not append"), 2)
+	if second == nil || second.Error() != first.Error() {
+		t.Fatalf("write after transition failure = %v, want sticky %v", second, first)
+	}
+	if err := sm.Close(); err == nil {
+		t.Fatal("Close hid the manager's terminal failure")
+	}
+}
+
+func TestSegmentManagerClosePropagatesWALTruncateError(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := OpenSegmentManager(dir, RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.Write([]byte("durable in wal"), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Closing the descriptor behind WAL makes the close-time truncate fail.
+	if err := sm.wal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := sm.Close()
+	if first == nil {
+		t.Fatal("Close returned nil after WAL truncate/close failure")
+	}
+	if second := sm.Close(); second == nil || second.Error() != first.Error() {
+		t.Fatalf("second Close = %v, want stable %v", second, first)
+	}
+}
+
+func TestSegmentManagerClosePreservesWALWhenActivePathIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	sm, err := OpenSegmentManager(dir, RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.Write([]byte("wal is the recovery copy"), 1); err != nil {
+		t.Fatal(err)
+	}
+	active, ok := sm.ActiveSegmentMeta()
+	if !ok {
+		t.Fatal("active metadata missing")
+	}
+	if err := os.Remove(sm.SegmentPath(active)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.Close(); err == nil {
+		t.Fatal("Close succeeded after active path disappeared")
+	}
+
+	walPath := filepath.Join(dir, walFileName)
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() == 0 {
+		t.Fatal("Close truncated the only recovery WAL copy")
+	}
+	if reopened, err := OpenSegmentManager(dir, RotationPolicy{}); err == nil {
+		_ = reopened.Close()
+		t.Fatal("Open guessed recovery state despite missing active segment")
+	}
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("failed reopen changed recovery WAL size from %d to %d", before.Size(), after.Size())
+	}
+}
+
+func TestSegmentManagerRotateFaultMatrixRecoversExactlyOnce(t *testing.T) {
+	points := []string{
+		"rotate:meta:before_tmp_open",
+		"rotate:meta:after_tmp_write",
+		"rotate:meta:after_tmp_sync",
+		"rotate:meta:before_rename",
+		"rotate:meta:after_rename",
+		"rotate:meta:before_dir_sync",
+		"rotate:before_wal_truncate",
+		"create:before_segment_file",
+		"create:meta:after_tmp_write",
+		"create:meta:before_rename",
+		"create:meta:after_rename",
+		"create:meta:before_dir_sync",
+	}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			dir := t.TempDir()
+			sm, err := OpenSegmentManager(dir, RotationPolicy{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sm.Write([]byte("fault-matrix-record"), 100); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("simulated transition fault")
+			sm.fault = func(got string) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}
+			first := sm.Rotate()
+			if !errors.Is(first, injected) {
+				t.Fatalf("Rotate error = %v, want injected fault at %s", first, point)
+			}
+			if second := sm.Write([]byte("must-not-append"), 200); second == nil || second.Error() != first.Error() {
+				t.Fatalf("Write after %s = %v, want sticky %v", point, second, first)
+			}
+			if err := sm.Close(); err == nil {
+				t.Fatalf("Close hid terminal fault at %s", point)
+			}
+			assertRecoveredPayloadOnce(t, dir, "fault-matrix-record")
+		})
+	}
+}
+
+func TestSegmentManagerCloseFaultMatrixRecoversExactlyOnce(t *testing.T) {
+	points := []string{
+		"close:meta:before_tmp_open",
+		"close:meta:after_tmp_write",
+		"close:meta:after_tmp_sync",
+		"close:meta:before_rename",
+		"close:meta:after_rename",
+		"close:meta:before_dir_sync",
+		"close:before_wal_truncate",
+	}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			dir := t.TempDir()
+			sm, err := OpenSegmentManager(dir, RotationPolicy{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sm.Write([]byte("close-fault-record"), 100); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("simulated close fault")
+			sm.fault = func(got string) error {
+				if got == point {
+					return injected
+				}
+				return nil
+			}
+			first := sm.Close()
+			if !errors.Is(first, injected) {
+				t.Fatalf("Close error = %v, want injected fault at %s", first, point)
+			}
+			if second := sm.Close(); second == nil || second.Error() != first.Error() {
+				t.Fatalf("second Close = %v, want stable %v", second, first)
+			}
+			assertRecoveredPayloadOnce(t, dir, "close-fault-record")
+		})
+	}
+}
+
+func assertRecoveredPayloadOnce(t *testing.T, dir, want string) {
+	t.Helper()
+	sm, err := OpenSegmentManager(dir, RotationPolicy{})
+	if err != nil {
+		t.Fatalf("reopen after injected fault: %v", err)
+	}
+	defer sm.Close()
+	if sm.ActiveRecordCount() > 0 {
+		if err := sm.Rotate(); err != nil {
+			t.Fatalf("seal recovered active: %v", err)
+		}
+	}
+	count := 0
+	for _, seg := range sm.Segments() {
+		sr, err := OpenSegmentReader(sm.SegmentPath(seg), nil)
+		if err != nil {
+			t.Fatalf("open recovered segment %s: %v", seg.FileName, err)
+		}
+		err = sr.Scan(func(data []byte) error {
+			if string(data) == want {
+				count++
+			}
+			if string(data) == "must-not-append" {
+				t.Errorf("sticky manager appended a rejected record")
+			}
+			return nil
+		})
+		_ = sr.Close()
+		if err != nil {
+			t.Fatalf("scan recovered segment %s: %v", seg.FileName, err)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("recovered payload %q count = %d, want 1", want, count)
+	}
 }
 
 func TestSegmentManager_Rotation_ByRecordCount(t *testing.T) {

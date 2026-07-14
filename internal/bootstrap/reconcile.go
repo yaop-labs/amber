@@ -58,6 +58,10 @@ func ReconcileFromRemote(
 			log.Warn("reconcile: skipping unrecognized remote name", "name", fileName)
 			continue
 		}
+		if err := manager.PrepareAdoptUploadedSegment(id); err != nil {
+			log.Warn("reconcile: prepare adoption failed", "segment", fileName, "err", err)
+			continue
+		}
 
 		if err := fetchAllSidecars(store, fileName, log); err != nil {
 			log.Warn("reconcile: fetch failed; skipping", "segment", fileName, "err", err)

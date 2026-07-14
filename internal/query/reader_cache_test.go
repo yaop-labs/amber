@@ -168,6 +168,36 @@ func TestReaderCache_FetchesFromStoreOnMiss(t *testing.T) {
 	}
 }
 
+func TestReaderCache_RefetchesCorruptLocalSegmentOnce(t *testing.T) {
+	srcDir, fileName := produceSealedSegment(t)
+	dstDir := t.TempDir()
+	store := newQueryMemStore(dstDir)
+	uploadToQueryStore(t, srcDir, fileName, store)
+
+	path := filepath.Join(dstDir, fileName)
+	if err := os.WriteFile(path, []byte("corrupt local cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache := newReaderCache(4)
+	cache.setFetcher(makeStoreFetcher(store, dstDir, "logs", nil))
+
+	cr, err := cache.acquire(path)
+	if err != nil {
+		t.Fatalf("acquire after corrupt local cache: %v", err)
+	}
+	defer cache.release(cr)
+	var records int
+	if err := cr.reader.Scan(func([]byte) error { records++; return nil }); err != nil {
+		t.Fatalf("scan refetched segment: %v", err)
+	}
+	if records != 1 {
+		t.Fatalf("records = %d, want 1", records)
+	}
+	if got := atomic.LoadInt32(&store.gets); got == 0 {
+		t.Fatal("corrupt local cache did not trigger remote Get")
+	}
+}
+
 func TestReaderCache_SingleflightDedupsConcurrentMisses(t *testing.T) {
 	srcDir, fileName := produceSealedSegment(t)
 	dstDir := t.TempDir()

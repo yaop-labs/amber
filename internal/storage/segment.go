@@ -606,12 +606,12 @@ func (sr *SegmentReader) scanBlockOffsets() error {
 func (sr *SegmentReader) readHeader() error {
 	var header [segHeaderSize]byte
 	if _, err := io.ReadFull(sr.file, header[:]); err != nil {
-		return fmt.Errorf("segment: read header: %w", err)
+		return fmt.Errorf("%w: read header: %v", ErrSegmentCorrupted, err)
 	}
 
 	magic := binary.LittleEndian.Uint32(header[0:4])
 	if magic != segMagic {
-		return ErrSegmentBadMagic
+		return fmt.Errorf("%w: %v", ErrSegmentCorrupted, ErrSegmentBadMagic)
 	}
 
 	version := binary.LittleEndian.Uint16(header[4:6])
@@ -822,12 +822,12 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 	// concurrent scans of one segment don't serialize on a mutex.
 	var blockHeader [blockHeaderSize]byte
 	if _, err := sr.file.ReadAt(blockHeader[:], offset); err != nil {
-		return fmt.Errorf("segment: read block header at %d: %w", offset, err)
+		return fmt.Errorf("%w: read block header at %d: %v", ErrSegmentCorrupted, offset, err)
 	}
 
 	magic := binary.LittleEndian.Uint32(blockHeader[0:4])
 	if magic != blockMagic {
-		return fmt.Errorf("segment: bad block magic at offset %d", offset)
+		return fmt.Errorf("%w: bad block magic at offset %d", ErrSegmentCorrupted, offset)
 	}
 
 	uncompressedSize := binary.LittleEndian.Uint32(blockHeader[4:8])
@@ -849,7 +849,7 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 	}()
 
 	if _, err := sr.file.ReadAt(compressed, offset+blockHeaderSize); err != nil {
-		return fmt.Errorf("segment: read block data at %d: %w", offset, err)
+		return fmt.Errorf("%w: read block data at %d: %v", ErrSegmentCorrupted, offset, err)
 	}
 
 	uncompressedP := scanUncompressedPool.Get().(*[]byte)
@@ -868,7 +868,7 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 			*uncompressedP = u
 			scanUncompressedPool.Put(uncompressedP)
 		}
-		return fmt.Errorf("segment: decompress block at %d: %w", offset, err)
+		return fmt.Errorf("%w: decompress block at %d: %v", ErrSegmentCorrupted, offset, err)
 	}
 	defer func() {
 		if cap(uncompressed) <= blockPoolMaxSize {
@@ -885,12 +885,12 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 	pos := 0
 	for pos < len(uncompressed) {
 		if pos+4 > len(uncompressed) {
-			return fmt.Errorf("segment: truncated record length at block offset %d", offset)
+			return fmt.Errorf("%w: truncated record length at block offset %d", ErrSegmentCorrupted, offset)
 		}
 		length := int(binary.LittleEndian.Uint32(uncompressed[pos:]))
 		pos += 4
 		if pos+length > len(uncompressed) {
-			return fmt.Errorf("segment: truncated record data at block offset %d", offset)
+			return fmt.Errorf("%w: truncated record data at block offset %d", ErrSegmentCorrupted, offset)
 		}
 		if err := fn(uncompressed[pos : pos+length]); err != nil {
 			return err

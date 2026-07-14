@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,8 @@ import (
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/yaop-labs/amber/internal/config"
@@ -242,6 +245,12 @@ func TestRoutes_OTLPTraceListAndTraceDetail(t *testing.T) {
 	if traceRec.Code != http.StatusOK {
 		t.Fatalf("POST /v1/traces status = %d, want 200", traceRec.Code)
 	}
+	if got := traceRec.Header().Get("Content-Type"); got != "application/x-protobuf" {
+		t.Fatalf("trace response content-type = %q", got)
+	}
+	if err := proto.Unmarshal(traceRec.Body.Bytes(), &collectortrace.ExportTraceServiceResponse{}); err != nil {
+		t.Fatalf("decode OTLP trace response: %v", err)
+	}
 
 	logReq := &collectorlogs.ExportLogsServiceRequest{
 		ResourceLogs: []*logspb.ResourceLogs{{
@@ -269,9 +278,15 @@ func TestRoutes_OTLPTraceListAndTraceDetail(t *testing.T) {
 	if logRec.Code != http.StatusOK {
 		t.Fatalf("POST /v1/logs status = %d, want 200", logRec.Code)
 	}
+	if got := logRec.Header().Get("Content-Type"); got != "application/x-protobuf" {
+		t.Fatalf("log response content-type = %q", got)
+	}
+	if err := proto.Unmarshal(logRec.Body.Bytes(), &collectorlogs.ExportLogsServiceResponse{}); err != nil {
+		t.Fatalf("decode OTLP log response: %v", err)
+	}
 
-	h.flush()
-
+	// OTLP success is the durability/queryability barrier; no explicit DB flush
+	// or batch timeout is allowed between Export and this query.
 	listRec := h.do(t, http.MethodGet, "/api/v1/traces?service=checkout&limit=10", nil, nil)
 	if listRec.Code != http.StatusOK {
 		t.Fatalf("GET /api/v1/traces status = %d, want 200", listRec.Code)
@@ -344,6 +359,85 @@ func TestRoutes_OTLPTraceListAndTraceDetail(t *testing.T) {
 		t.Fatalf("unexpected child logs: %+v", detailResp.Tree[0].Children[0].Logs)
 	}
 }
+
+func TestRoutes_OTLPJSONResponseAndRetryableFailure(t *testing.T) {
+	h := setupAPIHarness(t)
+	req := &collectorlogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+			Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "first"}},
+		}}}},
+	}}}
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := h.do(t, http.MethodPost, "/v1/logs", body, map[string]string{"Content-Type": "application/json"})
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("OTLP JSON response = status %d content-type %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if err := protojson.Unmarshal(rec.Body.Bytes(), &collectorlogs.ExportLogsServiceResponse{}); err != nil {
+		t.Fatalf("decode success response: %v", err)
+	}
+
+	if err := h.batcher.Close(context.Background()); err != nil {
+		t.Fatalf("close batcher: %v", err)
+	}
+	rec = h.do(t, http.MethodPost, "/v1/logs", body, map[string]string{"Content-Type": "application/json"})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("retryable status = %d, want 503", rec.Code)
+	}
+	var rpcStatus statuspb.Status
+	if err := protojson.Unmarshal(rec.Body.Bytes(), &rpcStatus); err != nil {
+		t.Fatalf("decode retryable status: %v", err)
+	}
+	if rpcStatus.Code != int32(codesUnavailable) || rpcStatus.Message == "" {
+		t.Fatalf("retryable OTLP status = %+v", rpcStatus)
+	}
+}
+
+func TestRoutes_OTLPAcceptsGzipWithoutBypassingDurableResponse(t *testing.T) {
+	h := setupAPIHarness(t)
+	req := &collectorlogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+			Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "compressed"}},
+		}}}},
+	}}}
+	raw, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	zw := gzip.NewWriter(&body)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := h.do(t, http.MethodPost, "/v1/logs", body.Bytes(), map[string]string{
+		"Content-Type":     "application/x-protobuf",
+		"Content-Encoding": "gzip",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gzip OTLP status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if err := proto.Unmarshal(rec.Body.Bytes(), &collectorlogs.ExportLogsServiceResponse{}); err != nil {
+		t.Fatalf("decode gzip request response: %v", err)
+	}
+
+	limited := NewOTLPHandler(h.batcher, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), int64(len(raw)-1))
+	limitedReq := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body.Bytes()))
+	limitedReq.Header.Set("Content-Type", "application/x-protobuf")
+	limitedReq.Header.Set("Content-Encoding", "gzip")
+	limitedRec := httptest.NewRecorder()
+	limited.ServeHTTP(limitedRec, limitedReq)
+	if limitedRec.Code != http.StatusBadRequest {
+		t.Fatalf("decompressed limit status = %d, want 400", limitedRec.Code)
+	}
+}
+
+const codesUnavailable = 14
 
 func stringAttr(key, value string) *commonpb.KeyValue {
 	return &commonpb.KeyValue{

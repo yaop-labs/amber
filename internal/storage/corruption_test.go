@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,9 +13,8 @@ import (
 
 // Corruption-injection tests pin the per-subsystem corruption contract:
 //
-//   - WAL: replay stops at the first bad record, counts it (WALCorruptRecords),
-//     and the store opens - records before the corruption survive, nothing
-//     duplicates.
+//   - WAL: a structurally incomplete final record is repaired, but checksum or
+//     middle corruption fails open rather than guessing a safe append point.
 //   - Sealed segment blocks: the store opens; scanning the damaged segment
 //     reports an error (zstd CRC / magic), it does not return garbage.
 //   - Segment footer: deliberately survivable - the reader falls back to the
@@ -153,26 +153,20 @@ func TestCorruption_WALRecord(t *testing.T) {
 	flipByte(t, walPath, walRecordStart(t, walPath, 9)+walHeaderSize+8+2)
 
 	sm, err := OpenSegmentManager(dir, RotationPolicy{MaxRecords: 50})
-	if err != nil {
-		t.Fatalf("store must open over a corrupt WAL, got: %v", err)
+	if sm != nil {
+		_ = sm.Close()
 	}
-	if got := sm.WALCorruptRecords(); got == 0 {
-		t.Error("corruption not counted: WALCorruptRecords() = 0")
+	if !errors.Is(err, ErrWALCorrupted) {
+		t.Fatalf("open error = %v, want ErrWALCorrupted", err)
 	}
-	if err := sm.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// Refusal must be stable: a failed open may replay valid prefix bytes into
+	// the active fd, but the next attempt rolls back to the durable watermark
+	// and must still reject the same corrupt WAL.
+	if sm, err = OpenSegmentManager(dir, RotationPolicy{MaxRecords: 50}); sm != nil {
+		_ = sm.Close()
 	}
-
-	seen := scanAll(t, dir)
-	for i := 1; i <= 109; i++ {
-		if seen[i] != 1 {
-			t.Errorf("record %d seen ×%d, want exactly once", i, seen[i])
-		}
-	}
-	for i := 110; i <= 120; i++ {
-		if seen[i] != 0 {
-			t.Errorf("record %d survived past the corruption point ×%d", i, seen[i])
-		}
+	if !errors.Is(err, ErrWALCorrupted) {
+		t.Fatalf("second open error = %v, want ErrWALCorrupted", err)
 	}
 }
 
@@ -187,21 +181,11 @@ func TestCorruption_WALSeqField(t *testing.T) {
 	flipByte(t, walPath, walRecordStart(t, walPath, 9)+12)
 
 	sm, err := OpenSegmentManager(dir, RotationPolicy{MaxRecords: 50})
-	if err != nil {
-		t.Fatalf("store must open over a corrupt WAL, got: %v", err)
+	if sm != nil {
+		_ = sm.Close()
 	}
-	if got := sm.WALCorruptRecords(); got == 0 {
-		t.Error("seq corruption not counted: WALCorruptRecords() = 0")
-	}
-	if err := sm.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	seen := scanAll(t, dir)
-	for i := 1; i <= 109; i++ {
-		if seen[i] != 1 {
-			t.Errorf("record %d seen ×%d, want exactly once", i, seen[i])
-		}
+	if !errors.Is(err, ErrWALCorrupted) {
+		t.Fatalf("open error = %v, want ErrWALCorrupted", err)
 	}
 }
 

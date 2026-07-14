@@ -15,6 +15,7 @@ package amber_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,51 @@ func eventually(t *testing.T, timeout, step time.Duration, cond func() bool) boo
 		time.Sleep(step)
 	}
 	return cond()
+}
+
+func TestEmbedded_LogRetentionUsesDatabaseRuntime(t *testing.T) {
+	opts := defaultOpts()
+	opts.SegmentMaxRecords = 1
+	opts.BatchSize = 1
+	opts.Retention.Logs.MaxSegments = 1
+	opts.Retention.Interval = 10 * time.Millisecond
+
+	db, err := amber.Open(t.TempDir(), opts)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		entry, err := amber.NewLogEntry(amber.LevelInfo, "retained-svc", "host", "row")
+		if err != nil {
+			t.Fatalf("new log %d: %v", i, err)
+		}
+		entry.Timestamp = time.Now().Add(time.Duration(i) * time.Millisecond)
+		if err := db.Log(ctx, entry); err != nil {
+			t.Fatalf("log %d: %v", i, err)
+		}
+	}
+	if err := db.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	var count int
+	if !eventually(t, 3*time.Second, 20*time.Millisecond, func() bool {
+		result, err := db.QueryLogs(ctx, &amber.LogQuery{Services: []string{"retained-svc"}, Limit: 10})
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		count = len(result.Entries)
+		return count == 1
+	}) {
+		t.Fatalf("embedded retention left %d entries, want 1", count)
+	}
 }
 
 // TestEmbedded_DurabilityAcrossClose writes through the public API, closes
@@ -376,5 +422,42 @@ func TestEmbedded_SecondOpenSameDirFails(t *testing.T) {
 	}
 	if err := db2.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestEmbedded_OversizedRecordsRejectedBeforeAdmission(t *testing.T) {
+	db, err := amber.Open(t.TempDir(), &amber.Options{BatchTimeout: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Reuse one max-sized attribute value so the logical encoded record exceeds
+	// 64 MiB without allocating a 64 MiB test string for every attribute.
+	value := strings.Repeat("x", 65535)
+	attrs := make([]amber.Attr, 1025)
+	for i := range attrs {
+		attrs[i] = amber.Attr{Key: "k", Value: value}
+	}
+	entry, err := amber.NewLogEntry(amber.LevelInfo, "oversized", "", "body", attrs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Log(context.Background(), entry); !errors.Is(err, amber.ErrRecordTooLarge) {
+		t.Fatalf("Log oversized error = %v, want ErrRecordTooLarge", err)
+	}
+
+	span, err := amber.NewSpanEntry(amber.TraceID{}, amber.SpanID{}, amber.SpanID{}, "oversized", "operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	span.Attrs = attrs
+	if err := db.Span(context.Background(), span); !errors.Is(err, amber.ErrRecordTooLarge) {
+		t.Fatalf("Span oversized error = %v, want ErrRecordTooLarge", err)
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.Flush(flushCtx); err != nil {
+		t.Fatalf("Flush after pre-admission rejections: %v", err)
 	}
 }

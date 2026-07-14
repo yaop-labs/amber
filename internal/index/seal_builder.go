@@ -3,6 +3,7 @@ package index
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/yaop-labs/amber/internal/model"
@@ -38,13 +39,10 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	posting := NewPostingListBuilder(16)
 	var traceKeys [][]byte
 	ctx := context.Background()
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 		entryID := model.EntryIDToUint64(entry.ID)
 
@@ -75,10 +73,6 @@ func BuildLogSealIndexes(segmentPath string, log *slog.Logger) (*LogSealIndexes,
 	if err != nil {
 		return nil, err
 	}
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: skipped undecodable records", "path", segmentPath, "count", skipped)
-	}
-
 	if err := bitmap.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
 	}
@@ -140,13 +134,10 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 	posting := NewPostingListBuilder(16)
 	cover := NewCoverBuilder()
 	var traceKeys [][]byte
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var span model.SpanEntry
 		if _, err := span.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode span record: %w", err)
 		}
 		entryID := model.EntryIDToUint64(span.ID)
 
@@ -176,10 +167,6 @@ func BuildSpanSealIndexes(segmentPath string, log *slog.Logger) (*SpanSealIndexe
 	if err != nil {
 		return nil, err
 	}
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: skipped undecodable span records", "path", segmentPath, "count", skipped)
-	}
-
 	if err := bitmap.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
 	}
@@ -217,13 +204,10 @@ func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex
 	defer func() { _ = sr.Close() }()
 
 	idx := NewMultiFieldIndex()
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 
 		entryID := model.EntryIDToUint64(entry.ID)
@@ -244,10 +228,6 @@ func BuildLogBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldIndex
 		return nil, err
 	}
 
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: skipped undecodable records", "path", segmentPath, "count", skipped)
-	}
-
 	if err := idx.Save(segmentPath + ".bidx"); err != nil {
 		return nil, err
 	}
@@ -266,13 +246,10 @@ func BuildLogFTSIndex(segmentPath string, log *slog.Logger) (*FTSIndex, error) {
 
 	idx := NewFTSIndex()
 	ctx := context.Background()
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 		if entry.Body == "" {
 			return nil
@@ -281,10 +258,6 @@ func BuildLogFTSIndex(segmentPath string, log *slog.Logger) (*FTSIndex, error) {
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: fts skipped undecodable records", "path", segmentPath, "count", skipped)
 	}
 
 	if err := idx.Save(segmentPath + ".fidx"); err != nil {
@@ -304,13 +277,10 @@ func BuildLogRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter, 
 	defer func() { _ = sr.Close() }()
 
 	var keys [][]byte
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 		if model.IsZeroTraceID(entry.TraceID) {
 			return nil
@@ -323,10 +293,6 @@ func BuildLogRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter, 
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: ribbon skipped undecodable records", "path", segmentPath, "count", skipped)
 	}
 
 	f, err := BuildRibbonFilter(keys, 8)
@@ -349,13 +315,10 @@ func BuildSpanRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter,
 	defer func() { _ = sr.Close() }()
 
 	var keys [][]byte
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var span model.SpanEntry
 		if _, err := span.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode span record: %w", err)
 		}
 		if model.IsZeroTraceID(span.TraceID) {
 			return nil
@@ -368,10 +331,6 @@ func BuildSpanRibbonFilter(segmentPath string, log *slog.Logger) (*RibbonFilter,
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: ribbon skipped undecodable span records", "path", segmentPath, "count", skipped)
 	}
 
 	f, err := BuildRibbonFilter(keys, 8)
@@ -394,13 +353,10 @@ func BuildLogFTSRibbon(segmentPath string, log *slog.Logger) (*RibbonFilter, err
 	defer func() { _ = sr.Close() }()
 
 	seen := make(map[string]struct{}, 4096)
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 		if entry.Body == "" {
 			return nil
@@ -415,10 +371,6 @@ func BuildLogFTSRibbon(segmentPath string, log *slog.Logger) (*RibbonFilter, err
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: fts ribbon skipped undecodable records", "path", segmentPath, "count", skipped)
 	}
 
 	keys := make([][]byte, 0, len(seen))
@@ -447,13 +399,10 @@ func BuildLogPostingList(segmentPath string, log *slog.Logger) (*PostingList, er
 	defer func() { _ = sr.Close() }()
 
 	b := NewPostingListBuilder(16)
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var entry model.LogEntry
 		if _, err := entry.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 		if model.IsZeroTraceID(entry.TraceID) {
 			return nil
@@ -463,10 +412,6 @@ func BuildLogPostingList(segmentPath string, log *slog.Logger) (*PostingList, er
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: posting list skipped undecodable records", "path", segmentPath, "count", skipped)
 	}
 
 	pl := b.Build()
@@ -485,13 +430,10 @@ func BuildSpanPostingList(segmentPath string, log *slog.Logger) (*PostingList, e
 	defer func() { _ = sr.Close() }()
 
 	b := NewPostingListBuilder(16)
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var span model.SpanEntry
 		if _, err := span.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode span record: %w", err)
 		}
 		if model.IsZeroTraceID(span.TraceID) {
 			return nil
@@ -501,10 +443,6 @@ func BuildSpanPostingList(segmentPath string, log *slog.Logger) (*PostingList, e
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: span posting list skipped undecodable records", "path", segmentPath, "count", skipped)
 	}
 
 	pl := b.Build()
@@ -524,13 +462,10 @@ func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldInde
 	defer func() { _ = sr.Close() }()
 
 	idx := NewMultiFieldIndex()
-	var skipped int
-
 	err = sr.Scan(func(data []byte) error {
 		var span model.SpanEntry
 		if _, err := span.ReadFrom(bytes.NewReader(data)); err != nil {
-			skipped++
-			return nil
+			return fmt.Errorf("decode span record: %w", err)
 		}
 
 		entryID := model.EntryIDToUint64(span.ID)
@@ -550,10 +485,6 @@ func BuildSpanBitmapIndex(segmentPath string, log *slog.Logger) (*MultiFieldInde
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	if skipped > 0 && log != nil {
-		log.Debug("seal_builder: skipped undecodable span records", "path", segmentPath, "count", skipped)
 	}
 
 	if err := idx.Save(segmentPath + ".bidx"); err != nil {

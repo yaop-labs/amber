@@ -152,6 +152,17 @@ func TestExecutor_ExecLog_Empty(t *testing.T) {
 	}
 }
 
+func TestExecutor_RejectsNilQueries(t *testing.T) {
+	sm, sparse, _ := setupTestStore(t)
+	exec := NewExecutor(sm, sm, sparse, index.NewSparseIndex())
+	if _, err := exec.ExecLog(context.Background(), nil); err == nil {
+		t.Fatal("ExecLog(nil) returned nil error")
+	}
+	if _, err := exec.ExecSpan(context.Background(), nil); err == nil {
+		t.Fatal("ExecSpan(nil) returned nil error")
+	}
+}
+
 func TestExecutor_ExecLog_NoSegments_AfterPruning(t *testing.T) {
 	sm, sparse, _ := setupTestStore(t)
 

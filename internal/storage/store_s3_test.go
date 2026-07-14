@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -17,6 +19,24 @@ func TestS3StoreKeyNormalizesPrefix(t *testing.T) {
 	store.cfg.Prefix = "/spans/"
 	if got := store.key("seg_00000001.alog"); got != "spans/seg_00000001.alog" {
 		t.Fatalf("key with slashy prefix = %q, want spans/seg_00000001.alog", got)
+	}
+}
+
+func TestS3StoreCloseCancelsOperationContexts(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	store := &S3Store{cfg: S3StoreConfig{OperationTimeout: time.Hour}, ctx: parent, cancel: cancel}
+	ctx, done := store.operationContext()
+	defer done()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("operation error = %v", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel operation context")
 	}
 }
 

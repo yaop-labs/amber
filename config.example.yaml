@@ -1,6 +1,8 @@
 storage:
   data_dir: ./data
   segment_max_records: 1000000
+  # Считает несжатый serialized payload; проверяется после batch и не является
+  # точным лимитом физического размера файла.
   segment_max_bytes: 536870912
   index_cache_size: 32
 
@@ -65,6 +67,9 @@ metrics:
   cache_budget: 0       # пример: 419430400 (400 MiB)
 
 runtime:
+  # Максимум одновременных rebuild sealed indexes при старте. Один worker
+  # удерживает peak memory bootstrap независимым от числа CPU.
+  index_bootstrap_workers: 1
   # Soft memory limit рантайма Go в байтах (debug.SetMemoryLimit,
   # аналог GOMEMLIMIT; заданное здесь значение перекрывает env).
   # GC начинает работать агрессивнее при приближении к лимиту —
