@@ -76,10 +76,8 @@ func TestStoreSelectIncludesHead(t *testing.T) {
 }
 
 // TestStoreReopenWithHistogramBlocks pins the reopen path for a store that
-// holds both scalar and histogram blocks: rebuildCatalogFromManifest and
-// reconcileLastTouchFromBlocks must skip Kind=histogram entries - reading an
-// MHB1 file with the scalar (MEB1) reader made every such store unopenable
-// ("invalid file magic"; found by the metrics benchmark campaign).
+// holds both scalar and histogram blocks: scalar entries use the MEB1 reader,
+// histogram entries use the MHB1 reader.
 func TestStoreReopenWithHistogramBlocks(t *testing.T) {
 	dir := t.TempDir()
 	st, err := Open(dir)
@@ -174,11 +172,63 @@ func TestStoreRebuildsMissingCatalog(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Remove every catalog persistence file so the reopen has to
-	// rebuild from blocks. As of INDEX_EVICTION_SPEC_v0 the source
-	// of truth is the append-only log (catalog.log + catalog.snapshot);
-	// the legacy JSON catalog (catalogFileName) is kept as a fallback
-	// but is no longer the primary write target. Remove all of them.
+	removeCatalogPersistence(t, dir)
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if len(reopened.catalog.Series) != 1 {
+		t.Fatalf("catalog series = %d, want 1", len(reopened.catalog.Series))
+	}
+}
+
+func TestStoreRebuildsMissingCatalogWithHistogramBlock(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := model.LabelSet{{Name: model.MetricNameLabel, Value: "rpc_latency"}, {Name: "job", Value: "api"}}
+	if _, err := st.AppendSketches([]engine.SketchSample{{
+		Labels: labels, Timestamp: 1000, Exp: &histogram.ExponentialHistogram{
+			Scale: 2, Positive: histogram.Buckets{Offset: 0, Counts: []uint64{1}}, Count: 1, Sum: 1,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	removeCatalogPersistence(t, dir)
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if len(reopened.catalog.Series) != 1 {
+		t.Fatalf("catalog series = %d, want 1", len(reopened.catalog.Series))
+	}
+	idA, err := reopened.Append(labels, model.MetricTypeGauge, 2000, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := reopened.Append(labels, model.MetricTypeGauge, 3000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idA != idB {
+		t.Fatalf("same labels yielded different ids: %d vs %d", idA, idB)
+	}
+}
+
+func removeCatalogPersistence(t *testing.T, dir string) {
+	t.Helper()
 	for _, name := range []string{
 		catalogFileName,
 		catalogLogFileName,
@@ -189,15 +239,6 @@ func TestStoreRebuildsMissingCatalog(t *testing.T) {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)
 		}
-	}
-
-	reopened, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	if len(reopened.catalog.Series) != 1 {
-		t.Fatalf("catalog series = %d, want 1", len(reopened.catalog.Series))
 	}
 }
 
@@ -278,6 +319,62 @@ func TestStoreThresholdFlushAfterAppend(t *testing.T) {
 	}
 	if stats.Blocks != 1 || stats.BufferedSamples != 0 {
 		t.Fatalf("stats = %+v, want one flushed block and empty head", stats)
+	}
+}
+
+func TestStoreThresholdFlushAfterHistogramAppend(t *testing.T) {
+	st, err := OpenWithOptions(t.TempDir(), Options{MaxBufferedSamples: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	labels := model.LabelSet{{Name: model.MetricNameLabel, Value: "rpc_latency"}, {Name: "job", Value: "api"}}
+	if _, err := st.AppendSketches([]engine.SketchSample{{
+		Labels: labels, Timestamp: 1000, Exp: &histogram.ExponentialHistogram{
+			Scale: 2, Positive: histogram.Buckets{Offset: 0, Counts: []uint64{1}}, Count: 1, Sum: 1,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := st.HistStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Blocks != 1 || stats.BufferedSamples != 0 {
+		t.Fatalf("hist stats = %+v, want one flushed block and empty sketch head", stats)
+	}
+}
+
+func TestStoreCloseFlushesHistogramOnlyHead(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := model.LabelSet{{Name: model.MetricNameLabel, Value: "rpc_latency"}, {Name: "job", Value: "api"}}
+	if _, err := st.AppendSketches([]engine.SketchSample{{
+		Labels: labels, Timestamp: 1000, Exp: &histogram.ExponentialHistogram{
+			Scale: 2, Positive: histogram.Buckets{Offset: 0, Counts: []uint64{1}}, Count: 1, Sum: 1,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.HistStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Blocks != 1 || stats.Series != 1 || stats.BufferedSamples != 0 {
+		t.Fatalf("hist stats after close/reopen = %+v, want one sealed histogram block", stats)
 	}
 }
 
@@ -1600,6 +1697,50 @@ func TestStoreRebuildsMissingManifest(t *testing.T) {
 	}
 	if len(reopened.catalog.Series) == 0 {
 		t.Fatal("expected catalog to persist at least one series")
+	}
+}
+
+func TestStoreRebuildsMissingManifestWithHistogramBlock(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := model.LabelSet{{Name: model.MetricNameLabel, Value: "rpc_latency"}, {Name: "job", Value: "api"}}
+	if _, err := st.AppendSketches([]engine.SketchSample{{
+		Labels: labels, Timestamp: 1000, Exp: &histogram.ExponentialHistogram{
+			Scale: 2, Positive: histogram.Buckets{Offset: 0, Counts: []uint64{1}}, Count: 1, Sum: 1,
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, manifestFileName)); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.HistStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Blocks != 1 || stats.Series != 1 {
+		t.Fatalf("hist stats = %+v, want one rebuilt histogram block", stats)
+	}
+	if len(reopened.manifest.Blocks) != 1 || reopened.manifest.Blocks[0].Kind != BlockKindHistogram {
+		t.Fatalf("manifest blocks = %+v, want one histogram entry", reopened.manifest.Blocks)
+	}
+	if got := reopened.manifest.Blocks[0].LabelValues["job"]; len(got) != 1 || got[0] != "api" {
+		t.Fatalf("rebuilt hist label values = %+v, want job=api", reopened.manifest.Blocks[0].LabelValues)
 	}
 }
 

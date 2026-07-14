@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 )
@@ -103,9 +104,14 @@ func (c *Catalog) Ensure(labels model.LabelSet) uint64 {
 func rebuildCatalogFromManifest(dir string, manifest Manifest) (Catalog, error) {
 	catalog := Catalog{NextID: 1}
 	for _, meta := range manifest.Blocks {
-		// Scalar blocks only: histogram blocks (Kind != "") use their own
-		// format (MHB1) and the scalar reader fail-stops on their magic.
-		if meta.Kind != "" {
+		if meta.Kind == BlockKindHistogram {
+			directory, err := histogram.ReadDirectory(filepath.Join(dir, meta.Path))
+			if err != nil {
+				return Catalog{}, err
+			}
+			for _, entry := range directory.Series {
+				catalog.Ensure(entry.Labels)
+			}
 			continue
 		}
 		directory, err := block.ReadDirectory(filepath.Join(dir, meta.Path))
@@ -126,10 +132,16 @@ func rebuildCatalogFromManifest(dir string, manifest Manifest) (Catalog, error) 
 // fsync. Labels are treated as the durable identity in that fallback path.
 func reconcileLastTouchFromBlocks(dir string, manifest Manifest, registry *index.Registry) error {
 	for _, meta := range manifest.Blocks {
-		// Scalar blocks only - a histogram block (Kind != "") carries MHB1
-		// magic and made every reopen of a store with hist data fail with
-		// "invalid file magic" (found by the metrics campaign, 2026-06-12).
-		if meta.Kind != "" {
+		if meta.Kind == BlockKindHistogram {
+			directory, err := histogram.ReadDirectory(filepath.Join(dir, meta.Path))
+			if err != nil {
+				return err
+			}
+			for _, entry := range directory.Series {
+				if !registry.UpdateLastTouch(index.SeriesID(entry.SeriesID), entry.TimeMax) {
+					registry.GetOrCreateAt(entry.Labels, entry.TimeMax)
+				}
+			}
 			continue
 		}
 		directory, err := block.ReadDirectory(filepath.Join(dir, meta.Path))

@@ -338,7 +338,7 @@ func segmentFileEmpty(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer sr.Close()
+	defer func() { _ = sr.Close() }()
 	count := 0
 	if err := sr.Scan(func([]byte) error {
 		count++
@@ -1086,7 +1086,7 @@ func (sm *SegmentManager) close() error {
 		if activeCloseErr != nil {
 			activeCloseErr = fmt.Errorf("segmgr: close active: %w", activeCloseErr)
 			errs = append(errs, activeCloseErr)
-			sm.failStop(activeCloseErr)
+			_ = sm.failStop(activeCloseErr)
 		}
 
 		// Never seal metadata or destroy the WAL after a prior ambiguous
@@ -1116,18 +1116,18 @@ func (sm *SegmentManager) close() error {
 			}
 			if transitionErr != nil {
 				errs = append(errs, transitionErr)
-				sm.failStop(transitionErr)
+				_ = sm.failStop(transitionErr)
 			} else if err := sm.saveTransitionMeta("close"); err != nil {
 				err = fmt.Errorf("segmgr: save meta on close: %w", err)
 				errs = append(errs, err)
-				sm.failStop(err)
+				_ = sm.failStop(err)
 			} else if err := sm.injectFault("close:before_wal_truncate"); err != nil {
 				errs = append(errs, err)
-				sm.failStop(err)
+				_ = sm.failStop(err)
 			} else if err := sm.wal.Truncate(); err != nil {
 				err = fmt.Errorf("segmgr: truncate wal on close: %w", err)
 				errs = append(errs, err)
-				sm.failStop(err)
+				_ = sm.failStop(err)
 			}
 		}
 		sm.active = nil

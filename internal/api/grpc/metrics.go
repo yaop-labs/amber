@@ -6,6 +6,8 @@ import (
 	"log/slog"
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/yaop-labs/amber/internal/otlpmetrics"
 	"github.com/yaop-labs/amber/metricsengine"
@@ -21,7 +23,10 @@ type metricsServer struct {
 // points to the embedded metric store via the shared otlpmetrics path,
 // reporting points that did not land through OTLP partial success.
 func (s *metricsServer) Export(ctx context.Context, req *collectormetrics.ExportMetricsServiceRequest) (*collectormetrics.ExportMetricsServiceResponse, error) {
-	res := otlpmetrics.Ingest(s.store, req, s.log)
+	res, err := otlpmetrics.Ingest(s.store, req, s.log)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, "metrics durable ingest failed; retry request")
+	}
 	// Rejected and unsupported points both failed to land; a gRPC client has
 	// only RejectedDataPoints to learn that, so report their sum.
 	notStored := int64(res.Rejected + res.Unsupported)

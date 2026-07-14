@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -62,45 +61,6 @@ func writeFixtureRecords(t *testing.T, sm *SegmentManager) {
 			t.Fatalf("fixture write %d: %v", i, err)
 		}
 	}
-}
-
-// scanAll seals everything and returns how many times each record id was seen.
-func scanAll(t *testing.T, dir string) map[int]int {
-	t.Helper()
-	sm, err := OpenSegmentManager(dir, DefaultRotationPolicy)
-	if err != nil {
-		t.Fatalf("reopen for scan: %v", err)
-	}
-	defer sm.Close()
-	if err := sm.Rotate(); err != nil {
-		t.Fatalf("rotate for scan: %v", err)
-	}
-
-	seen := make(map[int]int)
-	for _, seg := range sm.Segments() {
-		if seg.RecordCount == 0 {
-			continue
-		}
-		sr, err := OpenSegmentReader(filepath.Join(dir, seg.FileName), nil)
-		if err != nil {
-			t.Fatalf("open reader %s: %v", seg.FileName, err)
-		}
-		scanErr := sr.Scan(func(data []byte) error {
-			const prefix = "corr-rec-"
-			if len(data) <= len(prefix) {
-				return nil
-			}
-			if n, err := strconv.Atoi(string(data[len(prefix):])); err == nil {
-				seen[n]++
-			}
-			return nil
-		})
-		_ = sr.Close()
-		if scanErr != nil {
-			t.Fatalf("scan %s: %v", seg.FileName, scanErr)
-		}
-	}
-	return seen
 }
 
 // walRecordStart walks the WAL record chain and returns the file offset

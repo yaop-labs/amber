@@ -5,12 +5,12 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
-	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/selfobs"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 // runDogfoodScraper appends self-observation samples to the metric store.
-func runDogfoodScraper(interval time.Duration, store *mestore.Store, log *slog.Logger, stop <-chan struct{}, done chan<- struct{}) {
+func runDogfoodScraper(interval time.Duration, store *metricsengine.Store, log *slog.Logger, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

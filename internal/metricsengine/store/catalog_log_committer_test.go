@@ -215,6 +215,59 @@ func TestCatalogLogCommitterRecoversAcrossReopen(t *testing.T) {
 	cl2.Close()
 }
 
+func TestCatalogLogCommitterReturnsSyncErrorToWaiter(t *testing.T) {
+	dir := t.TempDir()
+	cl, err := openCatalogLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl.startCommitter(time.Hour)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- cl.AppendRegister(1, model.LabelSet{{Name: "job", Value: "api"}})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		cl.committer.mu.Lock()
+		written := cl.committer.lastWrittenSeq
+		cl.committer.mu.Unlock()
+		if written >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("append did not reach sync wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cl.mu.Lock()
+	if err := cl.f.Close(); err != nil {
+		cl.mu.Unlock()
+		t.Fatal(err)
+	}
+	cl.mu.Unlock()
+
+	if err := cl.committer.tick(); err == nil {
+		t.Fatal("tick succeeded after closing catalog log file, want sync error")
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("AppendRegister returned nil after sync failure")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AppendRegister hung after sync failure")
+	}
+
+	if err := cl.AppendRegister(2, model.LabelSet{{Name: "job", Value: "worker"}}); err == nil {
+		t.Fatal("AppendRegister after terminal sync error returned nil")
+	}
+	_ = cl.Close()
+}
+
 // silence the unused-test-helper warning across builds.
 var _ = os.Getenv
 

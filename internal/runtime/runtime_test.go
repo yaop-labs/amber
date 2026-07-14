@@ -38,6 +38,43 @@ func TestStatusReportsDegradedReasonsAndClosing(t *testing.T) {
 	}
 }
 
+func TestStatusReportsMetricsWALRepair(t *testing.T) {
+	dataDir := t.TempDir()
+	metricsDir := filepath.Join(dataDir, "metrics")
+	if err := os.MkdirAll(metricsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metricsDir, "head.wal"), []byte{1, 2, 3}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stack, err := New(context.Background(), Options{DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stack.Close(closeCtx); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	got := stack.Status()
+	if !got.Degraded || !statusHasReason(got, "metrics_wal_tail_repaired", 1) {
+		t.Fatalf("status = %+v, want metrics_wal_tail_repaired degraded reason", got)
+	}
+}
+
+func statusHasReason(st Status, code string, count uint64) bool {
+	for _, reason := range st.Reasons {
+		if reason.Code == code && reason.Count == count {
+			return true
+		}
+	}
+	return false
+}
+
 func TestNewReturnsMetricStoreOpenErrorWithoutHanging(t *testing.T) {
 	dir := t.TempDir()
 	metricsPath := filepath.Join(dir, "metrics-file")

@@ -22,6 +22,7 @@ type committer struct {
 	syncedSeq      atomic.Uint64
 	pending        *sync.Cond // signalled on every Sync completion
 	closed         bool
+	terminalErr    error
 	closeOnce      sync.Once
 	stop           chan struct{} // closed by Close to stop the goroutine
 	done           chan struct{} // closed by the goroutine on exit
@@ -62,6 +63,11 @@ func (c *committer) enqueue(records []wal.Record) (uint64, error) {
 		return 0, nil
 	}
 	c.mu.Lock()
+	if c.terminalErr != nil {
+		err := c.terminalErr
+		c.mu.Unlock()
+		return 0, err
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return 0, errCommitterClosed
@@ -96,6 +102,11 @@ func (c *committer) waitSynced(seq uint64) error {
 	}
 	c.mu.Lock()
 	for c.syncedSeq.Load() < seq {
+		if c.terminalErr != nil {
+			err := c.terminalErr
+			c.mu.Unlock()
+			return err
+		}
 		if c.closed {
 			c.mu.Unlock()
 			return errCommitterClosed
@@ -130,6 +141,7 @@ func (c *committer) flushAndStop() error {
 		close(c.stop)
 		<-c.done
 		c.mu.Lock()
+		lastErr = c.terminalErr
 		c.closed = true
 		c.mu.Unlock()
 		c.pending.Broadcast()
@@ -148,6 +160,7 @@ func (c *committer) tick() error {
 	}
 	err := c.wal.Sync()
 	if err != nil {
+		c.fail(err)
 		return err
 	}
 	c.syncedSeq.Store(target)
@@ -155,6 +168,15 @@ func (c *committer) tick() error {
 	c.pending.Broadcast()
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *committer) fail(err error) {
+	c.mu.Lock()
+	if c.terminalErr == nil {
+		c.terminalErr = err
+	}
+	c.pending.Broadcast()
+	c.mu.Unlock()
 }
 
 var errCommitterClosed = walClosedError{}

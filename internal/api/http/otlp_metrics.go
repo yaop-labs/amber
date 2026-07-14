@@ -26,7 +26,11 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := otlpmetrics.Ingest(h.metricStore, req, h.log)
+	res, err := otlpmetrics.Ingest(h.metricStore, req, h.log)
+	if err != nil {
+		writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "metrics durable ingest failed; retry request")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accepted":    res.Accepted,
 		"rejected":    res.Rejected,

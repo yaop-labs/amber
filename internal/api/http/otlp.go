@@ -54,7 +54,7 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if closeCompression != nil {
-		defer closeCompression()
+		defer func() { _ = closeCompression() }()
 	}
 	switch r.URL.Path {
 	case "/v1/logs":
@@ -86,7 +86,7 @@ func (h *OTLPHandler) prepareRequestBody(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			return nil, fmt.Errorf("invalid gzip body: %w", err)
 		}
-		var body io.ReadCloser = io.NopCloser(zr)
+		body := io.NopCloser(zr)
 		if h.maxRequestSize > 0 {
 			body = http.MaxBytesReader(w, body, h.maxRequestSize)
 		}

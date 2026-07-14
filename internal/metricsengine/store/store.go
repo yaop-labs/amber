@@ -625,10 +625,12 @@ func (s *Store) flushAfterAppend() error {
 }
 
 func (s *Store) flushThresholdExceeded(maxBufferedSeries int, maxBufferedSamples int) bool {
-	if maxBufferedSeries > 0 && s.engine.BufferedSeries() >= maxBufferedSeries {
+	bufferedSeries := s.engine.BufferedSeries() + s.engine.BufferedSketchSeries()
+	if maxBufferedSeries > 0 && bufferedSeries >= maxBufferedSeries {
 		return true
 	}
-	if maxBufferedSamples > 0 && s.engine.BufferedSamples() >= maxBufferedSamples {
+	bufferedSamples := s.engine.BufferedSamples() + s.engine.BufferedSketchSamples()
+	if maxBufferedSamples > 0 && bufferedSamples >= maxBufferedSamples {
 		return true
 	}
 	return false
@@ -1462,6 +1464,17 @@ func (s *Store) LastBackgroundError() error {
 	s.backgroundErrMu.RLock()
 	defer s.backgroundErrMu.RUnlock()
 	return s.backgroundErr
+}
+
+// WALRecoveryStats reports metrics head WAL replay repairs observed at open.
+func (s *Store) WALRecoveryStats() wal.RecoverStats {
+	return s.engine.WALRecoveryStats()
+}
+
+// UnknownWALSeries reports WAL records skipped because their series mapping was
+// missing during replay.
+func (s *Store) UnknownWALSeries() int {
+	return s.engine.UnknownWALSeries()
 }
 
 func (s *Store) setBackgroundError(err error) {
@@ -2793,7 +2806,7 @@ func (s *Store) backgroundLoop() {
 }
 
 func (s *Store) maintenance() error {
-	if s.engine.BufferedSeries() > 0 {
+	if s.engine.BufferedSeries() > 0 || s.engine.BufferedSketchSeries() > 0 {
 		if _, err := s.Flush(); err != nil && !errors.Is(err, ErrNoSamples) {
 			return err
 		}
@@ -2822,7 +2835,7 @@ func (s *Store) Close() error {
 			<-s.backgroundDone
 		}
 		s.stopEvictionSweep()
-		if s.engine.BufferedSeries() > 0 {
+		if s.engine.BufferedSeries() > 0 || s.engine.BufferedSketchSeries() > 0 {
 			if _, err := s.Flush(); err != nil && !errors.Is(err, ErrNoSamples) {
 				s.closeErr = err
 			}
