@@ -30,8 +30,7 @@ type sender interface {
 // non-nil it also registers the OTLP metrics service, writing points to the
 // embedded metric store; a nil store leaves MetricsService unregistered so
 // metric clients receive Unimplemented (metrics disabled).
-func NewServer(batcher sender, metricStore *metricsengine.Store, maxRecvBytes int, log *slog.Logger) *grpc.Server {
-	var opts []grpc.ServerOption
+func NewServer(batcher sender, metricStore *metricsengine.Store, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
 	if maxRecvBytes > 0 {
 		opts = append(opts, grpc.MaxRecvMsgSize(maxRecvBytes))
 	}

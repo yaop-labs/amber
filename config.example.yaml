@@ -32,6 +32,15 @@ api:
   read_timeout: 30s
   write_timeout: 30s
   api_key: ""          # Bearer token, пусто = auth выключен
+  security:
+    insecure: true     # required for plaintext unauthenticated non-loopback dev listeners
+    tls:
+      enabled: false
+      cert_file: ""
+      key_file: ""
+      client_ca_file: "" # set for mTLS
+    auth:
+      bearer: []       # [{name: "collector", token_file: "/etc/yaop/tokens/collector"}]
 
 log:
   level: info

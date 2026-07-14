@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -17,15 +16,18 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/yaop-labs/amber/metricsengine"
+	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/grpcreef"
 )
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func openStore(t *testing.T) *metricsengine.Store {
 	t.Helper()
-	store, err := metricsengine.OpenStore(filepath.Join(t.TempDir(), "metrics"))
+	store, err := metricsengine.OpenStore(t.TempDir() + "/metrics")
 	if err != nil {
 		t.Fatalf("open metric store: %v", err)
 	}
@@ -126,18 +128,55 @@ func TestNewServerRegistersMetricsOnlyWithStore(t *testing.T) {
 	})
 }
 
+func TestNewServerReefAuthGatesGRPC(t *testing.T) {
+	serverOpts, err := grpcreef.ServerOptions(nil, &bearer.ServerConfig{
+		Bearer: []bearer.Key{{Name: "collector", Token: "secret"}},
+	})
+	if err != nil {
+		t.Fatalf("ServerOptions: %v", err)
+	}
+	srv := NewServer(fakeSender{}, openStore(t), 0, discardLog(), serverOpts...)
+
+	if _, code := dialAndExport(t, srv); code != codes.Unauthenticated {
+		t.Fatalf("status code without token = %v, want Unauthenticated", code)
+	}
+}
+
+func TestNewServerReefAuthAcceptsBearer(t *testing.T) {
+	serverOpts, err := grpcreef.ServerOptions(nil, &bearer.ServerConfig{
+		Bearer: []bearer.Key{{Name: "collector", Token: "secret"}},
+	})
+	if err != nil {
+		t.Fatalf("ServerOptions: %v", err)
+	}
+	dialOpts, err := grpcreef.DialOptions(nil, &bearer.ClientConfig{Token: "secret"})
+	if err != nil {
+		t.Fatalf("DialOptions: %v", err)
+	}
+	srv := NewServer(fakeSender{}, openStore(t), 0, discardLog(), serverOpts...)
+
+	if _, code := dialAndExport(t, srv, dialOpts...); code != codes.OK {
+		t.Fatalf("status code with token = %v, want OK", code)
+	}
+}
+
 // dialAndExport serves srv on an ephemeral port, sends one empty metrics export,
 // and returns the response and gRPC status code.
-func dialAndExport(t *testing.T, srv *grpc.Server) (*collectormetrics.ExportMetricsServiceResponse, codes.Code) {
+func dialAndExport(t *testing.T, srv *grpc.Server, dialOpts ...grpc.DialOption) (*collectormetrics.ExportMetricsServiceResponse, codes.Code) {
 	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	lis := bufconn.Listen(1 << 20)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if len(dialOpts) == 0 {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	dialOpts = append([]grpc.DialOption{
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+	}, dialOpts...)
+	conn, err := grpc.NewClient("passthrough:///bufnet", dialOpts...)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
