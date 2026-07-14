@@ -22,8 +22,8 @@ func TestDefault(t *testing.T) {
 	if cfg.Ingest.QueueSize != 100_000 {
 		t.Errorf("QueueSize: got %d, want 100000", cfg.Ingest.QueueSize)
 	}
-	if cfg.API.HTTPAddr != ":8080" {
-		t.Errorf("HTTPAddr: got %q, want :8080", cfg.API.HTTPAddr)
+	if cfg.API.HTTPAddr != "localhost:8080" {
+		t.Errorf("HTTPAddr: got %q, want localhost:8080", cfg.API.HTTPAddr)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -61,6 +61,8 @@ ingest:
 api:
   http_addr: ":9090"
   grpc_addr: ":4318"
+  security:
+    insecure: true
 log:
   level: debug
   format: json
@@ -253,8 +255,38 @@ storage:
 	if cfg.Ingest.BatchSize != 1000 {
 		t.Errorf("BatchSize should keep default: got %d", cfg.Ingest.BatchSize)
 	}
-	if cfg.API.HTTPAddr != ":8080" {
+	if cfg.API.HTTPAddr != "localhost:8080" {
 		t.Errorf("HTTPAddr should keep default: got %q", cfg.API.HTTPAddr)
+	}
+}
+
+func TestValidate_NonLoopbackRequiresExplicitInsecureOrSecurity(t *testing.T) {
+	cfg := Default()
+	cfg.API.HTTPAddr = ":8080"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for unauthenticated non-loopback listener")
+	}
+
+	cfg.API.Security.Insecure = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit insecure dev config should pass: %v", err)
+	}
+}
+
+func TestValidate_LegacyAPIKeyProtectsNonLoopback(t *testing.T) {
+	cfg := Default()
+	cfg.API.HTTPAddr = ":8080"
+	cfg.API.APIKey = "secret"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("legacy api_key should map to Reef bearer config: %v", err)
+	}
+}
+
+func TestValidate_PartialTLSRejected(t *testing.T) {
+	cfg := Default()
+	cfg.API.Security.TLS.CertFile = "server.crt"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected partial TLS config to be rejected")
 	}
 }
 
@@ -284,5 +316,13 @@ func TestResolvedAPIKeys_EmptyDisables(t *testing.T) {
 	cfg := APIConfig{}
 	if got := cfg.ResolvedAPIKeys(); got != nil {
 		t.Errorf("empty config should disable auth, got %+v", got)
+	}
+}
+
+func TestResolvedBearerConfig_LegacyFallback(t *testing.T) {
+	cfg := APIConfig{APIKeys: []NamedAPIKey{{Name: "ops", Key: "secret"}}}
+	got := cfg.ResolvedBearerConfig()
+	if got == nil || len(got.Bearer) != 1 || got.Bearer[0].Name != "ops" || got.Bearer[0].Token != "secret" {
+		t.Fatalf("legacy keys not mapped to bearer config: %+v", got)
 	}
 }

@@ -3,10 +3,13 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/tlsconf"
 	"gopkg.in/yaml.v3"
 )
 
@@ -142,6 +145,15 @@ type NamedAPIKey struct {
 	Key  string `yaml:"key"`
 }
 
+// APISecurityConfig configures Reef protection for Amber's external HTTP/gRPC
+// surfaces. Empty TLS/auth is permitted only for local dev or explicit insecure
+// mode; partial TLS/auth blocks fail validation through Reef.
+type APISecurityConfig struct {
+	TLS      tlsconf.ServerConfig `yaml:"tls"`
+	Auth     bearer.ServerConfig  `yaml:"auth"`
+	Insecure bool                 `yaml:"insecure"`
+}
+
 // APIConfig configures the HTTP and gRPC listeners and API keys.
 type APIConfig struct {
 	HTTPAddr          string        `yaml:"http_addr"`
@@ -157,7 +169,8 @@ type APIConfig struct {
 	APIKey  string        `yaml:"api_key"`
 	APIKeys []NamedAPIKey `yaml:"api_keys"`
 
-	GRPCAddr string `yaml:"grpc_addr"`
+	GRPCAddr string            `yaml:"grpc_addr"`
+	Security APISecurityConfig `yaml:"security"`
 }
 
 // ResolvedAPIKeys returns api_keys, or api_key as a single default key.
@@ -169,6 +182,28 @@ func (c APIConfig) ResolvedAPIKeys() []NamedAPIKey {
 		return []NamedAPIKey{{Name: "default", Key: c.APIKey}}
 	}
 	return nil
+}
+
+// ResolvedBearerConfig returns Reef bearer auth config, preferring the new
+// api.security.auth shape and falling back to legacy api_keys/api_key.
+func (c APIConfig) ResolvedBearerConfig() *bearer.ServerConfig {
+	if len(c.Security.Auth.Bearer) > 0 {
+		return &c.Security.Auth
+	}
+	keys := c.ResolvedAPIKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+	out := &bearer.ServerConfig{Bearer: make([]bearer.Key, 0, len(keys))}
+	for _, k := range keys {
+		out.Bearer = append(out.Bearer, bearer.Key{Name: k.Name, Token: k.Key})
+	}
+	return out
+}
+
+func (c APIConfig) reefSecurityConfigured() bool {
+	auth := c.ResolvedBearerConfig()
+	return c.Security.TLS.Enabled || (auth != nil && len(auth.Bearer) > 0)
 }
 
 // LogConfig configures the server's own logging (level, format).
@@ -197,7 +232,7 @@ func Default() *Config {
 			MaxServices:           10_000,
 		},
 		API: APIConfig{
-			HTTPAddr:          ":8080",
+			HTTPAddr:          "localhost:8080",
 			ReadTimeout:       30 * time.Second,
 			ReadHeaderTimeout: 5 * time.Second,
 			WriteTimeout:      30 * time.Second,
@@ -290,6 +325,9 @@ func (c *Config) Validate() error {
 	if c.API.HTTPAddr == "" {
 		return fmt.Errorf("api.http_addr is required")
 	}
+	if err := c.validateAPISecurity(); err != nil {
+		return err
+	}
 	if c.Runtime.MemoryLimit < 0 {
 		return fmt.Errorf("runtime.memory_limit must be positive when set")
 	}
@@ -303,6 +341,54 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("ingest.max_services must be positive when set")
 	}
 	return nil
+}
+
+func (c *Config) validateAPISecurity() error {
+	if _, err := c.API.Security.TLS.Validate(); err != nil {
+		return fmt.Errorf("api.security.tls: %w", err)
+	}
+	if _, err := c.API.ResolvedBearerConfig().Validate(); err != nil {
+		return fmt.Errorf("api.security.auth: %w", err)
+	}
+	secured := c.API.reefSecurityConfigured()
+	if c.API.Security.Insecure && secured {
+		return fmt.Errorf("api.security.insecure cannot be true when TLS or auth is configured")
+	}
+	if !secured && !c.API.Security.Insecure && apiExposesNonLoopback(c.API.HTTPAddr, c.API.GRPCAddr) {
+		return fmt.Errorf("api.security.insecure must be true for plaintext unauthenticated non-loopback listeners")
+	}
+	return nil
+}
+
+func apiExposesNonLoopback(addrs ...string) bool {
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		if exposesNonLoopback(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func exposesNonLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return !ip.IsLoopback()
 }
 
 func validateIngestLane(name string, lane IngestLaneConfig) error {

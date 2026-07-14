@@ -19,6 +19,9 @@ import (
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
+	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/grpcreef"
+	"github.com/yaop-labs/reef/tlsconf"
 )
 
 func main() {
@@ -44,6 +47,16 @@ func run() error {
 		"data_dir", cfg.Storage.DataDir,
 		"http_addr", cfg.API.HTTPAddr,
 	)
+	authCfg := cfg.API.ResolvedBearerConfig()
+	httpTLS, err := tlsconf.Server(&cfg.API.Security.TLS)
+	if err != nil {
+		return fmt.Errorf("configure http reef tls: %w", err)
+	}
+	httpAuth, err := bearer.Require(authCfg, bearer.ExemptPaths("/health", "/readyz", "/metrics"))
+	if err != nil {
+		return fmt.Errorf("configure http reef auth: %w", err)
+	}
+	tlsconf.WarnIfPlaintext(log, "amber-http", httpTLS != nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -204,7 +217,12 @@ func run() error {
 	}
 
 	if cfg.API.GRPCAddr != "" {
-		grpcServer := ambergrpc.NewServer(stack.Batcher, stack.MetricStore, int(cfg.API.MaxRequestBytes), log)
+		grpcOpts, err := grpcreef.ServerOptions(&cfg.API.Security.TLS, authCfg)
+		if err != nil {
+			return fmt.Errorf("configure grpc reef: %w", err)
+		}
+		tlsconf.WarnIfPlaintext(log, "amber-grpc", cfg.API.Security.TLS.Enabled)
+		grpcServer := ambergrpc.NewServer(stack.Batcher, stack.MetricStore, int(cfg.API.MaxRequestBytes), log, grpcOpts...)
 		go func() {
 			log.Info("grpc server listening", "addr", cfg.API.GRPCAddr)
 			if err := ambergrpc.ListenAndServe(grpcServer, cfg.API.GRPCAddr); err != nil {
@@ -262,21 +280,27 @@ func run() error {
 		Status:      func() any { return stack.Status() },
 		Logger:      log,
 	}, amberhttp.RoutesConfig{
-		APIKeys:         cfg.API.ResolvedAPIKeys(),
 		MaxRequestBytes: cfg.API.MaxRequestBytes,
 	})
 
 	httpServer := &http.Server{
 		Addr:              cfg.API.HTTPAddr,
-		Handler:           mux,
+		Handler:           httpAuth(mux),
 		ReadTimeout:       cfg.API.ReadTimeout,
 		ReadHeaderTimeout: cfg.API.ReadHeaderTimeout,
 		WriteTimeout:      cfg.API.WriteTimeout,
 		IdleTimeout:       cfg.API.IdleTimeout,
+		TLSConfig:         httpTLS,
 	}
 	go func() {
 		log.Info("http server listening", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if httpTLS != nil {
+			err = httpServer.ListenAndServeTLS("", "")
+		} else {
+			err = httpServer.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Error("http server error", "err", err)
 		}
 	}()
