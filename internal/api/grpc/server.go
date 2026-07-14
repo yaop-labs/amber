@@ -2,6 +2,7 @@
 package grpc
 
 import (
+	"context"
 	"log/slog"
 	"net"
 
@@ -20,6 +21,8 @@ type sender interface {
 	IsBreakerOpen() bool
 	IsLogBreakerOpen() bool
 	IsSpanBreakerOpen() bool
+	FlushLogs(context.Context) error
+	FlushSpans(context.Context) error
 }
 
 // NewServer builds a gRPC server exposing the OTLP logs and traces collector

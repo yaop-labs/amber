@@ -2,9 +2,79 @@ package storage
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestSegmentManager_RepairedWALTailAppendSurvivesSecondCrash(t *testing.T) {
+	dir := t.TempDir()
+	policy := RotationPolicy{}
+
+	sm1, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sm1.Write([]byte("before-torn-tail"), 100); err != nil {
+		t.Fatal(err)
+	}
+	// Crash-style abandonment: do not Close sm1. Append a partial final WAL
+	// record exactly as a torn write can leave behind.
+	f, err := os.OpenFile(filepath.Join(dir, walFileName), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [walHeaderSize]byte
+	binary.LittleEndian.PutUint32(header[0:4], walMagic)
+	binary.LittleEndian.PutUint32(header[8:12], 128)
+	if _, err := f.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sm2, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("open must repair incomplete tail: %v", err)
+	}
+	if err := sm2.Write([]byte("after-repair"), 200); err != nil {
+		t.Fatalf("write after repair: %v", err)
+	}
+	// Abandon sm2 too. A third open proves the acknowledged post-repair append
+	// is no longer hidden behind the old corrupt bytes.
+	sm3, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		t.Fatalf("reopen after second crash: %v", err)
+	}
+	defer sm3.Close()
+	if err := sm3.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for _, seg := range sm3.Segments() {
+		sr, err := OpenSegmentReader(sm3.SegmentPath(seg), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = sr.Scan(func(data []byte) error {
+			got = append(got, string(data))
+			return nil
+		})
+		_ = sr.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(got) != 2 || got[0] != "before-torn-tail" || got[1] != "after-repair" {
+		t.Fatalf("records after repair, append, crash = %v", got)
+	}
+}
 
 // These two tests pin durability/correctness defects in the crash-recovery
 // path that the existing crash_test.go misses: it exercises only the single

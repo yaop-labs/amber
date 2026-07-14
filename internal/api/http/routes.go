@@ -25,6 +25,7 @@ type RoutesDeps struct {
 	// metric query endpoints.
 	MetricStore *metricsengine.Store
 	IsReady     func() bool
+	Status      func() any
 	Logger      *slog.Logger
 }
 
@@ -63,7 +64,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/traces", auth(NewTracesHandler(deps.Executor, deps.Logger)))
 	mux.Handle("GET /api/v1/services", auth(NewServicesHandler(deps.Executor, deps.Logger)))
 
-	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger)
+	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger, cfg.MaxRequestBytes)
 	mux.Handle("POST /v1/logs", authPost(otlpH))
 	mux.Handle("POST /v1/traces", authPost(otlpH))
 	mux.Handle("POST /v1/metrics", authPost(otlpH))
@@ -75,6 +76,11 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/metrics/quantile", auth(NewMetricsQuantileHandler(deps.MetricStore, deps.Logger)))
 
 	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Batcher, deps.Logger)
+	if deps.Status != nil {
+		mux.Handle("GET /api/v1/admin/status", auth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, deps.Status())
+		})))
+	}
 	mux.Handle("GET /api/v1/admin/stats", auth(http.HandlerFunc(adminH.Stats)))
 	mux.Handle("GET /api/v1/admin/segments", auth(http.HandlerFunc(adminH.Segments)))
 }

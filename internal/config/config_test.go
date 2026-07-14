@@ -213,6 +213,14 @@ func TestValidate_NegativeMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestValidate_IndexBootstrapWorkers(t *testing.T) {
+	cfg := Default()
+	cfg.Runtime.IndexBootstrapWorkers = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error")
+	}
+}
+
 func TestValidate_MissingHTTPAddr(t *testing.T) {
 	cfg := Default()
 	cfg.API.HTTPAddr = ""

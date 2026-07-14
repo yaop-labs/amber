@@ -230,7 +230,8 @@ func RegisterCounterFunc(name, help string, fn func() float64) {
 
 // Pre-declared counters used directly from ingest/bootstrap hot paths.
 var (
-	IngestAccepted  = NewCounterVec("amber_ingest_accepted_total", "Entries successfully written to a segment.", "kind")
+	IngestAccepted  = NewCounterVec("amber_ingest_accepted_total", "Entries accepted into an in-process ingest lane.", "kind")
+	IngestDurable   = NewCounterVec("amber_ingest_durable_total", "Accepted entries durably flushed to the event store.", "kind")
 	IngestDropped   = NewCounterVec("amber_ingest_dropped_total", "Entries dropped before reaching storage.", "kind", "reason")
 	SealIndexErrors = NewCounterVec("amber_seal_index_errors_total", "Index builds that failed during segment seal, after retries.", "kind", "index")
 
@@ -283,6 +284,7 @@ var (
 
 func init() {
 	RegisterCounterVec(IngestAccepted)
+	RegisterCounterVec(IngestDurable)
 	RegisterCounterVec(IngestDropped)
 	RegisterCounterVec(SealIndexErrors)
 	RegisterCounterVec(QueryTotal)

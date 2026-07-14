@@ -21,7 +21,9 @@ import (
 // started: whichever of the record-count or byte-size limit is hit first.
 type RotationPolicy struct {
 	MaxRecords uint64
-	MaxBytes   int64
+	// MaxBytes counts uncompressed serialized record payload admitted to the
+	// active segment. It is checked after a batch and is not an on-disk size cap.
+	MaxBytes int64
 }
 
 var DefaultRotationPolicy = RotationPolicy{
@@ -47,6 +49,12 @@ type SegmentManager struct {
 	onSeal         func(meta SegmentMeta)
 	onSealComplete func(meta SegmentMeta)
 	store          SegmentStore
+	failed         error
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
+	// fault is test-only transition injection. Production managers leave it nil.
+	fault func(point string) error
 
 	// Seal callbacks run on one background worker, strictly in seal order.
 	// A goroutine per seal (the previous design) let slow index builds pile
@@ -61,6 +69,47 @@ type SegmentManager struct {
 	sealWake  chan struct{}
 	sealStop  chan struct{}
 	sealDone  chan struct{}
+}
+
+var ErrSegmentManagerClosed = errors.New("segment manager is closed")
+
+// operational rejects work after a terminal transition failure or Close.
+// Caller holds sm.mu.
+func (sm *SegmentManager) operational() error {
+	if sm.failed != nil {
+		return sm.failed
+	}
+	if sm.closed {
+		return ErrSegmentManagerClosed
+	}
+	if sm.active == nil {
+		return errors.New("segmgr: no active segment")
+	}
+	return nil
+}
+
+// failStop makes a transition error sticky. Caller holds sm.mu.
+func (sm *SegmentManager) failStop(err error) error {
+	if sm.failed == nil {
+		sm.failed = err
+	}
+	return sm.failed
+}
+
+func (sm *SegmentManager) injectFault(point string) error {
+	if sm.fault == nil {
+		return nil
+	}
+	if err := sm.fault(point); err != nil {
+		return fmt.Errorf("segmgr: injected at %s: %w", point, err)
+	}
+	return nil
+}
+
+func (sm *SegmentManager) saveTransitionMeta(transition string) error {
+	return saveMetaWithFault(sm.dir, sm.meta, func(stage string) error {
+		return sm.injectFault(transition + ":meta:" + stage)
+	})
 }
 
 // SetStore replaces the store used for sealed segments.
@@ -154,8 +203,14 @@ func (sm *SegmentManager) replayWAL() error {
 
 	segPath := filepath.Join(sm.dir, activeMeta.FileName)
 
-	if _, err := os.Stat(segPath); os.IsNotExist(err) {
-		return sm.wal.Truncate()
+	if _, err := os.Stat(segPath); err != nil {
+		if os.IsNotExist(err) {
+			// Metadata says this active segment exists. The WAL may be the only
+			// surviving copy of acknowledged records, so never erase it while
+			// guessing how the file disappeared.
+			return fmt.Errorf("segmgr: active segment %s is missing; refusing to truncate recovery WAL", activeMeta.FileName)
+		}
+		return fmt.Errorf("segmgr: stat active segment %s: %w", activeMeta.FileName, err)
 	}
 
 	// Truncate the segment file back to the last fsynced offset. WAL replay
@@ -227,6 +282,9 @@ func (sm *SegmentManager) openActiveSegment() error {
 }
 
 func (sm *SegmentManager) createNewSegment() error {
+	if err := sm.injectFault("create:before_segment_file"); err != nil {
+		return err
+	}
 	id := sm.meta.NextSegmentID
 	fileName := segmentFileName(id)
 	segPath := filepath.Join(sm.dir, fileName)
@@ -238,11 +296,14 @@ func (sm *SegmentManager) createNewSegment() error {
 		// kill -9 test - recovery refused to open with "file exists").
 		// Such an orphan holds no acked data: rotate truncates the WAL
 		// before createNewSegment, and no Write is accepted until saveMeta
-		// below returns. Recreating it is safe. Anything larger than a bare
-		// header contradicts that invariant - fail stop instead of deleting
-		// what might be data.
+		// below returns. A failed save closes the writer and may leave an
+		// empty footer, so size > header is not by itself evidence of data.
+		// Scan before deleting; any record or unreadable structure fail-stops.
 		if info, statErr := os.Stat(segPath); statErr == nil && info.Size() > segHeaderSize {
-			return fmt.Errorf("segmgr: segment file %s exists with %d bytes but is not in meta — refusing to overwrite", fileName, info.Size())
+			empty, checkErr := segmentFileEmpty(segPath)
+			if checkErr != nil || !empty {
+				return fmt.Errorf("segmgr: segment file %s exists with %d bytes but is not a verified empty orphan — refusing to overwrite: %v", fileName, info.Size(), checkErr)
+			}
 		}
 		if rmErr := os.Remove(segPath); rmErr != nil {
 			return fmt.Errorf("segmgr: remove orphan segment %s: %w", fileName, rmErr)
@@ -262,7 +323,7 @@ func (sm *SegmentManager) createNewSegment() error {
 		LocalPresent: &present,
 	})
 
-	if err := saveMeta(sm.dir, sm.meta); err != nil {
+	if err := sm.saveTransitionMeta("create"); err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("segmgr: save meta after create: %w", err)
 	}
@@ -272,11 +333,30 @@ func (sm *SegmentManager) createNewSegment() error {
 	return nil
 }
 
-// Write appends one record: WAL append (durable) then active-segment write,
-// rotating first if the policy limit is reached.
+func segmentFileEmpty(path string) (bool, error) {
+	sr, err := OpenSegmentReader(path, nil)
+	if err != nil {
+		return false, err
+	}
+	defer sr.Close()
+	count := 0
+	if err := sr.Scan(func([]byte) error {
+		count++
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+// Write appends one record: WAL append (durable), active-segment write, then
+// rotation if the completed write reaches a policy threshold.
 func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if err := sm.operational(); err != nil {
+		return err
+	}
 
 	payload := makeWALPayload(ts, data)
 
@@ -285,33 +365,38 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	selfobs.WALWriteDuration.WithLabelValues("single").Observe(time.Since(walStart).Seconds())
 	selfobs.WALWrites.WithLabelValues("single").Inc()
 	if err != nil {
-		return fmt.Errorf("segmgr: wal write: %w", err)
+		err = fmt.Errorf("segmgr: wal write: %w", err)
+		if errors.Is(err, ErrWALRecordTooLarge) {
+			return err
+		}
+		return sm.failStop(err)
 	}
 
 	blocksBefore := sm.active.BlockCount()
 	if err := sm.active.WriteRecord(data, ts); err != nil {
-		return fmt.Errorf("segmgr: segment write: %w", err)
+		return sm.failStop(fmt.Errorf("segmgr: segment write: %w", err))
 	}
 	sm.activeSize += int64(len(data))
 
 	// Sync when WriteRecord flushes a block.
 	if sm.active.BlockCount() > blocksBefore {
 		if err := sm.checkpoint(seq); err != nil {
-			return fmt.Errorf("segmgr: checkpoint: %w", err)
+			return sm.failStop(fmt.Errorf("segmgr: checkpoint: %w", err))
 		}
 	}
 
 	if sm.shouldRotate() {
 		if err := sm.rotate(); err != nil {
-			return fmt.Errorf("segmgr: rotate: %w", err)
+			return sm.failStop(fmt.Errorf("segmgr: rotate: %w", err))
 		}
 	}
 
 	return nil
 }
 
-// WriteBatch appends many records under one WAL fsync (group commit), rotating
-// mid-batch as the policy requires.
+// WriteBatch appends many records under one WAL fsync (group commit). Rotation
+// policy is evaluated after the whole batch, so a segment may overshoot either
+// threshold by at most one admitted batch.
 func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	if len(items) == 0 {
 		return nil
@@ -319,13 +404,20 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if err := sm.operational(); err != nil {
+		return err
+	}
 
 	walStart := time.Now()
 	firstSeq, err := sm.wal.WriteBatchTS(items)
 	selfobs.WALWriteDuration.WithLabelValues("batch").Observe(time.Since(walStart).Seconds())
 	selfobs.WALWrites.WithLabelValues("batch").Inc()
 	if err != nil {
-		return fmt.Errorf("segmgr: wal batch: %w", err)
+		err = fmt.Errorf("segmgr: wal batch: %w", err)
+		if errors.Is(err, ErrWALRecordTooLarge) {
+			return err
+		}
+		return sm.failStop(err)
 	}
 
 	var (
@@ -335,7 +427,7 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	for i, item := range items {
 		before := sm.active.BlockCount()
 		if err := sm.active.WriteRecord(item.Data, item.TS); err != nil {
-			return fmt.Errorf("segmgr: segment write: %w", err)
+			return sm.failStop(fmt.Errorf("segmgr: segment write: %w", err))
 		}
 		sm.activeSize += int64(len(item.Data))
 		if sm.active.BlockCount() > before {
@@ -346,13 +438,13 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 
 	if sawFlush {
 		if err := sm.checkpoint(lastFlushSeq); err != nil {
-			return fmt.Errorf("segmgr: checkpoint: %w", err)
+			return sm.failStop(fmt.Errorf("segmgr: checkpoint: %w", err))
 		}
 	}
 
 	if sm.shouldRotate() {
 		if err := sm.rotate(); err != nil {
-			return fmt.Errorf("segmgr: rotate: %w", err)
+			return sm.failStop(fmt.Errorf("segmgr: rotate: %w", err))
 		}
 	}
 
@@ -434,7 +526,7 @@ func (sm *SegmentManager) rotate() error {
 
 	sm.active = nil
 
-	if err := saveMeta(sm.dir, sm.meta); err != nil {
+	if err := sm.saveTransitionMeta("rotate"); err != nil {
 		return err
 	}
 
@@ -445,6 +537,9 @@ func (sm *SegmentManager) rotate() error {
 	// The reverse order (create first, truncate last) had a crash window where
 	// replay would re-apply the entire WAL into the fresh empty segment,
 	// duplicating every record of the just-sealed one.
+	if err := sm.injectFault("rotate:before_wal_truncate"); err != nil {
+		return err
+	}
 	if err := sm.wal.Truncate(); err != nil {
 		return fmt.Errorf("segmgr: rotate truncate wal: %w", err)
 	}
@@ -548,10 +643,16 @@ func (sm *SegmentManager) Rotate() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.active == nil || sm.active.RecordCount() == 0 {
+	if err := sm.operational(); err != nil {
+		return err
+	}
+	if sm.active.RecordCount() == 0 {
 		return nil
 	}
-	return sm.rotate()
+	if err := sm.rotate(); err != nil {
+		return sm.failStop(fmt.Errorf("segmgr: rotate: %w", err))
+	}
+	return nil
 }
 
 // Segments returns a snapshot of all segment metadata, sealed and active.
@@ -647,9 +748,63 @@ func (sm *SegmentManager) MarkLocalEvicted(id uint32) error {
 		}
 		absent := false
 		seg.LocalPresent = &absent
+		seg.LocalDeletePending = false
 		return saveMeta(sm.dir, sm.meta)
 	}
 	return fmt.Errorf("segmgr: mark local evicted: unknown segment id %d", id)
+}
+
+// BeginLocalEviction durably records an in-progress local-tier eviction. It
+// never permits eviction of the only copy. CompleteLocalEviction must be
+// called after all local segment files have been removed.
+func (sm *SegmentManager) BeginLocalEviction(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		seg := &sm.meta.Segments[i]
+		if seg.UploadState != UploadStateUploaded {
+			return fmt.Errorf("segmgr: begin local eviction: segment %d is not uploaded", id)
+		}
+		if !seg.HasLocalCopy() && !seg.LocalDeletePending {
+			return nil
+		}
+		if seg.LocalDeletePending {
+			return nil
+		}
+		seg.LocalDeletePending = true
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return fmt.Errorf("segmgr: begin local eviction: unknown segment id %d", id)
+}
+
+// CompleteLocalEviction commits the local cache state after local unlink has
+// succeeded. Repeating it is harmless, which lets a crash at any transition
+// point converge on the next retention run.
+func (sm *SegmentManager) CompleteLocalEviction(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		seg := &sm.meta.Segments[i]
+		if seg.UploadState != UploadStateUploaded {
+			return fmt.Errorf("segmgr: complete local eviction: segment %d is not uploaded", id)
+		}
+		if !seg.HasLocalCopy() && !seg.LocalDeletePending {
+			return nil
+		}
+		absent := false
+		seg.LocalPresent = &absent
+		seg.LocalDeletePending = false
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return fmt.Errorf("segmgr: complete local eviction: unknown segment id %d", id)
 }
 
 // BeginDeleteSegment marks a sealed segment for terminal deletion.
@@ -678,24 +833,14 @@ func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	for i, existing := range sm.meta.Segments {
+	for _, existing := range sm.meta.Segments {
 		if existing.ID != meta.ID {
 			continue
 		}
 		if existing.Sealed {
 			return nil
 		}
-		if sm.active != nil && sm.active.RecordCount() > 0 {
-			return fmt.Errorf("segmgr: adopt %d conflicts with non-empty active segment", meta.ID)
-		}
-		if sm.active != nil {
-			_ = sm.active.Close()
-			sm.active = nil
-			sm.activeSize = 0
-		}
-		_ = os.Remove(filepath.Join(sm.dir, existing.FileName))
-		sm.meta.Segments = append(sm.meta.Segments[:i], sm.meta.Segments[i+1:]...)
-		break
+		return fmt.Errorf("segmgr: adopt %d conflicts with active segment; call PrepareAdoptUploadedSegment before download", meta.ID)
 	}
 
 	meta.Sealed = true
@@ -709,6 +854,47 @@ func (sm *SegmentManager) AdoptUploadedSegment(meta SegmentMeta) error {
 	}
 
 	return saveMeta(sm.dir, sm.meta)
+}
+
+// PrepareAdoptUploadedSegment vacates an empty active segment whose ID/path
+// collides with a remote sealed segment before that remote file is downloaded.
+// It immediately creates a fresh active segment with the next ID, so failed or
+// partial reconciliation cannot leave ingest without an active writer.
+func (sm *SegmentManager) PrepareAdoptUploadedSegment(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.failed != nil {
+		return sm.failed
+	}
+	if sm.closed {
+		return ErrSegmentManagerClosed
+	}
+
+	for i, existing := range sm.meta.Segments {
+		if existing.ID != id || existing.Sealed {
+			continue
+		}
+		if sm.active == nil || sm.active.RecordCount() > 0 {
+			return fmt.Errorf("segmgr: prepare adopt %d conflicts with non-empty or missing active writer", id)
+		}
+		if err := sm.active.Close(); err != nil {
+			return sm.failStop(fmt.Errorf("segmgr: prepare adopt close empty active: %w", err))
+		}
+		sm.active = nil
+		sm.activeSize = 0
+		if err := os.Remove(filepath.Join(sm.dir, existing.FileName)); err != nil && !os.IsNotExist(err) {
+			return sm.failStop(fmt.Errorf("segmgr: prepare adopt remove empty active: %w", err))
+		}
+		sm.meta.Segments = append(sm.meta.Segments[:i], sm.meta.Segments[i+1:]...)
+		if err := saveMeta(sm.dir, sm.meta); err != nil {
+			return sm.failStop(fmt.Errorf("segmgr: prepare adopt save meta: %w", err))
+		}
+		if err := sm.createNewSegment(); err != nil {
+			return sm.failStop(fmt.Errorf("segmgr: prepare adopt create replacement active: %w", err))
+		}
+		return nil
+	}
+	return nil
 }
 
 // RecordUploadFailure increments the failure counter and stores a truncated
@@ -769,16 +955,19 @@ func (sm *SegmentManager) RemoveSegment(id uint32) error {
 	return nil
 }
 
-// Flush flushes and checkpoints the active segment (fsync + record the synced
-// size/seq in metadata), the durability barrier behind db.Flush.
+// Flush makes buffered active-segment bytes queryable. WAL durability is
+// established before segment writes; this method does not advance metadata's
+// checkpoint watermark.
 func (sm *SegmentManager) Flush() error {
-	sm.mu.RLock()
-	active := sm.active
-	sm.mu.RUnlock()
-	if active == nil {
-		return nil
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if err := sm.operational(); err != nil {
+		return err
 	}
-	return active.Flush()
+	if err := sm.active.Flush(); err != nil {
+		return sm.failStop(fmt.Errorf("segmgr: flush active: %w", err))
+	}
+	return nil
 }
 
 // ActiveRecordCount returns the record count of the current active segment.
@@ -821,6 +1010,16 @@ func (sm *SegmentManager) ActiveSegmentMeta() (SegmentMeta, bool) {
 
 	for _, s := range sm.meta.Segments {
 		if !s.Sealed {
+			// Persisted active metadata is only a checkpoint. WAL replay and
+			// post-checkpoint writes may have widened the live range without
+			// updating meta.json yet, so query bootstrap must use the writer's
+			// authoritative in-process state.
+			if sm.active != nil {
+				s.RecordCount = sm.active.RecordCount()
+				if s.RecordCount > 0 {
+					s.MinTS, s.MaxTS = sm.active.TimeRange()
+				}
+			}
 			return s, true
 		}
 	}
@@ -862,6 +1061,13 @@ func (sm *SegmentManager) DeleteSegmentFilesLocal(meta SegmentMeta) error {
 // Close stops the seal worker (draining the queue), flushes and closes the
 // active segment and WAL.
 func (sm *SegmentManager) Close() error {
+	sm.closeOnce.Do(func() {
+		sm.closeErr = sm.close()
+	})
+	return sm.closeErr
+}
+
+func (sm *SegmentManager) close() error {
 	// Stop the seal worker before taking sm.mu: an in-flight seal callback
 	// reads hooks under sm.mu.RLock, so waiting for it while holding the
 	// write lock would deadlock.
@@ -869,38 +1075,69 @@ func (sm *SegmentManager) Close() error {
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	var errs []error
+	preexistingFailure := sm.failed
+	if preexistingFailure != nil {
+		errs = append(errs, preexistingFailure)
+	}
 
 	if sm.active != nil {
-		if err := sm.active.Close(); err != nil {
-			return fmt.Errorf("segmgr: close active: %w", err)
+		activeCloseErr := sm.active.Close()
+		if activeCloseErr != nil {
+			activeCloseErr = fmt.Errorf("segmgr: close active: %w", activeCloseErr)
+			errs = append(errs, activeCloseErr)
+			sm.failStop(activeCloseErr)
 		}
 
-		for i := range sm.meta.Segments {
-			if !sm.meta.Segments[i].Sealed {
-				sm.meta.Segments[i].Sealed = true
-				sm.meta.Segments[i].RecordCount = sm.active.RecordCount()
+		// Never seal metadata or destroy the WAL after a prior ambiguous
+		// transition error. On reopen, the durable watermark rolls the active
+		// file back and WAL replay reconstructs the acknowledged suffix.
+		if preexistingFailure == nil && activeCloseErr == nil {
+			var transitionErr error
+			foundActiveMeta := false
+			for i := range sm.meta.Segments {
+				if !sm.meta.Segments[i].Sealed {
+					foundActiveMeta = true
+					sm.meta.Segments[i].Sealed = true
+					sm.meta.Segments[i].RecordCount = sm.active.RecordCount()
+					sm.meta.Segments[i].MinTS, sm.meta.Segments[i].MaxTS = sm.active.TimeRange()
 
-				segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
-				if info, err := os.Stat(segPath); err == nil {
-					sm.meta.Segments[i].SizeBytes = info.Size()
+					segPath := filepath.Join(sm.dir, sm.meta.Segments[i].FileName)
+					if info, err := os.Stat(segPath); err == nil {
+						sm.meta.Segments[i].SizeBytes = info.Size()
+					} else {
+						transitionErr = fmt.Errorf("segmgr: stat active on close: %w", err)
+					}
+					break
 				}
-				if sr, err := OpenSegmentReader(segPath, nil); err == nil {
-					footer := sr.Footer()
-					sm.meta.Segments[i].MinTS = footer.MinTS
-					sm.meta.Segments[i].MaxTS = footer.MaxTS
-					_ = sr.Close()
-				}
-				break
+			}
+			if !foundActiveMeta {
+				transitionErr = errors.New("segmgr: active writer has no metadata on close")
+			}
+			if transitionErr != nil {
+				errs = append(errs, transitionErr)
+				sm.failStop(transitionErr)
+			} else if err := sm.saveTransitionMeta("close"); err != nil {
+				err = fmt.Errorf("segmgr: save meta on close: %w", err)
+				errs = append(errs, err)
+				sm.failStop(err)
+			} else if err := sm.injectFault("close:before_wal_truncate"); err != nil {
+				errs = append(errs, err)
+				sm.failStop(err)
+			} else if err := sm.wal.Truncate(); err != nil {
+				err = fmt.Errorf("segmgr: truncate wal on close: %w", err)
+				errs = append(errs, err)
+				sm.failStop(err)
 			}
 		}
 		sm.active = nil
-		_ = saveMeta(sm.dir, sm.meta)
-		// Active segment is now sealed and fsync'd; the WAL records that fed
-		// it are durable on disk, so drop them before closing.
-		_ = sm.wal.Truncate()
 	}
 
-	return sm.wal.Close()
+	if err := sm.wal.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("segmgr: close wal: %w", err))
+	}
+	sm.closed = true
+	return errors.Join(errs...)
 }
 
 func makeWALPayload(ts int64, data []byte) []byte {

@@ -28,6 +28,8 @@ type RuntimeConfig struct {
 	// MemoryLimit sets the Go runtime soft memory limit in bytes
 	// (debug.SetMemoryLimit; overrides GOMEMLIMIT). Zero disables it.
 	MemoryLimit int64 `yaml:"memory_limit"`
+	// IndexBootstrapWorkers bounds concurrent sidecar rebuilds during open.
+	IndexBootstrapWorkers int `yaml:"index_bootstrap_workers"`
 }
 
 // MetricsConfig configures the embedded metrics store.
@@ -103,11 +105,12 @@ type S3Config struct {
 
 // StorageConfig configures the data directory, segment rotation, and S3 tier.
 type StorageConfig struct {
-	DataDir           string   `yaml:"data_dir"`
-	SegmentMaxRecords uint64   `yaml:"segment_max_records"`
-	SegmentMaxBytes   int64    `yaml:"segment_max_bytes"`
-	IndexCacheSize    int      `yaml:"index_cache_size"`
-	S3                S3Config `yaml:"s3"`
+	DataDir           string `yaml:"data_dir"`
+	SegmentMaxRecords uint64 `yaml:"segment_max_records"`
+	// SegmentMaxBytes counts uncompressed record payload and is checked after a batch.
+	SegmentMaxBytes int64    `yaml:"segment_max_bytes"`
+	IndexCacheSize  int      `yaml:"index_cache_size"`
+	S3              S3Config `yaml:"s3"`
 }
 
 // IngestConfig configures the batcher and its per-lane overrides.
@@ -122,6 +125,7 @@ type IngestConfig struct {
 	MaxAttrsPerEntry      int              `yaml:"max_attrs_per_entry"`
 	MaxAttrValueBytes     int              `yaml:"max_attr_value_bytes"`
 	MaxAttrKeysPerService int              `yaml:"max_attr_keys_per_service"`
+	MaxServices           int              `yaml:"max_services"`
 }
 
 // IngestLaneConfig overrides ingest settings for one lane (logs or spans).
@@ -190,6 +194,7 @@ func Default() *Config {
 			MaxAttrsPerEntry:      64,
 			MaxAttrValueBytes:     4096,
 			MaxAttrKeysPerService: 1024,
+			MaxServices:           10_000,
 		},
 		API: APIConfig{
 			HTTPAddr:          ":8080",
@@ -213,6 +218,7 @@ func Default() *Config {
 			Enabled:   true,
 			Retention: 24 * time.Hour,
 		},
+		Runtime: RuntimeConfig{IndexBootstrapWorkers: 1},
 	}
 }
 
@@ -287,8 +293,14 @@ func (c *Config) Validate() error {
 	if c.Runtime.MemoryLimit < 0 {
 		return fmt.Errorf("runtime.memory_limit must be positive when set")
 	}
+	if c.Runtime.IndexBootstrapWorkers <= 0 {
+		return fmt.Errorf("runtime.index_bootstrap_workers must be positive")
+	}
 	if c.Metrics.CacheBudget < 0 {
 		return fmt.Errorf("metrics.cache_budget must be positive when set")
+	}
+	if c.Ingest.MaxServices < 0 {
+		return fmt.Errorf("ingest.max_services must be positive when set")
 	}
 	return nil
 }

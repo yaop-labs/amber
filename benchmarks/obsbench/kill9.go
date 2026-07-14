@@ -15,7 +15,7 @@ import (
 
 // Kill9Options drives the durability-loss test (METHODOLOGY.md): steady
 // ingest, SIGKILL the server at a random point, restart, and compare the
-// post-recovery queryable count against what the server acknowledged.
+// post-recovery real-query ID count against what the server acknowledged.
 type Kill9Options struct {
 	// ServerCmd starts the system under test; the harness owns the process
 	// (its own process group) so the kill hits the whole tree.

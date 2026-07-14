@@ -66,3 +66,24 @@ func TestCardinalityGuard_NilReceiverPasses(t *testing.T) {
 		t.Fatalf("nil guard must pass, got %q", r)
 	}
 }
+
+func TestCardinalityGuard_DoesNotCommitRejectedAdmission(t *testing.T) {
+	g := NewCardinalityGuard(0, 0, 1, 10)
+	reason, admitted := g.Admit("svc", []model.Attr{{Key: "rejected"}}, func() bool { return false })
+	if reason != "" || admitted {
+		t.Fatalf("rejected admission = (%q, %v)", reason, admitted)
+	}
+	if reason := g.Check("svc", []model.Attr{{Key: "accepted"}}); reason != "" {
+		t.Fatalf("rejected key consumed budget: %q", reason)
+	}
+}
+
+func TestCardinalityGuard_BoundsTrackedServices(t *testing.T) {
+	g := NewCardinalityGuard(0, 0, 4, 1)
+	if reason := g.Check("first", []model.Attr{{Key: "a"}}); reason != "" {
+		t.Fatal(reason)
+	}
+	if reason := g.Check("second", []model.Attr{{Key: "a"}}); reason != "service_cardinality" {
+		t.Fatalf("reason = %q, want service_cardinality", reason)
+	}
+}

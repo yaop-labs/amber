@@ -9,8 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
@@ -18,6 +18,12 @@ import (
 	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/internal/storage"
 )
+
+// LoadReport summarizes recoverable startup failures. Query correctness is
+// preserved by scan fallback, but runtime health must expose the degradation.
+type LoadReport struct {
+	IndexErrors uint64
+}
 
 // retryBuild runs fn up to 3 times with exponential backoff (100ms, 500ms),
 // returning early if ctx is cancelled. Bumping the metric and surrendering
@@ -53,15 +59,15 @@ func LoadSealedIndexes(
 	exec *query.Executor,
 	logManager, spanManager *storage.SegmentManager,
 	logDir, spanDir string,
+	workers int,
 	log *slog.Logger,
-) {
-	workers := runtime.NumCPU()
-	if workers < 2 {
-		workers = 2
+) LoadReport {
+	if workers < 1 {
+		workers = 1
 	}
 
-	loadLogSegments(ctx, exec, logManager, logDir, workers, log)
-	loadSpanSegments(ctx, exec, spanManager, spanDir, workers, log)
+	return LoadReport{IndexErrors: loadLogSegments(ctx, exec, logManager, logDir, workers, log) +
+		loadSpanSegments(ctx, exec, spanManager, spanDir, workers, log)}
 }
 
 func loadLogSegments(
@@ -71,14 +77,15 @@ func loadLogSegments(
 	logDir string,
 	workers int,
 	log *slog.Logger,
-) {
+) uint64 {
 	segs := logManager.Segments()
 	if len(segs) == 0 {
-		return
+		return 0
 	}
 
-	jobs := make(chan storage.SegmentMeta, len(segs))
+	jobs := make(chan storage.SegmentMeta, workers)
 	var wg sync.WaitGroup
+	var failures atomic.Uint64
 
 	for range workers {
 		wg.Go(func() {
@@ -91,6 +98,7 @@ func loadLogSegments(
 				bidxPath := filepath.Join(logDir, seg.FileName+".bidx")
 				if _, err := os.Stat(bidxPath); err != nil {
 					if _, err := index.BuildLogBitmapIndex(segPath, log); err != nil {
+						failures.Add(1)
 						log.Warn("failed to build log bitmap on startup", "segment", seg.FileName, "err", err)
 					}
 				}
@@ -98,6 +106,7 @@ func loadLogSegments(
 				fidxPath := filepath.Join(logDir, seg.FileName+".fidx")
 				if _, err := os.Stat(fidxPath); err != nil {
 					if _, err := index.BuildLogFTSIndex(segPath, log); err != nil {
+						failures.Add(1)
 						log.Warn("failed to build log fts on startup", "segment", seg.FileName, "err", err)
 					}
 				}
@@ -107,6 +116,7 @@ func loadLogSegments(
 				} else if ribbon, err := index.BuildLogRibbonFilter(segPath, log); err == nil {
 					exec.RegisterLogRibbon(seg.FileName, ribbon)
 				} else {
+					failures.Add(1)
 					log.Warn("failed to build log ribbon on startup", "segment", seg.FileName, "err", err)
 				}
 
@@ -115,6 +125,7 @@ func loadLogSegments(
 				} else if ribbon, err := index.BuildLogFTSRibbon(segPath, log); err == nil {
 					exec.RegisterLogFTSRibbon(seg.FileName, ribbon)
 				} else {
+					failures.Add(1)
 					log.Warn("failed to build log fts ribbon on startup", "segment", seg.FileName, "err", err)
 				}
 
@@ -127,6 +138,7 @@ func loadLogSegments(
 	}
 	close(jobs)
 	wg.Wait()
+	return failures.Load()
 }
 
 func loadSpanSegments(
@@ -136,14 +148,15 @@ func loadSpanSegments(
 	spanDir string,
 	workers int,
 	log *slog.Logger,
-) {
+) uint64 {
 	segs := spanManager.Segments()
 	if len(segs) == 0 {
-		return
+		return 0
 	}
 
-	jobs := make(chan storage.SegmentMeta, len(segs))
+	jobs := make(chan storage.SegmentMeta, workers)
 	var wg sync.WaitGroup
+	var failures atomic.Uint64
 
 	for range workers {
 		wg.Go(func() {
@@ -156,6 +169,7 @@ func loadSpanSegments(
 				bidxPath := filepath.Join(spanDir, seg.FileName+".bidx")
 				if _, err := os.Stat(bidxPath); err != nil {
 					if _, err := index.BuildSpanBitmapIndex(segPath, log); err != nil {
+						failures.Add(1)
 						log.Warn("failed to build span bitmap on startup", "segment", seg.FileName, "err", err)
 					}
 				}
@@ -165,6 +179,7 @@ func loadSpanSegments(
 				} else if ribbon, err := index.BuildSpanRibbonFilter(segPath, log); err == nil {
 					exec.RegisterSpanRibbon(seg.FileName, ribbon)
 				} else {
+					failures.Add(1)
 					log.Warn("failed to build span ribbon on startup", "segment", seg.FileName, "err", err)
 				}
 
@@ -177,6 +192,7 @@ func loadSpanSegments(
 	}
 	close(jobs)
 	wg.Wait()
+	return failures.Load()
 }
 
 // SetupSealCallbacks wires the segment managers' on-seal hooks to build each
@@ -187,6 +203,7 @@ func SetupSealCallbacks(
 	logManager, spanManager *storage.SegmentManager,
 	logDir, spanDir string,
 	log *slog.Logger,
+	onDegraded func(string),
 ) {
 	logManager.SetOnSeal(func(meta storage.SegmentMeta) {
 		segPath := filepath.Join(logDir, meta.FileName)
@@ -203,6 +220,9 @@ func SetupSealCallbacks(
 			return err
 		}); err != nil {
 			selfobs.SealIndexErrors.WithLabelValues("log", "seal").Inc()
+			if onDegraded != nil {
+				onDegraded("log_seal_index_failure")
+			}
 			log.Error("seal: build log indexes gave up", "segment", meta.FileName, "err", err)
 			return
 		}
@@ -228,6 +248,9 @@ func SetupSealCallbacks(
 			return err
 		}); err != nil {
 			selfobs.SealIndexErrors.WithLabelValues("span", "seal").Inc()
+			if onDegraded != nil {
+				onDegraded("span_seal_index_failure")
+			}
 			log.Error("seal: build span indexes gave up", "segment", meta.FileName, "err", err)
 			return
 		}

@@ -31,23 +31,88 @@ func CountQueryable(ctx context.Context, target TargetConfig) (uint64, error) {
 	}
 }
 
-// amberCount reads segments.total_records from the admin stats endpoint -
-// exact (sealed + active) and O(1), unlike a full-scan query whose
-// total_hits is allowed to skip segments once the result heap fills.
+// amberCount walks the real paginated query API and verifies both Amber entry
+// IDs and benchmark seq identities are unique. total_hits is intentionally not
+// used: it is a lower bound once top-k pruning starts.
 func amberCount(ctx context.Context, client *http.Client, target TargetConfig) (uint64, error) {
-	body, err := getBody(ctx, client, target, "/api/v1/admin/stats")
-	if err != nil {
-		return 0, err
+	const pageSize = 10_000
+	type attr struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
 	}
-	var resp struct {
-		Segments struct {
-			TotalRecords uint64 `json:"total_records"`
-		} `json:"segments"`
+	type entry struct {
+		ID    json.RawMessage `json:"id"`
+		Attrs []attr          `json:"attrs"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, fmt.Errorf("amber stats: %w", err)
+	type queryResponse struct {
+		Entries    []entry `json:"entries"`
+		NextCursor string  `json:"next_cursor"`
 	}
-	return resp.Segments.TotalRecords, nil
+
+	entryIDs := make(map[string]struct{})
+	seqs := make(map[uint64]struct{})
+	cursors := make(map[string]struct{})
+	cursor := ""
+	for {
+		params := url.Values{}
+		params.Set("limit", strconv.Itoa(pageSize))
+		if cursor != "" {
+			params.Set("cursor", cursor)
+		}
+		body, err := getBody(ctx, client, target, "/api/v1/logs?"+params.Encode())
+		if err != nil {
+			return 0, err
+		}
+		var resp queryResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return 0, fmt.Errorf("amber query page: %w", err)
+		}
+		for _, item := range resp.Entries {
+			id := string(item.ID)
+			if id == "" || id == "null" {
+				return 0, fmt.Errorf("amber query: entry without ID")
+			}
+			if _, duplicate := entryIDs[id]; duplicate {
+				return 0, fmt.Errorf("amber query: duplicate entry ID %s", id)
+			}
+			entryIDs[id] = struct{}{}
+
+			var seqText string
+			for _, a := range item.Attrs {
+				if a.Key == "seq" {
+					seqText = a.Value
+					break
+				}
+			}
+			if seqText == "" {
+				return 0, fmt.Errorf("amber query: entry %s has no benchmark seq", id)
+			}
+			seq, err := strconv.ParseUint(seqText, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("amber query: entry %s bad seq %q: %w", id, seqText, err)
+			}
+			if _, duplicate := seqs[seq]; duplicate {
+				return 0, fmt.Errorf("amber query: duplicate benchmark seq %d", seq)
+			}
+			seqs[seq] = struct{}{}
+		}
+
+		if resp.NextCursor == "" {
+			break
+		}
+		if len(resp.Entries) == 0 {
+			return 0, fmt.Errorf("amber query: empty page returned cursor")
+		}
+		if _, duplicate := cursors[resp.NextCursor]; duplicate {
+			return 0, fmt.Errorf("amber query: cursor cycle")
+		}
+		cursors[resp.NextCursor] = struct{}{}
+		cursor = resp.NextCursor
+	}
+	if len(entryIDs) != len(seqs) {
+		return 0, fmt.Errorf("amber query: %d entry IDs but %d seq IDs", len(entryIDs), len(seqs))
+	}
+	return uint64(len(entryIDs)), nil
 }
 
 func victoriaLogsCount(ctx context.Context, client *http.Client, target TargetConfig) (uint64, error) {

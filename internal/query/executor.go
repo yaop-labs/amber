@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -106,17 +107,15 @@ type Executor struct {
 
 	active *indexer.ActiveIndex
 
-	sealedMu      sync.RWMutex
-	logRibbons    map[string]*index.RibbonFilter
-	logFTSRibbons map[string]*index.RibbonFilter
-	spanRibbons   map[string]*index.RibbonFilter
-
-	logBitmapCache   *indexLRU[*index.MultiFieldIndex]
-	spanBitmapCache  *indexLRU[index.SpanBitmap]
-	spanCoverCache   *indexLRU[*index.CoverIndex]
-	ftsCache         *indexLRU[*index.FTSIndex]
-	logPostingCache  *indexLRU[*index.PostingList]
-	spanPostingCache *indexLRU[*index.PostingList]
+	logBitmapCache    *indexLRU[*index.MultiFieldIndex]
+	spanBitmapCache   *indexLRU[index.SpanBitmap]
+	spanCoverCache    *indexLRU[*index.CoverIndex]
+	ftsCache          *indexLRU[*index.FTSIndex]
+	logPostingCache   *indexLRU[*index.PostingList]
+	spanPostingCache  *indexLRU[*index.PostingList]
+	logRibbonCache    *indexLRU[*index.RibbonFilter]
+	logFTSRibbonCache *indexLRU[*index.RibbonFilter]
+	spanRibbonCache   *indexLRU[*index.RibbonFilter]
 
 	logReaders  *readerCache
 	spanReaders *readerCache
@@ -138,6 +137,8 @@ type activeServicesCache struct {
 	set  map[string]struct{}
 }
 
+type corruptRefetchContextKey struct{}
+
 type queryCacheEntry struct {
 	logs    *LogResult
 	spans   *SpanResult
@@ -151,11 +152,13 @@ type queryCacheEntry struct {
 }
 
 type queryCache struct {
-	mu       sync.Mutex
-	entries  map[[32]byte]queryCacheEntry
-	inflight map[[32]byte]chan struct{}
-	ttl      time.Duration
-	maxSize  int
+	mu             sync.Mutex
+	entries        map[[32]byte]queryCacheEntry
+	inflight       map[[32]byte]chan struct{}
+	logGeneration  uint64
+	spanGeneration uint64
+	ttl            time.Duration
+	maxSize        int
 }
 
 func newQueryCache(maxSize int, ttl time.Duration) *queryCache {
@@ -205,7 +208,7 @@ func (c *queryCache) getLog(key [32]byte) (*LogResult, bool) {
 	if !ok || e.logs == nil || time.Now().UnixNano() > e.expires {
 		return nil, false
 	}
-	return e.logs, true
+	return cloneLogResult(e.logs), true
 }
 
 func (c *queryCache) getSpan(key [32]byte) (*SpanResult, bool) {
@@ -218,59 +221,98 @@ func (c *queryCache) getSpan(key [32]byte) (*SpanResult, bool) {
 	if !ok || e.spans == nil || time.Now().UnixNano() > e.expires {
 		return nil, false
 	}
-	return e.spans, true
+	return cloneSpanResult(e.spans), true
 }
 
-func (c *queryCache) putLog(key [32]byte, r *LogResult, from, to int64) {
+func (c *queryCache) logGenerationSnapshot() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.logGeneration
+}
+
+func (c *queryCache) spanGenerationSnapshot() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.spanGeneration
+}
+
+func (c *queryCache) putLog(key [32]byte, r *LogResult, from, to int64, generation uint64) bool {
 	if c == nil || r == nil {
-		return
+		return false
 	}
 	// Empty results are not cached; ingest may make them stale immediately.
 	if len(r.Entries) == 0 {
-		return
+		return false
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if generation != c.logGeneration {
+		return false
+	}
 	if len(c.entries) >= c.maxSize {
 		c.sweepLocked()
 	}
 	c.entries[key] = queryCacheEntry{
-		logs:    r,
+		logs:    cloneLogResult(r),
 		expires: time.Now().Add(c.ttl).UnixNano(),
 		from:    from,
 		to:      to,
 	}
-	c.mu.Unlock()
+	return true
 }
 
-func (c *queryCache) putSpan(key [32]byte, r *SpanResult, from, to int64) {
+func (c *queryCache) putSpan(key [32]byte, r *SpanResult, from, to int64, generation uint64) bool {
 	if c == nil || r == nil {
-		return
+		return false
 	}
 	if len(r.Spans) == 0 {
-		return
+		return false
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if generation != c.spanGeneration {
+		return false
+	}
 	if len(c.entries) >= c.maxSize {
 		c.sweepLocked()
 	}
 	c.entries[key] = queryCacheEntry{
-		spans:   r,
+		spans:   cloneSpanResult(r),
 		expires: time.Now().Add(c.ttl).UnixNano(),
 		from:    from,
 		to:      to,
 	}
-	c.mu.Unlock()
+	return true
 }
 
-// invalidateRange drops cached results whose query window overlaps
-// [from, to] (unixnano).
-func (c *queryCache) invalidateRange(from, to int64) {
+func (c *queryCache) invalidateLogRange(from, to int64) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
+	c.logGeneration++
 	for k, e := range c.entries {
-		if e.from <= to && e.to >= from {
+		if e.logs != nil && e.from <= to && e.to >= from {
+			delete(c.entries, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *queryCache) invalidateSpanRange(from, to int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.spanGeneration++
+	for k, e := range c.entries {
+		if e.spans != nil && e.from <= to && e.to >= from {
 			delete(c.entries, k)
 		}
 	}
@@ -294,8 +336,62 @@ func (c *queryCache) clear() {
 		return
 	}
 	c.mu.Lock()
+	c.logGeneration++
+	c.spanGeneration++
 	c.entries = make(map[[32]byte]queryCacheEntry, c.maxSize)
 	c.mu.Unlock()
+}
+
+func (c *queryCache) clearLogs() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.logGeneration++
+	for key, entry := range c.entries {
+		if entry.logs != nil {
+			delete(c.entries, key)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *queryCache) clearSpans() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.spanGeneration++
+	for key, entry := range c.entries {
+		if entry.spans != nil {
+			delete(c.entries, key)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func cloneLogResult(src *LogResult) *LogResult {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Entries = append([]model.LogEntry(nil), src.Entries...)
+	for i := range dst.Entries {
+		dst.Entries[i].Attrs = append([]model.Attr(nil), src.Entries[i].Attrs...)
+	}
+	return &dst
+}
+
+func cloneSpanResult(src *SpanResult) *SpanResult {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	dst.Spans = append([]model.SpanEntry(nil), src.Spans...)
+	for i := range dst.Spans {
+		dst.Spans[i].Attrs = append([]model.Attr(nil), src.Spans[i].Attrs...)
+	}
+	return &dst
 }
 
 func hashLogQuery(q *LogQuery) [32]byte {
@@ -420,26 +516,26 @@ func NewExecutorWithCache(
 		cacheSize = defaultIndexCacheSize
 	}
 	return &Executor{
-		logManager:       logManager,
-		spanManager:      spanManager,
-		logSparse:        logSparse,
-		spanSparse:       spanSparse,
-		planner:          NewPlanner(logSparse),
-		logDir:           logDir,
-		spanDir:          spanDir,
-		active:           indexer.New(logManager, spanManager),
-		logRibbons:       make(map[string]*index.RibbonFilter),
-		logFTSRibbons:    make(map[string]*index.RibbonFilter),
-		spanRibbons:      make(map[string]*index.RibbonFilter),
-		logBitmapCache:   newIndexLRU[*index.MultiFieldIndex](cacheSize),
-		spanBitmapCache:  newIndexLRU[index.SpanBitmap](cacheSize),
-		spanCoverCache:   newIndexLRU[*index.CoverIndex](cacheSize),
-		ftsCache:         newIndexLRU[*index.FTSIndex](cacheSize),
-		logPostingCache:  newIndexLRU[*index.PostingList](cacheSize),
-		spanPostingCache: newIndexLRU[*index.PostingList](cacheSize),
-		logReaders:       newReaderCache(cacheSize),
-		spanReaders:      newReaderCache(cacheSize),
-		resultCache:      newQueryCache(defaultResultCacheSize, defaultResultCacheTTL),
+		logManager:        logManager,
+		spanManager:       spanManager,
+		logSparse:         logSparse,
+		spanSparse:        spanSparse,
+		planner:           NewPlanner(logSparse),
+		logDir:            logDir,
+		spanDir:           spanDir,
+		active:            indexer.New(logManager, spanManager),
+		logBitmapCache:    newIndexLRU[*index.MultiFieldIndex](cacheSize),
+		spanBitmapCache:   newIndexLRU[index.SpanBitmap](cacheSize),
+		spanCoverCache:    newIndexLRU[*index.CoverIndex](cacheSize),
+		ftsCache:          newIndexLRU[*index.FTSIndex](cacheSize),
+		logPostingCache:   newIndexLRU[*index.PostingList](cacheSize),
+		spanPostingCache:  newIndexLRU[*index.PostingList](cacheSize),
+		logRibbonCache:    newIndexLRU[*index.RibbonFilter](cacheSize),
+		logFTSRibbonCache: newIndexLRU[*index.RibbonFilter](cacheSize),
+		spanRibbonCache:   newIndexLRU[*index.RibbonFilter](cacheSize),
+		logReaders:        newReaderCache(cacheSize),
+		spanReaders:       newReaderCache(cacheSize),
+		resultCache:       newQueryCache(defaultResultCacheSize, defaultResultCacheTTL),
 	}
 }
 
@@ -464,11 +560,10 @@ func (e *Executor) InvalidateLogSegment(seg storage.SegmentMeta) {
 	}
 	e.logBitmapCache.delete(seg.FileName)
 	e.ftsCache.delete(seg.FileName)
-	e.sealedMu.Lock()
-	delete(e.logRibbons, seg.FileName)
-	delete(e.logFTSRibbons, seg.FileName)
-	e.sealedMu.Unlock()
-	e.resultCache.clear()
+	e.logPostingCache.delete(seg.FileName)
+	e.logRibbonCache.delete(seg.FileName)
+	e.logFTSRibbonCache.delete(seg.FileName)
+	e.resultCache.clearLogs()
 }
 
 // ClearResultCache drops cached query results.
@@ -476,11 +571,16 @@ func (e *Executor) ClearResultCache() {
 	e.resultCache.clear()
 }
 
-// InvalidateResultRange drops cached results whose query window overlaps the
-// given event-time range (unixnano). Ingest calls this per batch so steady
-// writes stop wiping results for historical windows.
-func (e *Executor) InvalidateResultRange(from, to int64) {
-	e.resultCache.invalidateRange(from, to)
+// InvalidateLogResultRange advances the log data generation and drops cached
+// log results whose query window overlaps the new batch.
+func (e *Executor) InvalidateLogResultRange(from, to int64) {
+	e.resultCache.invalidateLogRange(from, to)
+}
+
+// InvalidateSpanResultRange advances the span data generation and drops cached
+// span results whose query window overlaps the new batch.
+func (e *Executor) InvalidateSpanResultRange(from, to int64) {
+	e.resultCache.invalidateSpanRange(from, to)
 }
 
 // InvalidateSpanSegment drops cached sidecar indexes for a span segment.
@@ -490,10 +590,9 @@ func (e *Executor) InvalidateSpanSegment(seg storage.SegmentMeta) {
 	}
 	e.spanBitmapCache.delete(seg.FileName)
 	e.spanCoverCache.delete(seg.FileName)
-	e.sealedMu.Lock()
-	delete(e.spanRibbons, seg.FileName)
-	e.sealedMu.Unlock()
-	e.resultCache.clear()
+	e.spanPostingCache.delete(seg.FileName)
+	e.spanRibbonCache.delete(seg.FileName)
+	e.resultCache.clearSpans()
 }
 
 // Close releases the executor's cached resources.
@@ -527,23 +626,17 @@ func (e *Executor) RegisterFTSIndex(segmentFile string, idx *index.FTSIndex) {
 
 // RegisterLogRibbon registers a log segment's service-name ribbon filter.
 func (e *Executor) RegisterLogRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.sealedMu.Lock()
-	e.logRibbons[segmentFile] = f
-	e.sealedMu.Unlock()
+	e.logRibbonCache.put(segmentFile, f)
 }
 
 // RegisterLogFTSRibbon registers a log segment's FTS-token ribbon filter.
 func (e *Executor) RegisterLogFTSRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.sealedMu.Lock()
-	e.logFTSRibbons[segmentFile] = f
-	e.sealedMu.Unlock()
+	e.logFTSRibbonCache.put(segmentFile, f)
 }
 
 // RegisterSpanRibbon registers a span segment's service-name ribbon filter.
 func (e *Executor) RegisterSpanRibbon(segmentFile string, f *index.RibbonFilter) {
-	e.sealedMu.Lock()
-	e.spanRibbons[segmentFile] = f
-	e.sealedMu.Unlock()
+	e.spanRibbonCache.put(segmentFile, f)
 }
 
 // RegisterLogPostingList registers a log segment's trace-ID posting list.
@@ -648,24 +741,48 @@ func (e *Executor) fts(name string) (*index.FTSIndex, bool) {
 }
 
 func (e *Executor) logRibbon(name string) (*index.RibbonFilter, bool) {
-	e.sealedMu.RLock()
-	f, ok := e.logRibbons[name]
-	e.sealedMu.RUnlock()
-	return f, ok
+	if f, ok := e.logRibbonCache.get(name); ok {
+		return f, true
+	}
+	if e.logDir == "" {
+		return nil, false
+	}
+	f, err := index.LoadRibbonFilter(filepath.Join(e.logDir, name+".filt"))
+	if err != nil {
+		return nil, false
+	}
+	e.logRibbonCache.put(name, f)
+	return f, true
 }
 
 func (e *Executor) logFTSRibbon(name string) (*index.RibbonFilter, bool) {
-	e.sealedMu.RLock()
-	f, ok := e.logFTSRibbons[name]
-	e.sealedMu.RUnlock()
-	return f, ok
+	if f, ok := e.logFTSRibbonCache.get(name); ok {
+		return f, true
+	}
+	if e.logDir == "" {
+		return nil, false
+	}
+	f, err := index.LoadRibbonFilter(filepath.Join(e.logDir, name+".fts.filt"))
+	if err != nil {
+		return nil, false
+	}
+	e.logFTSRibbonCache.put(name, f)
+	return f, true
 }
 
 func (e *Executor) spanRibbon(name string) (*index.RibbonFilter, bool) {
-	e.sealedMu.RLock()
-	f, ok := e.spanRibbons[name]
-	e.sealedMu.RUnlock()
-	return f, ok
+	if f, ok := e.spanRibbonCache.get(name); ok {
+		return f, true
+	}
+	if e.spanDir == "" {
+		return nil, false
+	}
+	f, err := index.LoadRibbonFilter(filepath.Join(e.spanDir, name+".filt"))
+	if err != nil {
+		return nil, false
+	}
+	e.spanRibbonCache.put(name, f)
+	return f, true
 }
 
 // Services returns the distinct service names known across segments, for the
@@ -713,9 +830,16 @@ func (e *Executor) Services() []string {
 }
 
 func (e *Executor) scanActiveServices(seen map[string]struct{}) {
-	managers := [2]*storage.SegmentManager{e.logManager, e.spanManager}
-	caches := [2]*activeServicesCache{&e.logActiveServices, &e.spanActiveServices}
-	for i, mgr := range managers {
+	streams := []struct {
+		manager *storage.SegmentManager
+		cache   *activeServicesCache
+		isLog   bool
+	}{
+		{manager: e.logManager, cache: &e.logActiveServices, isLog: true},
+		{manager: e.spanManager, cache: &e.spanActiveServices, isLog: false},
+	}
+	for _, stream := range streams {
+		mgr := stream.manager
 		if mgr == nil {
 			continue
 		}
@@ -723,14 +847,7 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 		if !ok {
 			continue
 		}
-		if _, hasBitmap := e.logBitmap(activeMeta.FileName); hasBitmap {
-			continue
-		}
-		if _, hasBitmap := e.spanBitmap(activeMeta.FileName); hasBitmap {
-			continue
-		}
-
-		cache := caches[i]
+		cache := stream.cache
 		cache.mu.Lock()
 		if cache.file != activeMeta.FileName {
 			set := make(map[string]struct{})
@@ -738,18 +855,22 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 			hint, _ := mgr.ActiveBlockIndex(activeMeta.FileName)
 			if sr, err := storage.OpenSegmentReader(segPath, hint); err == nil {
 				_ = sr.Scan(func(data []byte) error {
-					var logEntry model.LogEntry
-					if _, err := logEntry.ReadFrom(bytes.NewReader(data)); err == nil {
+					if stream.isLog {
+						var logEntry model.LogEntry
+						if _, err := logEntry.ReadFrom(bytes.NewReader(data)); err != nil {
+							return err
+						}
 						if logEntry.Service != "" {
 							set[logEntry.Service] = struct{}{}
 						}
 						return nil
 					}
 					var spanEntry model.SpanEntry
-					if _, err := spanEntry.ReadFrom(bytes.NewReader(data)); err == nil {
-						if spanEntry.Service != "" {
-							set[spanEntry.Service] = struct{}{}
-						}
+					if _, err := spanEntry.ReadFrom(bytes.NewReader(data)); err != nil {
+						return err
+					}
+					if spanEntry.Service != "" {
+						set[spanEntry.Service] = struct{}{}
 					}
 					return nil
 				})
@@ -796,6 +917,9 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 		selfobs.QueryTotal.WithLabelValues("log", cache).Inc()
 	}()
 
+	if q == nil {
+		return nil, errors.New("query: log query is nil")
+	}
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
@@ -804,12 +928,12 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 	}
 
 	cacheKey := hashLogQuery(q)
+	var queryGeneration uint64
 
 	for {
 		if cached, ok := e.resultCache.getLog(cacheKey); ok {
-			cp := *cached
-			cp.CacheHit = true
-			return &cp, nil
+			cached.CacheHit = true
+			return cached, nil
 		}
 		wait, done, err := e.resultCache.waitOrStart(ctx, cacheKey)
 		if err != nil {
@@ -819,6 +943,7 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 			continue
 		}
 		defer done()
+		queryGeneration = e.resultCache.logGenerationSnapshot()
 		break
 	}
 
@@ -899,7 +1024,7 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 		SegTotal:   len(segs),
 		SegScanned: scanned,
 	}
-	e.resultCache.putLog(cacheKey, result, q.FromUnixNano(), q.ToUnixNano())
+	e.resultCache.putLog(cacheKey, result, q.FromUnixNano(), q.ToUnixNano(), queryGeneration)
 	return result, nil
 }
 
@@ -945,14 +1070,25 @@ func (e *Executor) execLogSegment(
 
 		if len(ftsTokens) > 0 {
 			if ribbon, ok := e.logFTSRibbon(seg.FileName); ok {
-				anyHit := slices.ContainsFunc(ftsTokens, ribbon.Contains)
-				if !anyHit {
+				allHit := true
+				for _, token := range ftsTokens {
+					if !ribbon.Contains(token) {
+						allHit = false
+						break
+					}
+				}
+				if !allHit {
 					return 0, nil
 				}
 			}
 		}
 		if fts, ok := e.fts(seg.FileName); ok {
-			ftsIDs, err := fts.Search(ctx, q.FullText, 100_000)
+			// The row scan applies top-k after all predicates. Capping this
+			// ascending candidate set at the page limit (or at the default
+			// 100K segment size) would discard newer matches in stores using a
+			// larger rotation policy. The index is only a pruning aid, so it
+			// must return the complete per-segment candidate set.
+			ftsIDs, err := fts.Search(ctx, q.FullText, 0)
 			if err != nil {
 				return 0, fmt.Errorf("fts search: %w", err)
 			}
@@ -995,12 +1131,16 @@ func (e *Executor) execLogSegment(
 	} else {
 		cr, err := e.logReaders.acquire(segPath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && !e.logManager.IsQueryableSegment(seg.FileName) {
+				return 0, nil
+			}
 			return 0, fmt.Errorf("open segment: %w", err)
 		}
 		defer e.logReaders.release(cr)
 		sr = cr.reader
 	}
 
+	heapBeforeScan := append(logMinHeap(nil), (*hp)...)
 	matched := 0
 
 	var ftsTokenStrs []string
@@ -1054,7 +1194,7 @@ func (e *Executor) execLogSegment(
 
 		var entry model.LogEntry
 		if err := entry.DecodeBytes(data); err != nil {
-			return nil
+			return fmt.Errorf("decode log record: %w", err)
 		}
 
 		if !matchesTimeRange(entry, q) || !matchesAttrs(entry, q) {
@@ -1108,6 +1248,14 @@ func (e *Executor) execLogSegment(
 		scanErr = sr.ScanReverseWithBlockSkip(skip, scanFn)
 	}
 	if scanErr != nil {
+		if errors.Is(scanErr, storage.ErrSegmentCorrupted) && ctx.Value(corruptRefetchContextKey{}) != segPath {
+			if err := e.logReaders.refreshCorrupt(segPath); err == nil {
+				*hp = append((*hp)[:0], heapBeforeScan...)
+				heap.Init(hp)
+				retryCtx := context.WithValue(ctx, corruptRefetchContextKey{}, segPath)
+				return e.execLogSegment(retryCtx, q, plan, seg, cursor, hp, k, ftsTokens)
+			}
+		}
 		return matched, fmt.Errorf("scan segment: %w", scanErr)
 	}
 
@@ -1132,6 +1280,9 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 		selfobs.QueryTotal.WithLabelValues("span", cache).Inc()
 	}()
 
+	if q == nil {
+		return nil, errors.New("query: span query is nil")
+	}
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
@@ -1140,14 +1291,12 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	}
 
 	cacheKey := hashSpanQuery(q)
+	var queryGeneration uint64
 
 	for {
 		if cached, ok := e.resultCache.getSpan(cacheKey); ok {
 			cacheHit = true
-			// Copy, mirroring the log path: handing out the cached pointer
-			// would let callers mutate the shared result.
-			cp := *cached
-			return &cp, nil
+			return cached, nil
 		}
 		wait, done, err := e.resultCache.waitOrStart(ctx, cacheKey)
 		if err != nil {
@@ -1157,6 +1306,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 			continue
 		}
 		defer done()
+		queryGeneration = e.resultCache.spanGenerationSnapshot()
 		break
 	}
 
@@ -1225,7 +1375,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 		Truncated:  truncated,
 		NextCursor: nextCursor,
 	}
-	e.resultCache.putSpan(cacheKey, result, q.FromUnixNano(), q.ToUnixNano())
+	e.resultCache.putSpan(cacheKey, result, q.FromUnixNano(), q.ToUnixNano(), queryGeneration)
 	return result, nil
 }
 
@@ -1308,12 +1458,16 @@ func (e *Executor) execSpanSegment(
 	} else {
 		cr, err := e.spanReaders.acquire(segPath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && !e.spanManager.IsQueryableSegment(seg.FileName) {
+				return 0, nil
+			}
 			return 0, fmt.Errorf("open span segment: %w", err)
 		}
 		defer e.spanReaders.release(cr)
 		sr = cr.reader
 	}
 
+	heapBeforeScan := append(spanMinHeap(nil), (*hp)...)
 	matched := 0
 
 	scanFn := func(data []byte) error {
@@ -1330,7 +1484,7 @@ func (e *Executor) execSpanSegment(
 
 		var span model.SpanEntry
 		if err := span.DecodeBytes(data); err != nil {
-			return nil
+			return fmt.Errorf("decode span record: %w", err)
 		}
 
 		if !model.IsZeroTraceID(q.TraceID) && span.TraceID != q.TraceID {
@@ -1415,6 +1569,14 @@ func (e *Executor) execSpanSegment(
 		scanErr = sr.ScanReverseWithBlockSkip(skip, scanFn)
 	}
 	if scanErr != nil {
+		if errors.Is(scanErr, storage.ErrSegmentCorrupted) && ctx.Value(corruptRefetchContextKey{}) != segPath {
+			if err := e.spanReaders.refreshCorrupt(segPath); err == nil {
+				*hp = append((*hp)[:0], heapBeforeScan...)
+				heap.Init(hp)
+				retryCtx := context.WithValue(ctx, corruptRefetchContextKey{}, segPath)
+				return e.execSpanSegment(retryCtx, q, seg, cursor, hp, k)
+			}
+		}
 		return matched, fmt.Errorf("scan span segment: %w", scanErr)
 	}
 

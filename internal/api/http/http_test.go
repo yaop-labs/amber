@@ -276,6 +276,35 @@ func TestIngestHandler_Returns503WhenQueueIsFull(t *testing.T) {
 	}
 }
 
+func TestIngestHandlerRejectsUnknownLevelAndMalformedIDs(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logManager, err := storage.OpenSegmentManager(dir+"/logs", storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logManager.Close()
+	spanManager, err := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spanManager.Close()
+	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log}, ingest.Config{BatchSize: 10, BatchTimeout: time.Second, QueueSize: 4})
+	h := NewIngestHandler(batcher, log)
+	req := httptest.NewRequest("POST", "/api/v1/logs", strings.NewReader(`[
+		{"level":"NOTICE","body":"bad level"},
+		{"level":"INFO","trace_id":"01","body":"bad id"}
+	]`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 partial rejection", rec.Code)
+	}
+	if batcher.LogQueueLen() != 0 {
+		t.Fatalf("invalid records admitted: queue=%d", batcher.LogQueueLen())
+	}
+}
+
 func TestBatcher_SendLogReturnsQueueFull(t *testing.T) {
 	dir := t.TempDir()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

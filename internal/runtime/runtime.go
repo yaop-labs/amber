@@ -11,6 +11,7 @@ import (
 	"math"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	"github.com/yaop-labs/amber/internal/ingest"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -44,12 +46,66 @@ type Options struct {
 	Ingest         IngestOptions
 	Cardinality    CardinalityOptions
 	Metrics        MetricsOptions
+	Retention      RetentionOptions
 	IndexCacheSize int
+	// IndexBootstrapWorkers bounds concurrent sealed-segment sidecar builds.
+	// One worker is the default to keep startup peak memory independent of CPU count.
+	IndexBootstrapWorkers int
 	// MemoryLimit sets the Go runtime soft memory limit in bytes
 	// (debug.SetMemoryLimit). Process-wide and sticky: it overrides
 	// GOMEMLIMIT and stays in effect after Close. Zero leaves the
 	// runtime (or GOMEMLIMIT) setting untouched.
 	MemoryLimit int64
+}
+
+// RetentionOptions configures log/span local-tier eviction and terminal
+// retention. It belongs to the shared runtime so embedded and standalone
+// deployments have the same database semantics.
+type RetentionOptions struct {
+	Logs     StreamRetentionOptions
+	Spans    StreamRetentionOptions
+	Interval time.Duration
+}
+
+// StreamRetentionOptions is the retention policy for one segment stream.
+type StreamRetentionOptions struct {
+	LocalMaxAge   time.Duration
+	LocalMaxBytes int64
+	MaxAge        time.Duration
+	MaxTotalBytes int64
+	MaxSegments   int
+}
+
+// Status is a point-in-time operational view of the database runtime.
+// Degraded means requests remain correct through a documented fallback, while
+// Ready reports whether new traffic may be served.
+type Status struct {
+	Ready                bool           `json:"ready"`
+	Degraded             bool           `json:"degraded"`
+	Closing              bool           `json:"closing"`
+	WALRepairEvents      uint64         `json:"wal_repair_events"`
+	IndexBootstrapErrors uint64         `json:"index_bootstrap_errors"`
+	Reasons              []StatusReason `json:"reasons,omitempty"`
+}
+
+type StatusReason struct {
+	Code  string `json:"code"`
+	Count uint64 `json:"count"`
+}
+
+func (o StreamRetentionOptions) enabled() bool {
+	return o.LocalMaxAge > 0 || o.LocalMaxBytes > 0 || o.MaxAge > 0 || o.MaxTotalBytes > 0 || o.MaxSegments > 0
+}
+
+func (o StreamRetentionOptions) hasLocalTier() bool {
+	return o.LocalMaxAge > 0 || o.LocalMaxBytes > 0
+}
+
+func (o StreamRetentionOptions) policy() retention.Policy {
+	return retention.Policy{
+		LocalMaxAge: o.LocalMaxAge, LocalMaxBytes: o.LocalMaxBytes,
+		MaxAge: o.MaxAge, MaxTotalBytes: o.MaxTotalBytes, MaxSegments: o.MaxSegments,
+	}
 }
 
 // MetricsOptions configures the embedded metrics store.
@@ -109,15 +165,18 @@ type CardinalityOptions struct {
 	MaxAttrsPerEntry      int
 	MaxAttrValueBytes     int
 	MaxAttrKeysPerService int
+	MaxServices           int
 }
 
 const (
 	defaultSegmentMaxRecords uint64 = 100_000
 	defaultSegmentMaxBytes   int64  = 128 << 20
 
-	defaultBatchSize    = 1000
-	defaultBatchTimeout = 100 * time.Millisecond
-	defaultQueueSize    = 10_000
+	defaultBatchSize             = 1000
+	defaultBatchTimeout          = 100 * time.Millisecond
+	defaultQueueSize             = 10_000
+	defaultCardinalityServices   = 10_000
+	defaultIndexBootstrapWorkers = 1
 )
 
 func (o Options) withDefaults() Options {
@@ -139,6 +198,12 @@ func (o Options) withDefaults() Options {
 	}
 	if out.Logger == nil {
 		out.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if out.Cardinality.MaxAttrKeysPerService > 0 && out.Cardinality.MaxServices == 0 {
+		out.Cardinality.MaxServices = defaultCardinalityServices
+	}
+	if out.IndexBootstrapWorkers == 0 {
+		out.IndexBootstrapWorkers = defaultIndexBootstrapWorkers
 	}
 	return out
 }
@@ -163,21 +228,65 @@ type Stack struct {
 	dogfoodStop chan struct{}
 	dogfoodDone chan struct{}
 
-	logUploader  *uploader
-	spanUploader *uploader
+	logUploader   *uploader
+	spanUploader  *uploader
+	remoteClosers []io.Closer
 
-	ready *atomic.Bool
+	ready                *atomic.Bool
+	statusMu             sync.RWMutex
+	degradedReasons      map[string]uint64
+	walRepairEvents      uint64
+	indexBootstrapErrors uint64
+	closing              bool
 
 	// bootstrapWG waits for the sealed-index bootstrap goroutine.
-	bootstrapWG sync.WaitGroup
+	bootstrapWG   sync.WaitGroup
+	bootstrapDone chan struct{}
+
+	retentionCancel context.CancelFunc
+	retentionWG     sync.WaitGroup
 
 	// lock guards the data directory against a second amber process or a
 	// second embedded Open on the same path.
 	lock *fslock.Lock
+
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 // IsReady reports whether bootstrap finished loading sealed indexes.
 func (s *Stack) IsReady() bool { return s.ready.Load() }
+
+// Status returns a consistent operational snapshot.
+func (s *Stack) Status() Status {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	reasons := make([]StatusReason, 0, len(s.degradedReasons))
+	for code, count := range s.degradedReasons {
+		reasons = append(reasons, StatusReason{Code: code, Count: count})
+	}
+	sort.Slice(reasons, func(i, j int) bool { return reasons[i].Code < reasons[j].Code })
+	return Status{
+		Ready:                s.ready.Load() && !s.closing,
+		Degraded:             len(reasons) > 0,
+		Closing:              s.closing,
+		WALRepairEvents:      s.walRepairEvents,
+		IndexBootstrapErrors: s.indexBootstrapErrors,
+		Reasons:              reasons,
+	}
+}
+
+func (s *Stack) markDegraded(reason string) { s.markDegradedN(reason, 1) }
+
+func (s *Stack) markDegradedN(reason string, count uint64) {
+	if reason == "" || count == 0 {
+		return
+	}
+	s.statusMu.Lock()
+	s.degradedReasons[reason] += count
+	s.statusMu.Unlock()
+}
 
 // New assembles and starts a Stack: it takes the data-directory lock, opens
 // storage and the metrics store, wires the executor and batcher, and launches
@@ -187,7 +296,13 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	if opts.DataDir == "" {
 		return nil, errors.New("runtime: DataDir required")
 	}
+	if opts.IndexBootstrapWorkers < 0 {
+		return nil, errors.New("runtime: IndexBootstrapWorkers must be positive when set")
+	}
 	cfg := opts.withDefaults()
+	if cfg.Storage.S3Bucket == "" && (cfg.Retention.Logs.hasLocalTier() || cfg.Retention.Spans.hasLocalTier()) {
+		return nil, errors.New("runtime: local retention tier requires S3 storage")
+	}
 
 	if cfg.MemoryLimit > 0 {
 		debug.SetMemoryLimit(cfg.MemoryLimit)
@@ -226,26 +341,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		return nil, fmt.Errorf("runtime: open span segment manager: %w", err)
 	}
 
-	logSparse, err := index.LoadSparseIndex(logDir)
-	if err != nil {
-		_ = logManager.Close()
-		_ = spanManager.Close()
-		return nil, fmt.Errorf("runtime: load log sparse: %w", err)
-	}
-
-	spanSparse, err := index.LoadSparseIndex(spanDir)
-	if err != nil {
-		_ = logManager.Close()
-		_ = spanManager.Close()
-		return nil, fmt.Errorf("runtime: load span sparse: %w", err)
-	}
-
-	exec := query.NewExecutorWithCache(
-		logManager, spanManager, logSparse, spanSparse,
-		logDir, spanDir, cfg.IndexCacheSize,
-	)
-
 	var logUp, spanUp *uploader
+	var logRemote, spanRemote storage.SegmentStore
+	var reconcileFailures []string
 	if cfg.Storage.S3Bucket != "" {
 		s3cfg := storage.S3StoreConfig{
 			Bucket:   cfg.Storage.S3Bucket,
@@ -275,8 +373,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		logManager.SetStore(logS3)
 		spanManager.SetStore(spanS3)
-
-		exec.SetSegmentStores(logS3, spanS3, cfg.Logger)
+		logRemote, spanRemote = logS3, spanS3
 
 		logUp = newUploader(logManager, logS3, logDir, cfg.Logger)
 		spanUp = newUploader(spanManager, spanS3, spanDir, cfg.Logger)
@@ -290,6 +387,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		runSpanReconcile := cfg.Storage.S3ReconcileOnStart || len(spanManager.Segments()) == 0
 		if runLogReconcile {
 			if n, err := bootstrap.ReconcileFromRemote(ctx, logManager, logS3, logDir, cfg.Logger); err != nil {
+				reconcileFailures = append(reconcileFailures, "log_remote_reconcile_failure")
 				cfg.Logger.Warn("log s3 reconcile failed", "err", err)
 			} else if n > 0 {
 				cfg.Logger.Info("log s3 reconcile adopted segments", "count", n)
@@ -297,6 +395,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		if runSpanReconcile {
 			if n, err := bootstrap.ReconcileFromRemote(ctx, spanManager, spanS3, spanDir, cfg.Logger); err != nil {
+				reconcileFailures = append(reconcileFailures, "span_remote_reconcile_failure")
 				cfg.Logger.Warn("span s3 reconcile failed", "err", err)
 			} else if n > 0 {
 				cfg.Logger.Info("span s3 reconcile adopted segments", "count", n)
@@ -304,17 +403,41 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 	}
 
-	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
+	// sparse.idx is a disposable acceleration artifact, not authoritative
+	// state. Rebuild it from the recovered managers after local WAL replay and
+	// remote reconciliation, so a missing, stale, or corrupt cache cannot make
+	// durable segments invisible to queries.
+	logSparse := bootstrap.BuildSparseIndex(logManager)
+	spanSparse := bootstrap.BuildSparseIndex(spanManager)
+	exec := query.NewExecutorWithCache(
+		logManager, spanManager, logSparse, spanSparse,
+		logDir, spanDir, cfg.IndexCacheSize,
+	)
+	if logRemote != nil || spanRemote != nil {
+		exec.SetSegmentStores(logRemote, spanRemote, cfg.Logger)
+	}
 
 	ready := &atomic.Bool{}
-	s := &Stack{ready: ready}
+	s := &Stack{
+		ready: ready, closeDone: make(chan struct{}), bootstrapDone: make(chan struct{}),
+		degradedReasons: make(map[string]uint64),
+	}
+	s.walRepairEvents = logManager.WALCorruptRecords() + spanManager.WALCorruptRecords()
+	if s.walRepairEvents > 0 {
+		s.markDegradedN("wal_tail_repaired", s.walRepairEvents)
+	}
+	for _, reason := range reconcileFailures {
+		s.markDegraded(reason)
+	}
+	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger, s.markDegraded)
 
 	var guard *ingest.CardinalityGuard
-	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 {
+	if cfg.Cardinality.MaxAttrsPerEntry > 0 || cfg.Cardinality.MaxAttrValueBytes > 0 || cfg.Cardinality.MaxAttrKeysPerService > 0 || cfg.Cardinality.MaxServices > 0 {
 		guard = ingest.NewCardinalityGuard(
 			cfg.Cardinality.MaxAttrsPerEntry,
 			cfg.Cardinality.MaxAttrValueBytes,
 			cfg.Cardinality.MaxAttrKeysPerService,
+			cfg.Cardinality.MaxServices,
 		)
 	}
 
@@ -400,16 +523,31 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.MetricStore = metricStore
 	s.logUploader = logUp
 	s.spanUploader = spanUp
+	if closer, ok := logRemote.(io.Closer); ok {
+		s.remoteClosers = append(s.remoteClosers, closer)
+	}
+	if closer, ok := spanRemote.(io.Closer); ok {
+		s.remoteClosers = append(s.remoteClosers, closer)
+	}
 	s.lock = dirLock
 	opened = true
 
 	s.bootstrapWG.Go(func() {
-		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
+		defer close(s.bootstrapDone)
+		report := bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.IndexBootstrapWorkers, cfg.Logger)
+		if report.IndexErrors > 0 {
+			s.statusMu.Lock()
+			s.indexBootstrapErrors += report.IndexErrors
+			s.statusMu.Unlock()
+			s.markDegradedN("index_bootstrap_failure", report.IndexErrors)
+		}
 		if ctx.Err() == nil {
 			ready.Store(true)
 			cfg.Logger.Info("sealed indexes loaded")
 		}
 	})
+
+	s.startRetention(ctx, cfg.Retention, cfg.Storage.S3Bucket != "", cfg.Logger)
 
 	batcher.Start(ctx)
 
@@ -422,18 +560,70 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	return s, nil
 }
 
-// Close drains the batcher and shuts down storage under ctx's deadline.
-// The parent context passed to New must be canceled before Close.
+func (s *Stack) startRetention(parent context.Context, opts RetentionOptions, remoteEnabled bool, log *slog.Logger) {
+	if !opts.Logs.enabled() && !opts.Spans.enabled() {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.retentionCancel = cancel
+	interval := opts.Interval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+
+	start := func(stream string, policy StreamRetentionOptions, manager *storage.SegmentManager, sparse *index.SparseIndex, dir string, invalidate func(storage.SegmentMeta)) {
+		if !policy.enabled() {
+			return
+		}
+		cleaner := retention.NewCleaner(manager, sparse, policy.policy(), dir, stream, log)
+		cleaner.SetOnDelete(invalidate)
+		cleaner.SetOnLocalEvict(invalidate)
+		cleaner.RequireUploaded(remoteEnabled)
+		s.retentionWG.Go(func() {
+			select {
+			case <-s.bootstrapDone:
+			case <-ctx.Done():
+				return
+			}
+			cleaner.StartLoop(interval, ctx.Done())
+		})
+	}
+
+	start("logs", opts.Logs, s.LogManager, s.LogSparse, s.LogDir, s.Executor.InvalidateLogSegment)
+	start("spans", opts.Spans, s.SpanManager, s.SpanSparse, s.SpanDir, s.Executor.InvalidateSpanSegment)
+}
+
+// Close first stops ingest admission and drains both lane barriers, then shuts
+// down storage under ctx's deadline. Background contexts may already be
+// cancelled; the batcher owns its worker lifetime so cancellation cannot race
+// the final admission drain.
 func (s *Stack) Close(ctx context.Context) error {
-	waitDone := make(chan struct{})
-	go func() {
-		s.Batcher.Wait()
-		close(waitDone)
-	}()
+	s.statusMu.Lock()
+	s.closing = true
+	s.ready.Store(false)
+	s.statusMu.Unlock()
+	s.closeOnce.Do(func() {
+		go func() {
+			s.closeErr = s.close()
+			close(s.closeDone)
+		}()
+	})
 	select {
-	case <-waitDone:
+	case <-s.closeDone:
+		return s.closeErr
 	case <-ctx.Done():
-		return fmt.Errorf("runtime: batcher drain: %w", ctx.Err())
+		return fmt.Errorf("runtime: shutdown: %w", ctx.Err())
+	}
+}
+
+func (s *Stack) close() error {
+	var errs []error
+	if s.retentionCancel != nil {
+		s.retentionCancel()
+		s.retentionWG.Wait()
+	}
+	if err := s.Batcher.Close(context.Background()); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: batcher drain: %w", err))
 	}
 
 	// Stop the dogfood scraper before closing the metric store.
@@ -443,6 +633,11 @@ func (s *Stack) Close(ctx context.Context) error {
 	}
 
 	// Stop uploaders before closing segment managers.
+	for _, closer := range s.remoteClosers {
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close remote store: %w", err))
+		}
+	}
 	if s.logUploader != nil {
 		s.logUploader.Stop()
 	}
@@ -451,52 +646,32 @@ func (s *Stack) Close(ctx context.Context) error {
 	}
 
 	// Wait for bootstrap readers before closing segment managers.
-	bsDone := make(chan struct{})
-	go func() {
-		s.bootstrapWG.Wait()
-		close(bsDone)
-	}()
-	select {
-	case <-bsDone:
-	case <-ctx.Done():
-		return fmt.Errorf("runtime: bootstrap drain: %w", ctx.Err())
-	}
+	s.bootstrapWG.Wait()
 
-	closeDone := make(chan error, 1)
-	go func() {
-		var errs []error
-		if s.MetricStore != nil {
-			if err := s.MetricStore.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("runtime: close metric store: %w", err))
-			}
+	if s.MetricStore != nil {
+		if err := s.MetricStore.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close metric store: %w", err))
 		}
-		if s.Executor != nil {
-			s.Executor.Close()
-		}
-		if err := s.LogSparse.Save(s.LogDir); err != nil {
-			errs = append(errs, fmt.Errorf("runtime: save log sparse: %w", err))
-		}
-		if err := s.SpanSparse.Save(s.SpanDir); err != nil {
-			errs = append(errs, fmt.Errorf("runtime: save span sparse: %w", err))
-		}
-		if err := s.LogManager.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("runtime: close log manager: %w", err))
-		}
-		if err := s.SpanManager.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("runtime: close span manager: %w", err))
-		}
-		closeDone <- errors.Join(errs...)
-	}()
-	select {
-	case err := <-closeDone:
-		// Release the dir lock only after a clean close; on timeout paths
-		// components may still touch files, so the lock stays held until
-		// process exit (the kernel drops it then).
-		if rerr := s.lock.Release(); rerr != nil && err == nil {
-			err = fmt.Errorf("runtime: release dir lock: %w", rerr)
-		}
-		return err
-	case <-ctx.Done():
-		return fmt.Errorf("runtime: shutdown: %w", ctx.Err())
 	}
+	if s.Executor != nil {
+		s.Executor.Close()
+	}
+	if err := s.LogSparse.Save(s.LogDir); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: save log sparse: %w", err))
+	}
+	if err := s.SpanSparse.Save(s.SpanDir); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: save span sparse: %w", err))
+	}
+	if err := s.LogManager.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: close log manager: %w", err))
+	}
+	if err := s.SpanManager.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: close span manager: %w", err))
+	}
+	// All workers and file owners have terminated at this point, so releasing
+	// the lock is safe even when one component reported a terminal error.
+	if err := s.lock.Release(); err != nil {
+		errs = append(errs, fmt.Errorf("runtime: release dir lock: %w", err))
+	}
+	return errors.Join(errs...)
 }

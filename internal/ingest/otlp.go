@@ -29,7 +29,13 @@ func ExtractResource(attrs []*commonpb.KeyValue) (service, host string) {
 // OTLPLogToEntry converts an OTLP log record (with its resource service/host)
 // into a model.LogEntry.
 func OTLPLogToEntry(lr *logspb.LogRecord, service, host string) (model.LogEntry, error) {
-	level, _ := model.LevelFromString(lr.SeverityText)
+	if len(lr.TraceId) != 0 && len(lr.TraceId) != 16 {
+		return model.LogEntry{}, fmt.Errorf("otlp log: trace_id length %d, want 16", len(lr.TraceId))
+	}
+	if len(lr.SpanId) != 0 && len(lr.SpanId) != 8 {
+		return model.LogEntry{}, fmt.Errorf("otlp log: span_id length %d, want 8", len(lr.SpanId))
+	}
+	level := otlpLogLevel(lr)
 
 	body := AnyValueToString(lr.Body)
 
@@ -63,6 +69,15 @@ func OTLPLogToEntry(lr *logspb.LogRecord, service, host string) (model.LogEntry,
 // OTLPSpanToEntry converts an OTLP span (with its resource service) into a
 // model.SpanEntry.
 func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) {
+	if len(sp.TraceId) != 16 {
+		return model.SpanEntry{}, fmt.Errorf("otlp span: trace_id length %d, want 16", len(sp.TraceId))
+	}
+	if len(sp.SpanId) != 8 {
+		return model.SpanEntry{}, fmt.Errorf("otlp span: span_id length %d, want 8", len(sp.SpanId))
+	}
+	if len(sp.ParentSpanId) != 0 && len(sp.ParentSpanId) != 8 {
+		return model.SpanEntry{}, fmt.Errorf("otlp span: parent_span_id length %d, want 8", len(sp.ParentSpanId))
+	}
 	var traceID model.TraceID
 	var spanID model.SpanID
 	var parentID model.SpanID
@@ -94,6 +109,28 @@ func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) 
 	}
 
 	return entry, nil
+}
+
+func otlpLogLevel(lr *logspb.LogRecord) model.Level {
+	if level, err := model.LevelFromString(lr.SeverityText); err == nil {
+		return level
+	}
+	switch n := lr.SeverityNumber; {
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_FATAL:
+		return model.LevelFatal
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_ERROR:
+		return model.LevelError
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_WARN:
+		return model.LevelWarn
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_INFO:
+		return model.LevelInfo
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_DEBUG:
+		return model.LevelDebug
+	case n >= logspb.SeverityNumber_SEVERITY_NUMBER_TRACE:
+		return model.LevelTrace
+	default:
+		return model.LevelInfo
+	}
 }
 
 // OTLPStatusToModel maps an OTLP span status to the model's SpanStatus.

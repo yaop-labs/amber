@@ -43,6 +43,41 @@ func TestEntryIDToUint64_Deterministic(t *testing.T) {
 	}
 }
 
+func TestEncodedSizeMatchesWriteTo(t *testing.T) {
+	logEntry := LogEntry{
+		ID: MustNewEntryID(), Timestamp: time.Now(), Level: LevelWarn,
+		Service: "api", Host: "node", Body: "hello",
+		Attrs: []Attr{{Key: "env", Value: "test"}, {Key: "zone", Value: "a"}},
+	}
+	wantLog, err := logEntry.EncodedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logBuf bytes.Buffer
+	if _, err := logEntry.WriteTo(&logBuf); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(logBuf.Len()) != wantLog {
+		t.Fatalf("log EncodedSize = %d, WriteTo = %d", wantLog, logBuf.Len())
+	}
+
+	span := SpanEntry{
+		ID: MustNewEntryID(), Service: "api", Operation: "GET /", StartTime: time.Now(), EndTime: time.Now().Add(time.Millisecond),
+		Attrs: []Attr{{Key: "http.method", Value: "GET"}},
+	}
+	wantSpan, err := span.EncodedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spanBuf bytes.Buffer
+	if _, err := span.WriteTo(&spanBuf); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(spanBuf.Len()) != wantSpan {
+		t.Fatalf("span EncodedSize = %d, WriteTo = %d", wantSpan, spanBuf.Len())
+	}
+}
+
 func TestEntryIDToUint64_Unique(t *testing.T) {
 	seen := make(map[uint64]struct{}, 1000)
 	for i := range 1000 {

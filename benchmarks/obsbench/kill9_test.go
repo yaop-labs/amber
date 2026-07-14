@@ -13,7 +13,7 @@ import (
 
 // TestE2E_Kill9Amber drives the durability-loss orchestration against a real
 // amber binary: build, start, steady ingest, SIGKILL mid-stream, restart,
-// recovery count. It validates the harness, not amber's loss numbers - amber
+// recovery through the paginated query API. It validates the harness, not amber's loss numbers - amber
 // acks after enqueue by design, so LostAcked > 0 is an expected outcome
 // here, not a failure.
 func TestE2E_Kill9Amber(t *testing.T) {

@@ -122,7 +122,12 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 	c.mu.Unlock()
 
 	sr, err := storage.OpenSegmentReader(path, nil)
-	if err != nil && c.fetcher != nil && errors.Is(err, os.ErrNotExist) {
+	if err != nil && c.fetcher != nil && (errors.Is(err, os.ErrNotExist) || errors.Is(err, storage.ErrSegmentCorrupted)) {
+		if errors.Is(err, storage.ErrSegmentCorrupted) {
+			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+				return nil, removeErr
+			}
+		}
 		// Local miss: pull from remote store under singleflight so concurrent
 		// queriers don't each pay the network cost. After fetch, retry the
 		// open - store.Get writes the data file atomically via temp+rename.
@@ -170,6 +175,22 @@ func (c *readerCache) acquire(path string) (*cachedReader, error) {
 		_ = closeReader.Close()
 	}
 	return cr, nil
+}
+
+// refreshCorrupt drops a cached reader and corrupt local data file, then
+// materializes one fresh remote copy. Callers retry the scan at most once.
+func (c *readerCache) refreshCorrupt(path string) error {
+	if c.fetcher == nil {
+		return errors.New("reader cache: remote fetch disabled")
+	}
+	c.invalidate(path)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_, err, _ := c.flight.Do(path+"#corrupt", func() (any, error) {
+		return nil, c.fetcher(filepath.Base(path))
+	})
+	return err
 }
 
 // evictLocked marks the entry evicted and, when no scan holds it, detaches

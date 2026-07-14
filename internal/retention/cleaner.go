@@ -37,6 +37,7 @@ type Cleaner struct {
 	stream          string // "logs" or "spans"
 	log             *slog.Logger
 	onDelete        func(storage.SegmentMeta)
+	onLocalEvict    func(storage.SegmentMeta)
 	requireUploaded bool
 }
 
@@ -65,6 +66,13 @@ func (c *Cleaner) SetOnDelete(fn func(storage.SegmentMeta)) {
 	c.onDelete = fn
 }
 
+// SetOnLocalEvict registers a callback after local files are removed. Query
+// runtimes use it to close cached file descriptors (so unlink really reclaims
+// bytes) and discard sidecars that no longer exist locally.
+func (c *Cleaner) SetOnLocalEvict(fn func(storage.SegmentMeta)) {
+	c.onLocalEvict = fn
+}
+
 // RequireUploaded requires UploadStateUploaded before global deletion.
 func (c *Cleaner) RequireUploaded(v bool) {
 	c.requireUploaded = v
@@ -83,7 +91,7 @@ func (c *Cleaner) Run() (int, error) {
 	if c.policy.hasLocalTier() {
 		var localCandidates []storage.SegmentMeta
 		for _, s := range segments {
-			if !s.DeletePending && s.UploadState == storage.UploadStateUploaded && s.HasLocalCopy() {
+			if !s.DeletePending && s.UploadState == storage.UploadStateUploaded && (s.HasLocalCopy() || s.LocalDeletePending) {
 				localCandidates = append(localCandidates, s)
 			}
 		}
@@ -137,10 +145,18 @@ func (c *Cleaner) runLocalEviction(candidates []storage.SegmentMeta) int {
 		reason string
 	}
 	var picks []localEvict
+	for _, s := range candidates {
+		if s.LocalDeletePending {
+			picks = append(picks, localEvict{seg: s, reason: "local_delete_pending"})
+		}
+	}
 
 	if c.policy.LocalMaxAge > 0 {
 		cutoff := now - c.policy.LocalMaxAge.Nanoseconds()
 		for _, s := range candidates {
+			if s.LocalDeletePending {
+				continue
+			}
 			if s.MaxTS < cutoff {
 				picks = append(picks, localEvict{seg: s, reason: "local_max_age"})
 			}
@@ -192,14 +208,20 @@ func (c *Cleaner) runLocalEviction(candidates []storage.SegmentMeta) int {
 }
 
 // evictLocal removes one segment's local files.
-// It marks metadata before deleting files so a crash cannot leave metadata
-// claiming a local copy that is gone.
+// It persists an in-progress state, deletes files, then commits absence. A
+// crash or I/O failure at either boundary is retried by the next Run.
 func (c *Cleaner) evictLocal(seg storage.SegmentMeta) error {
-	if err := c.manager.MarkLocalEvicted(seg.ID); err != nil {
+	if err := c.manager.BeginLocalEviction(seg.ID); err != nil {
 		return err
 	}
 	if err := c.manager.DeleteSegmentFilesLocal(seg); err != nil {
 		return err
+	}
+	if err := c.manager.CompleteLocalEviction(seg.ID); err != nil {
+		return err
+	}
+	if c.onLocalEvict != nil {
+		c.onLocalEvict(seg)
 	}
 	c.log.Info("local segment evicted",
 		"kind", c.stream,
@@ -284,6 +306,11 @@ func (c *Cleaner) deleteSegment(seg storage.SegmentMeta) error {
 	if err := c.manager.BeginDeleteSegment(seg.ID); err != nil {
 		return err
 	}
+	// DeletePending is the logical deletion commit. Invalidate result/read and
+	// sidecar caches now, even if physical deletion fails and is retried later.
+	if c.onDelete != nil {
+		c.onDelete(seg)
+	}
 
 	c.sparse.Remove(seg.ID)
 	if err := c.sparse.Save(c.dataDir); err != nil {
@@ -296,10 +323,6 @@ func (c *Cleaner) deleteSegment(seg storage.SegmentMeta) error {
 
 	if err := c.manager.RemoveSegment(seg.ID); err != nil {
 		return err
-	}
-
-	if c.onDelete != nil {
-		c.onDelete(seg)
 	}
 
 	c.log.Info("segment deleted",

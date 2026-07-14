@@ -6,7 +6,6 @@
 package indexer
 
 import (
-	"encoding/hex"
 	"sync"
 
 	"github.com/yaop-labs/amber/internal/index"
@@ -112,11 +111,6 @@ func (a *ActiveIndex) IndexLogEntry(entry model.LogEntry) {
 	if entry.Host != "" {
 		idx.Add("host", entry.Host, entryID)
 	}
-	if !model.IsZeroTraceID(entry.TraceID) {
-		var traceHex [32]byte
-		hex.Encode(traceHex[:], entry.TraceID[:])
-		idx.Add("trace_id", string(traceHex[:]), entryID)
-	}
 }
 
 // IndexSpanEntry adds one span's indexable fields to the active span bitmap.
@@ -134,11 +128,6 @@ func (a *ActiveIndex) IndexSpanEntry(span model.SpanEntry) {
 	}
 	idx.Add("status", span.Status.String(), entryID)
 	idx.Add(index.DurationBucketField, index.DurationBucket(span.Duration()), entryID)
-	if !model.IsZeroTraceID(span.TraceID) {
-		var traceHex [32]byte
-		hex.Encode(traceHex[:], span.TraceID[:])
-		idx.Add("trace_id", string(traceHex[:]), entryID)
-	}
 }
 
 // IndexLogEntries adds a batch of log entries to the active log bitmap in one
@@ -155,9 +144,6 @@ func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 	levelGroups := make(map[string][]uint64, 4)
 	serviceGroups := make(map[string][]uint64, 4)
 	hostGroups := make(map[string][]uint64, 8)
-	traceGroups := make(map[string][]uint64)
-
-	var traceHexCache map[model.TraceID]string
 
 	for _, entry := range entries {
 		entryID := model.EntryIDToUint64(entry.ID)
@@ -168,19 +154,6 @@ func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 		}
 		if entry.Host != "" {
 			hostGroups[entry.Host] = append(hostGroups[entry.Host], entryID)
-		}
-		if !model.IsZeroTraceID(entry.TraceID) {
-			if traceHexCache == nil {
-				traceHexCache = make(map[model.TraceID]string)
-			}
-			th, ok := traceHexCache[entry.TraceID]
-			if !ok {
-				var buf [32]byte
-				hex.Encode(buf[:], entry.TraceID[:])
-				th = string(buf[:])
-				traceHexCache[entry.TraceID] = th
-			}
-			traceGroups[th] = append(traceGroups[th], entryID)
 		}
 	}
 
@@ -196,7 +169,6 @@ func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 	flush("level", levelGroups)
 	flush("service", serviceGroups)
 	flush("host", hostGroups)
-	flush("trace_id", traceGroups)
 }
 
 // IndexSpanEntries adds a batch of spans to the active span bitmap in one pass.
@@ -213,8 +185,6 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	operationGroups := make(map[string][]uint64, 8)
 	statusGroups := make(map[string][]uint64, 4)
 	durGroups := make(map[string][]uint64, 16)
-	traceGroups := make(map[string][]uint64)
-	var traceHexCache map[model.TraceID]string
 
 	for _, span := range spans {
 		entryID := model.EntryIDToUint64(span.ID)
@@ -228,19 +198,6 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 		statusGroups[span.Status.String()] = append(statusGroups[span.Status.String()], entryID)
 		durBucket := index.DurationBucket(span.Duration())
 		durGroups[durBucket] = append(durGroups[durBucket], entryID)
-		if !model.IsZeroTraceID(span.TraceID) {
-			if traceHexCache == nil {
-				traceHexCache = make(map[model.TraceID]string)
-			}
-			th, ok := traceHexCache[span.TraceID]
-			if !ok {
-				var buf [32]byte
-				hex.Encode(buf[:], span.TraceID[:])
-				th = string(buf[:])
-				traceHexCache[span.TraceID] = th
-			}
-			traceGroups[th] = append(traceGroups[th], entryID)
-		}
 	}
 
 	if len(serviceGroups) > 0 {
@@ -264,12 +221,6 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	if len(durGroups) > 0 {
 		bi := idx.GetOrCreate(index.DurationBucketField)
 		for value, ids := range durGroups {
-			bi.AddMany(value, ids)
-		}
-	}
-	if len(traceGroups) > 0 {
-		bi := idx.GetOrCreate("trace_id")
-		for value, ids := range traceGroups {
 			bi.AddMany(value, ids)
 		}
 	}

@@ -26,16 +26,22 @@ const (
 	// walHeaderSize layout: magic(4) | crc(4) | length(4) | seq(8) = 20 bytes.
 	walHeaderSize = 20
 
-	// maxWALRecordBytes caps the per-record payload size accepted by Replay.
-	// Guards against OOM on a corrupt WAL whose length field decodes to garbage
-	// before we have a chance to verify the CRC.
-	maxWALRecordBytes = 64 << 20
+	// MaxWALRecordBytes is the largest payload both the writer and replay
+	// accept. Keeping this symmetric prevents successfully acknowledged data
+	// from becoming unreplayable after a restart.
+	MaxWALRecordBytes = 64 << 20
+	// MaxEventRecordBytes leaves room for SegmentManager's 8-byte event-time
+	// prefix inside a WAL payload.
+	MaxEventRecordBytes = MaxWALRecordBytes - 8
 )
 
 var (
-	ErrWALCorrupted = errors.New("wal: corrupted record")
-	ErrWALBadMagic  = errors.New("wal: bad magic bytes")
-	ErrWALBadCRC    = errors.New("wal: crc32 mismatch")
+	ErrWALCorrupted   = errors.New("wal: corrupted record")
+	ErrWALBadMagic    = errors.New("wal: bad magic bytes")
+	ErrWALBadCRC      = errors.New("wal: crc32 mismatch")
+	ErrRecordTooLarge = errors.New("record exceeds maximum storage size")
+	// ErrWALRecordTooLarge is kept as the storage-specific compatibility name.
+	ErrWALRecordTooLarge = ErrRecordTooLarge
 )
 
 // WALRecord is one replayed log/span record's opaque payload.
@@ -134,6 +140,9 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 	if w.failed != nil {
 		return 0, w.failed
 	}
+	if err := validateWALPayloadSize(len(payload)); err != nil {
+		return 0, err
+	}
 
 	seq, err := w.writeRecord(payload)
 	if err != nil {
@@ -169,6 +178,11 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 
 	if w.failed != nil {
 		return 0, w.failed
+	}
+	for i, item := range items {
+		if err := validateWALPayloadSize(8 + len(item.Data)); err != nil {
+			return 0, fmt.Errorf("wal: batch item %d: %w", i, err)
+		}
 	}
 
 	// Reserve len(items) sequential seqs in a single atomic op.
@@ -232,6 +246,11 @@ func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
 	if w.failed != nil {
 		return 0, w.failed
 	}
+	for i, payload := range payloads {
+		if err := validateWALPayloadSize(len(payload)); err != nil {
+			return 0, fmt.Errorf("wal: batch item %d: %w", i, err)
+		}
+	}
 
 	firstSeq, err := w.writeRecord(payloads[0])
 	if err != nil {
@@ -279,6 +298,13 @@ func (w *WAL) writeRecord(payload []byte) (uint64, error) {
 	return seq, nil
 }
 
+func validateWALPayloadSize(size int) error {
+	if size > MaxWALRecordBytes {
+		return fmt.Errorf("%w: got %d bytes, max %d", ErrWALRecordTooLarge, size, MaxWALRecordBytes)
+	}
+	return nil
+}
+
 // Replay iterates payloads in order. Equivalent to ReplayWithSeq but ignores
 // the seq for callers that don't need it.
 func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
@@ -299,11 +325,20 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 	r := bufio.NewReader(w.file)
 	count := 0
 	var maxSeq uint64
+	var lastGoodOffset int64
 
 	for {
 		var header [walHeaderSize]byte
 		_, err := io.ReadFull(r, header[:])
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			w.corruptCount.Add(1)
+			w.log.Warn("wal: repairing incomplete header tail", "last_good_offset", lastGoodOffset)
+			if err := w.repairTail(lastGoodOffset); err != nil {
+				return count, err
+			}
 			break
 		}
 		if err != nil {
@@ -313,24 +348,27 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 		magic := binary.LittleEndian.Uint32(header[0:4])
 		if magic != walMagic {
 			w.corruptCount.Add(1)
-			w.log.Warn("wal: bad magic, stopping replay", "offset_records", count)
-			break
+			return count, fmt.Errorf("%w at byte %d: %w", ErrWALCorrupted, lastGoodOffset, ErrWALBadMagic)
 		}
 
 		expectedCRC := binary.LittleEndian.Uint32(header[4:8])
 		length := binary.LittleEndian.Uint32(header[8:12])
 		seq := binary.LittleEndian.Uint64(header[12:20])
 
-		if length > maxWALRecordBytes {
+		if length > MaxWALRecordBytes {
 			w.corruptCount.Add(1)
-			w.log.Warn("wal: record length exceeds cap, stopping replay",
-				"length", length, "cap", uint32(maxWALRecordBytes), "offset_records", count)
-			break
+			return count, fmt.Errorf("%w at byte %d: %w: got %d bytes, max %d",
+				ErrWALCorrupted, lastGoodOffset, ErrWALRecordTooLarge, length, MaxWALRecordBytes)
 		}
 
 		payload := make([]byte, length)
 		_, err = io.ReadFull(r, payload)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			w.corruptCount.Add(1)
+			w.log.Warn("wal: repairing incomplete payload tail", "last_good_offset", lastGoodOffset)
+			if err := w.repairTail(lastGoodOffset); err != nil {
+				return count, err
+			}
 			break
 		}
 		if err != nil {
@@ -341,8 +379,7 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 		actualCRC = crc32.Update(actualCRC, crc32.IEEETable, payload)
 		if actualCRC != expectedCRC {
 			w.corruptCount.Add(1)
-			w.log.Warn("wal: crc mismatch, stopping replay", "offset_records", count)
-			break
+			return count, fmt.Errorf("%w at byte %d: %w", ErrWALCorrupted, lastGoodOffset, ErrWALBadCRC)
 		}
 
 		if err := fn(seq, payload); err != nil {
@@ -353,6 +390,7 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 			maxSeq = seq
 		}
 		count++
+		lastGoodOffset += walHeaderSize + int64(length)
 	}
 
 	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
@@ -364,6 +402,23 @@ func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, err
 	}
 
 	return count, nil
+}
+
+// repairTail removes only a structurally incomplete final record. The caller
+// holds w.mu. Checksum, magic, and oversized-length failures are not repaired:
+// they can be middle corruption and therefore fail replay instead.
+func (w *WAL) repairTail(lastGoodOffset int64) error {
+	if err := w.file.Truncate(lastGoodOffset); err != nil {
+		return fmt.Errorf("wal: repair tail truncate to %d: %w", lastGoodOffset, err)
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("wal: repair tail sync: %w", err)
+	}
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("wal: repair tail seek: %w", err)
+	}
+	w.buf.Reset(w.file)
+	return nil
 }
 
 // Truncate empties the WAL after its records are durably checkpointed into a

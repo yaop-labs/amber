@@ -2,8 +2,11 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,7 +128,7 @@ func TestBatcher_SendAndDrain(t *testing.T) {
 	defer logManager.Close()
 	defer spanManager.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 	batcher := NewBatcher(Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: sparse, SpanSparse: spanSparse, Logger: log}, Config{BatchSize: 50, BatchTimeout: 10 * time.Millisecond, QueueSize: 1000})
 	batcher.Start(ctx)
 
@@ -142,8 +145,11 @@ func TestBatcher_SendAndDrain(t *testing.T) {
 		}
 	}
 
-	cancel()
-	batcher.Wait()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if err := batcher.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	if logManager.ActiveRecordCount() != 200 {
 		t.Errorf("expected 200 records after drain, got %d", logManager.ActiveRecordCount())
@@ -170,11 +176,12 @@ func TestBatcher_RotationTouchesWrittenSegmentSparseIndex(t *testing.T) {
 		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: logSparse, SpanSparse: index.NewSparseIndex(), Logger: log},
 		Config{BatchSize: 1, BatchTimeout: time.Hour, QueueSize: 16},
 	)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 	batcher.Start(ctx)
 	defer func() {
-		cancel()
-		batcher.Wait()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = batcher.Close(closeCtx)
 	}()
 
 	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "rotate"}
@@ -256,11 +263,12 @@ func TestBatcher_LogBreakerDoesNotBlockSpan(t *testing.T) {
 	)
 
 	_ = logManager.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 	batcher.Start(ctx)
 	defer func() {
-		cancel()
-		batcher.Wait()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = batcher.Close(closeCtx)
 	}()
 
 	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "trip"}
@@ -292,5 +300,124 @@ func TestBatcher_LogBreakerDoesNotBlockSpan(t *testing.T) {
 	}
 	if err := batcher.SendSpan(span); err != nil {
 		t.Fatalf("SendSpan after log breaker open: %v", err)
+	}
+}
+
+func TestBatcherFlushReturnsCoveredWriteError(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logManager, err := storage.OpenSegmentManager(dir+"/logs", storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanManager, err := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spanManager.Close()
+
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 100, BatchTimeout: time.Hour, QueueSize: 16},
+	)
+	batcher.Start(context.Background())
+
+	// Closing the manager injects a deterministic covered storage failure.
+	if err := logManager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "must fail"}
+	if err := batcher.SendLog(entry); err != nil {
+		t.Fatalf("SendLog: %v", err)
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := batcher.Flush(flushCtx); err == nil {
+		t.Fatal("Flush returned nil after covered storage failure")
+	}
+	_ = batcher.Close(flushCtx)
+}
+
+func TestBatcherRejectsAdmissionAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logManager, _ := storage.OpenSegmentManager(dir+"/logs", storage.DefaultRotationPolicy)
+	spanManager, _ := storage.OpenSegmentManager(dir+"/spans", storage.DefaultRotationPolicy)
+	defer logManager.Close()
+	defer spanManager.Close()
+
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 100, BatchTimeout: time.Hour, QueueSize: 16},
+	)
+	batcher.Start(context.Background())
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := batcher.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Now(), Level: model.LevelInfo, Service: "logs", Body: "late"}
+	if err := batcher.SendLog(entry); !errors.Is(err, ErrClosed) {
+		t.Fatalf("SendLog after Close = %v, want ErrClosed", err)
+	}
+	if err := batcher.Flush(closeCtx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Flush after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestBatcherCloseDrainsEveryConcurrentlyAcceptedEntry(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	logManager, err := storage.OpenSegmentManager(dir+"/logs", storage.RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanManager, err := storage.OpenSegmentManager(dir+"/spans", storage.RotationPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logManager.Close()
+	defer spanManager.Close()
+
+	batcher := NewBatcher(
+		Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: index.NewSparseIndex(), SpanSparse: index.NewSparseIndex(), Logger: log},
+		Config{BatchSize: 32, BatchTimeout: time.Hour, QueueSize: 1024},
+	)
+	batcher.Start(context.Background())
+
+	var accepted atomic.Uint64
+	start := make(chan struct{})
+	var senders sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		senders.Add(1)
+		go func(worker int) {
+			defer senders.Done()
+			<-start
+			for i := 0; i < 500; i++ {
+				entry := model.LogEntry{ID: model.MustNewEntryID(), Timestamp: time.Unix(0, int64(worker*500+i+1)), Level: model.LevelInfo, Service: "close-race", Body: "accepted must drain"}
+				if err := batcher.SendLog(entry); err == nil {
+					accepted.Add(1)
+				} else if errors.Is(err, ErrClosed) {
+					return
+				} else if !errors.Is(err, ErrQueueFull) {
+					t.Errorf("SendLog: %v", err)
+					return
+				}
+			}
+		}(worker)
+	}
+	close(start)
+	deadline := time.Now().Add(2 * time.Second)
+	for accepted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := batcher.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	senders.Wait()
+	if got, want := logManager.ActiveRecordCount(), accepted.Load(); got != want {
+		t.Fatalf("records after Close = %d, accepted = %d", got, want)
 	}
 }

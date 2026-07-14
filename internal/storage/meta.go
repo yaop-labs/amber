@@ -51,6 +51,11 @@ type SegmentMeta struct {
 	// Nil means the value must be inferred for legacy metadata.
 	LocalPresent *bool `json:"local_present,omitempty"`
 
+	// LocalDeletePending makes local-tier eviction crash-retryable. The remote
+	// copy is authoritative while this flag is set; startup/retention retries
+	// local file removal and only then records LocalPresent=false.
+	LocalDeletePending bool `json:"local_delete_pending,omitempty"`
+
 	// DeletePending marks a sealed segment selected for terminal deletion.
 	DeletePending bool `json:"delete_pending,omitempty"`
 }
@@ -112,12 +117,31 @@ func migrateLocalPresent(dir string, m *StoreMeta) {
 }
 
 func saveMeta(dir string, m *StoreMeta) error {
+	return saveMetaWithFault(dir, m, nil)
+}
+
+type metaFaultFunc func(stage string) error
+
+func saveMetaWithFault(dir string, m *StoreMeta, fault metaFaultFunc) error {
+	inject := func(stage string) error {
+		if fault == nil {
+			return nil
+		}
+		if err := fault(stage); err != nil {
+			return fmt.Errorf("meta: injected at %s: %w", stage, err)
+		}
+		return nil
+	}
+
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("meta: marshal: %w", err)
 	}
 
 	tmp := filepath.Join(dir, metaFileName+".tmp")
+	if err := inject("before_tmp_open"); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600) //nolint:gosec
 	if err != nil {
 		return fmt.Errorf("meta: open tmp: %w", err)
@@ -126,23 +150,48 @@ func saveMeta(dir string, m *StoreMeta) error {
 		_ = f.Close()
 		return fmt.Errorf("meta: write tmp: %w", err)
 	}
+	if err := inject("after_tmp_write"); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("meta: sync tmp: %w", err)
 	}
+	if err := inject("after_tmp_sync"); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("meta: close tmp: %w", err)
+	}
+	if err := inject("before_rename"); err != nil {
+		return err
 	}
 
 	dst := filepath.Join(dir, metaFileName)
 	if err := os.Rename(tmp, dst); err != nil { //nolint:gosec
 		return fmt.Errorf("meta: rename: %w", err)
 	}
+	if err := inject("after_rename"); err != nil {
+		return err
+	}
 
 	// Sync the directory so the rename is durable.
-	if d, err := os.Open(dir); err == nil { //nolint:gosec
-		_ = d.Sync()
+	d, err := os.Open(dir) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("meta: open dir for sync: %w", err)
+	}
+	if err := inject("before_dir_sync"); err != nil {
 		_ = d.Close()
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("meta: sync dir: %w", err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("meta: close dir: %w", err)
 	}
 
 	return nil

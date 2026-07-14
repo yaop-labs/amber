@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -28,9 +29,12 @@ type S3StoreConfig struct {
 
 // S3Store stores sealed segments in S3 and caches reads locally.
 type S3Store struct {
-	client   *s3.Client
-	cfg      S3StoreConfig
-	localDir string
+	client    *s3.Client
+	cfg       S3StoreConfig
+	localDir  string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
 // NewS3Store creates an S3Store.
@@ -66,10 +70,13 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 
 	client := s3.NewFromConfig(awsCfg, s3Opts...)
 
+	storeCtx, cancel := context.WithCancel(ctx)
 	return &S3Store{
 		client:   client,
 		cfg:      cfg,
 		localDir: cfg.LocalDir,
+		ctx:      storeCtx,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -82,7 +89,23 @@ func (s *S3Store) key(name string) string {
 }
 
 func (s *S3Store) operationContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), s.cfg.OperationTimeout)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, s.cfg.OperationTimeout)
+}
+
+// Close cancels every in-flight and future remote operation. It is idempotent
+// and lets runtime Close bound uploader shutdown instead of waiting for the
+// per-operation timeout.
+func (s *S3Store) Close() error {
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
+	return nil
 }
 
 // Put uploads name to S3.

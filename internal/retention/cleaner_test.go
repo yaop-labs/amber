@@ -14,8 +14,9 @@ import (
 )
 
 type failingDeleteStore struct {
-	base storage.SegmentStore
-	fail bool
+	base      storage.SegmentStore
+	fail      bool
+	failLocal bool
 }
 
 func (s *failingDeleteStore) Put(name string, r io.Reader) error { return s.base.Put(name, r) }
@@ -28,8 +29,13 @@ func (s *failingDeleteStore) Delete(name string) error {
 	}
 	return s.base.Delete(name)
 }
-func (s *failingDeleteStore) DeleteLocal(name string) error { return s.base.DeleteLocal(name) }
-func (s *failingDeleteStore) List() ([]string, error)       { return s.base.List() }
+func (s *failingDeleteStore) DeleteLocal(name string) error {
+	if s.failLocal {
+		return errors.New("local delete failed")
+	}
+	return s.base.DeleteLocal(name)
+}
+func (s *failingDeleteStore) List() ([]string, error) { return s.base.List() }
 
 func setupTestCleaner(t *testing.T, policy Policy, numSegments int) (*Cleaner, *storage.SegmentManager, string) {
 	t.Helper()
@@ -115,9 +121,14 @@ func TestCleaner_DeletePendingRetriesAfterFileDeleteFailure(t *testing.T) {
 	seg := manager.Segments()[0]
 	store := &failingDeleteStore{base: storage.NewLocalStore(dir), fail: true}
 	manager.SetStore(store)
+	invalidations := 0
+	cleaner.SetOnDelete(func(storage.SegmentMeta) { invalidations++ })
 
 	if err := cleaner.deleteSegment(seg); err == nil {
 		t.Fatal("deleteSegment returned nil, want delete failure")
+	}
+	if invalidations != 1 {
+		t.Fatalf("cache invalidations after logical delete = %d, want 1", invalidations)
 	}
 	if got := manager.Segments(); len(got) != 0 {
 		t.Fatalf("queryable segments after pending delete = %d, want 0", len(got))
@@ -137,6 +148,50 @@ func TestCleaner_DeletePendingRetriesAfterFileDeleteFailure(t *testing.T) {
 	}
 	if got := manager.SegmentsForRetention(); len(got) != 0 {
 		t.Fatalf("segments after retry = %d, want 0", len(got))
+	}
+}
+
+func TestCleaner_LocalEvictionRetriesPendingFileDelete(t *testing.T) {
+	cleaner, manager, dir := setupTestCleaner(t, Policy{LocalMaxAge: time.Hour}, 1)
+	defer manager.Close()
+
+	seg := manager.Segments()[0]
+	if err := manager.MarkUploaded(seg.ID); err != nil {
+		t.Fatalf("MarkUploaded: %v", err)
+	}
+	store := &failingDeleteStore{base: storage.NewLocalStore(dir), failLocal: true}
+	manager.SetStore(store)
+	invalidations := 0
+	cleaner.SetOnLocalEvict(func(storage.SegmentMeta) { invalidations++ })
+
+	if n, err := cleaner.Run(); err != nil || n != 0 {
+		t.Fatalf("failed eviction Run = (%d, %v), want (0, nil)", n, err)
+	}
+	pending := manager.SegmentsForRetention()
+	if len(pending) != 1 || !pending[0].LocalDeletePending || !pending[0].HasLocalCopy() {
+		t.Fatalf("metadata after failed local delete = %+v, want pending+present", pending)
+	}
+	if _, err := os.Stat(filepath.Join(dir, seg.FileName)); err != nil {
+		t.Fatalf("local file should remain after injected failure: %v", err)
+	}
+
+	store.failLocal = false
+	if n, err := cleaner.Run(); err != nil || n != 1 {
+		t.Fatalf("retry Run = (%d, %v), want (1, nil)", n, err)
+	}
+	completed := manager.SegmentsForRetention()
+	if len(completed) != 1 || completed[0].LocalDeletePending || completed[0].HasLocalCopy() {
+		t.Fatalf("metadata after retry = %+v, want complete+absent", completed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, seg.FileName)); !os.IsNotExist(err) {
+		t.Fatalf("local file still exists after retry: %v", err)
+	}
+	if invalidations != 1 {
+		t.Fatalf("local cache invalidations = %d, want 1", invalidations)
+	}
+
+	if n, err := cleaner.Run(); err != nil || n != 0 {
+		t.Fatalf("idempotent Run = (%d, %v), want (0, nil)", n, err)
 	}
 }
 

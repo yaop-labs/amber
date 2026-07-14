@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -21,15 +22,17 @@ type item struct {
 	log  *model.LogEntry
 	span *model.SpanEntry
 	// barrier marks a Flush sentinel: the worker flushes the pending batch,
-	// then closes the channel. Never carries data.
-	barrier chan struct{}
+	// then reports the lane's sticky outcome. Never carries data.
+	barrier chan error
 }
 
 // Errors returned by the Send methods when an entry is rejected on the hot path.
 var (
-	ErrQueueFull   = errors.New("ingest queue full")
-	ErrBreakerOpen = errors.New("ingest circuit breaker open")
-	ErrCardinality = errors.New("ingest cardinality limit exceeded")
+	ErrQueueFull      = errors.New("ingest queue full")
+	ErrBreakerOpen    = errors.New("ingest circuit breaker open")
+	ErrCardinality    = errors.New("ingest cardinality limit exceeded")
+	ErrClosed         = errors.New("ingest is closing or closed")
+	ErrRecordTooLarge = storage.ErrRecordTooLarge
 )
 
 // Batcher is the asynchronous ingest path: SendLog/SendSpan enqueue entries
@@ -57,6 +60,17 @@ type Batcher struct {
 	guard            *CardinalityGuard
 	cacheInvalidator CacheInvalidator
 
+	// admitMu makes the open->closing transition atomic with respect to queue
+	// admission. Once beginClose returns, every Send that held the read lock has
+	// either enqueued its item or returned an error, so the following barriers
+	// cover all accepted work.
+	admitMu   sync.RWMutex
+	accepting bool
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
+
 	logM, spanM kindMetrics
 }
 
@@ -66,26 +80,32 @@ type Batcher struct {
 // success paths this fires on every accepted entry. Bind once at NewBatcher
 // time and store pointers.
 type kindMetrics struct {
-	accepted     *selfobs.Counter
-	breakerOpen  *selfobs.Counter
-	queueFull    *selfobs.Counter
-	serializeErr *selfobs.Counter
-	writeFailed  *selfobs.Counter
-	cardAttrs    *selfobs.Counter
-	cardValueLen *selfobs.Counter
-	cardKeys     *selfobs.Counter
+	accepted       *selfobs.Counter
+	durable        *selfobs.Counter
+	breakerOpen    *selfobs.Counter
+	queueFull      *selfobs.Counter
+	serializeErr   *selfobs.Counter
+	writeFailed    *selfobs.Counter
+	cardAttrs      *selfobs.Counter
+	cardValueLen   *selfobs.Counter
+	cardKeys       *selfobs.Counter
+	cardServices   *selfobs.Counter
+	recordTooLarge *selfobs.Counter
 }
 
 func newKindMetrics(kind string) kindMetrics {
 	return kindMetrics{
-		accepted:     selfobs.IngestAccepted.WithLabelValues(kind),
-		breakerOpen:  selfobs.IngestDropped.WithLabelValues(kind, "breaker_open"),
-		queueFull:    selfobs.IngestDropped.WithLabelValues(kind, "queue_full"),
-		serializeErr: selfobs.IngestDropped.WithLabelValues(kind, "serialize_error"),
-		writeFailed:  selfobs.IngestDropped.WithLabelValues(kind, "write_failed"),
-		cardAttrs:    selfobs.IngestDropped.WithLabelValues(kind, "attrs_per_entry"),
-		cardValueLen: selfobs.IngestDropped.WithLabelValues(kind, "attr_value_too_long"),
-		cardKeys:     selfobs.IngestDropped.WithLabelValues(kind, "key_cardinality"),
+		accepted:       selfobs.IngestAccepted.WithLabelValues(kind),
+		durable:        selfobs.IngestDurable.WithLabelValues(kind),
+		breakerOpen:    selfobs.IngestDropped.WithLabelValues(kind, "breaker_open"),
+		queueFull:      selfobs.IngestDropped.WithLabelValues(kind, "queue_full"),
+		serializeErr:   selfobs.IngestDropped.WithLabelValues(kind, "serialize_error"),
+		writeFailed:    selfobs.IngestDropped.WithLabelValues(kind, "write_failed"),
+		cardAttrs:      selfobs.IngestDropped.WithLabelValues(kind, "attrs_per_entry"),
+		cardValueLen:   selfobs.IngestDropped.WithLabelValues(kind, "attr_value_too_long"),
+		cardKeys:       selfobs.IngestDropped.WithLabelValues(kind, "key_cardinality"),
+		cardServices:   selfobs.IngestDropped.WithLabelValues(kind, "service_cardinality"),
+		recordTooLarge: selfobs.IngestDropped.WithLabelValues(kind, "record_too_large"),
 	}
 }
 
@@ -100,6 +120,8 @@ func (m *kindMetrics) dropCardinality(reason string) *selfobs.Counter {
 		return m.cardValueLen
 	case "key_cardinality":
 		return m.cardKeys
+	case "service_cardinality":
+		return m.cardServices
 	}
 	return nil
 }
@@ -165,6 +187,8 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		spanBreaker:      spanCfg.breakerThreshold,
 		guard:            deps.Guard,
 		cacheInvalidator: deps.Invalidator,
+		accepting:        true,
+		closeDone:        make(chan struct{}),
 		logM:             newKindMetrics("log"),
 		spanM:            newKindMetrics("span"),
 	}
@@ -214,12 +238,24 @@ func (b *Batcher) IsSpanBreakerOpen() bool {
 	return b.spanBreaker > 0 && b.spanFailures.Load() >= b.spanBreaker
 }
 
-// Start launches the per-lane worker goroutines; they stop when ctx is
-// cancelled. Wait blocks until they finish.
+// Start launches the per-lane worker goroutines. Parent cancellation is
+// translated into the same graceful Close transition (stop admission,
+// barriers, worker cancellation) rather than cancelling workers directly.
 func (b *Batcher) Start(ctx context.Context) {
+	workerCtx, cancel := context.WithCancel(context.Background())
+	b.cancel = cancel
 	b.wg.Add(2)
-	go b.run(ctx, b.logQueue, b.logBatchSize, b.logBatchTimeout, b.processLogBatch)
-	go b.run(ctx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, b.processSpanBatch)
+	go b.run(workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, b.processLogBatch)
+	go b.run(workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, b.processSpanBatch)
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = b.Close(context.Background())
+			case <-b.closeDone:
+			}
+		}()
+	}
 }
 
 // Wait blocks until the worker goroutines have drained and exited.
@@ -231,53 +267,100 @@ func (b *Batcher) Wait() {
 // ErrCardinality when the entry is rejected; a nil return means queued, not yet
 // durable (the worker writes and fsyncs it).
 func (b *Batcher) SendLog(entry model.LogEntry) error {
+	b.admitMu.RLock()
+	defer b.admitMu.RUnlock()
+	if !b.accepting {
+		return ErrClosed
+	}
 	if b.IsLogBreakerOpen() {
 		b.logM.breakerOpen.Inc()
 		return ErrBreakerOpen
 	}
-	if reason := b.guard.Check(entry.Service, entry.Attrs); reason != "" {
+	encodedSize, err := entry.EncodedSize()
+	if err != nil {
+		return fmt.Errorf("ingest: invalid log record: %w", err)
+	}
+	if err := validateEventRecordSize("log", encodedSize); err != nil {
+		b.logM.recordTooLarge.Inc()
+		return err
+	}
+	reason, admitted := b.guard.Admit(entry.Service, entry.Attrs, func() bool {
+		select {
+		case b.logQueue <- item{log: &entry}:
+			return true
+		default:
+			return false
+		}
+	})
+	if reason != "" {
 		if c := b.logM.dropCardinality(reason); c != nil {
 			c.Inc()
 		}
 		return ErrCardinality
 	}
-	select {
-	case b.logQueue <- item{log: &entry}:
+	if admitted {
+		b.logM.accepted.Inc()
 		return nil
-	default:
-		b.logM.queueFull.Inc()
-		b.log.Warn("ingest queue full, dropping log entry",
-			"entry_id", entry.ID.String(),
-			"service", entry.Service,
-		)
-		return ErrQueueFull
 	}
+	b.logM.queueFull.Inc()
+	b.log.Warn("ingest queue full, dropping log entry",
+		"entry_id", entry.ID.String(),
+		"service", entry.Service,
+	)
+	return ErrQueueFull
 }
 
 // SendSpan enqueues a span, mirroring SendLog's reject errors and async semantics.
 func (b *Batcher) SendSpan(span model.SpanEntry) error {
+	b.admitMu.RLock()
+	defer b.admitMu.RUnlock()
+	if !b.accepting {
+		return ErrClosed
+	}
 	if b.IsSpanBreakerOpen() {
 		b.spanM.breakerOpen.Inc()
 		return ErrBreakerOpen
 	}
-	if reason := b.guard.Check(span.Service, span.Attrs); reason != "" {
+	encodedSize, err := span.EncodedSize()
+	if err != nil {
+		return fmt.Errorf("ingest: invalid span record: %w", err)
+	}
+	if err := validateEventRecordSize("span", encodedSize); err != nil {
+		b.spanM.recordTooLarge.Inc()
+		return err
+	}
+	reason, admitted := b.guard.Admit(span.Service, span.Attrs, func() bool {
+		select {
+		case b.spanQueue <- item{span: &span}:
+			return true
+		default:
+			return false
+		}
+	})
+	if reason != "" {
 		if c := b.spanM.dropCardinality(reason); c != nil {
 			c.Inc()
 		}
 		return ErrCardinality
 	}
-	select {
-	case b.spanQueue <- item{span: &span}:
+	if admitted {
+		b.spanM.accepted.Inc()
 		return nil
-	default:
-		b.spanM.queueFull.Inc()
-		b.log.Warn("ingest queue full, dropping span",
-			"entry_id", span.ID.String(),
-			"service", span.Service,
-			"operation", span.Operation,
-		)
-		return ErrQueueFull
 	}
+	b.spanM.queueFull.Inc()
+	b.log.Warn("ingest queue full, dropping span",
+		"entry_id", span.ID.String(),
+		"service", span.Service,
+		"operation", span.Operation,
+	)
+	return ErrQueueFull
+}
+
+func validateEventRecordSize(kind string, encodedSize uint64) error {
+	if encodedSize > uint64(storage.MaxEventRecordBytes) {
+		return fmt.Errorf("%w: %s encodes to %d bytes, max %d", ErrRecordTooLarge, kind, encodedSize, storage.MaxEventRecordBytes)
+	}
+	return nil
 }
 
 // QueueLen returns the combined depth of the log and span queues.
@@ -300,10 +383,11 @@ var bufPool = sync.Pool{
 	New: func() any { return &bytes.Buffer{} },
 }
 
-func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, batchTimeout time.Duration, process func(context.Context, []item)) {
+func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, batchTimeout time.Duration, process func(context.Context, []item) error) {
 	defer b.wg.Done()
 
 	batch := make([]item, 0, batchSize)
+	var stickyErr error
 	ticker := time.NewTicker(batchTimeout)
 	defer ticker.Stop()
 
@@ -311,7 +395,9 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 		if len(batch) == 0 {
 			return
 		}
-		process(ctx, batch)
+		if err := process(ctx, batch); err != nil {
+			stickyErr = errors.Join(stickyErr, err)
+		}
 		batch = batch[:0]
 	}
 
@@ -323,7 +409,7 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 				case it := <-queue:
 					if it.barrier != nil {
 						flush()
-						close(it.barrier)
+						it.barrier <- stickyErr
 						continue
 					}
 					batch = append(batch, it)
@@ -339,7 +425,7 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 		case it := <-queue:
 			if it.barrier != nil {
 				flush()
-				close(it.barrier)
+				it.barrier <- stickyErr
 				continue
 			}
 			batch = append(batch, it)
@@ -355,14 +441,49 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 }
 
 // Flush blocks until both lanes have processed everything enqueued before the
-// call: queued entries are handed to storage (WAL write + sync) or counted as
-// dropped. Write failures don't fail Flush - they surface through the
-// circuit breaker and ingest metrics.
+// call. It returns any serialization or storage error observed by either lane
+// before its barrier; nil means all covered entries reached their storage
+// manager successfully.
 func (b *Batcher) Flush(ctx context.Context) error {
+	b.admitMu.RLock()
+	defer b.admitMu.RUnlock()
+	if !b.accepting {
+		return ErrClosed
+	}
+	return b.flush(ctx)
+}
+
+// FlushLogs and FlushSpans are per-signal durability barriers used by OTLP
+// Export: success means every record admitted by that request's lane is durable
+// and queryable.
+func (b *Batcher) FlushLogs(ctx context.Context) error  { return b.flushOne(ctx, b.logQueue) }
+func (b *Batcher) FlushSpans(ctx context.Context) error { return b.flushOne(ctx, b.spanQueue) }
+
+func (b *Batcher) flushOne(ctx context.Context, queue chan item) error {
+	b.admitMu.RLock()
+	defer b.admitMu.RUnlock()
+	if !b.accepting {
+		return ErrClosed
+	}
+	done := make(chan error, 1)
+	select {
+	case queue <- item{barrier: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *Batcher) flush(ctx context.Context) error {
 	lanes := [2]chan item{b.logQueue, b.spanQueue}
-	var dones [2]chan struct{}
+	var dones [2]chan error
 	for i, queue := range lanes {
-		done := make(chan struct{})
+		done := make(chan error, 1)
 		select {
 		case queue <- item{barrier: done}:
 			dones[i] = done
@@ -370,57 +491,90 @@ func (b *Batcher) Flush(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	var errs []error
 	for _, done := range dones {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				errs = append(errs, err)
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-func (b *Batcher) processBatch(_ context.Context, batch []item) {
+// Close atomically stops admission, waits for both lane barriers, then stops
+// the workers. The shutdown itself continues if a caller's context expires;
+// subsequent Close calls observe the same terminal result.
+func (b *Batcher) Close(ctx context.Context) error {
+	b.closeOnce.Do(func() {
+		go func() {
+			b.admitMu.Lock()
+			b.accepting = false
+			b.admitMu.Unlock()
+
+			b.closeErr = b.flush(context.Background())
+			if b.cancel != nil {
+				b.cancel()
+			}
+			b.Wait()
+			close(b.closeDone)
+		}()
+	})
+
+	select {
+	case <-b.closeDone:
+		return b.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *Batcher) processBatch(_ context.Context, batch []item) error {
 	if len(batch) == 0 {
-		return
+		return nil
 	}
 
-	logItems, logEntries := b.prepareLogBatch(batch)
+	logItems, logEntries, logErr := b.prepareLogBatch(batch)
 	if len(logItems) > 0 {
-		b.writeLogBatch(logItems, logEntries)
+		logErr = errors.Join(logErr, b.writeLogBatch(logItems, logEntries))
 	}
 
-	spanItems, spanEntries := b.prepareSpanBatch(batch)
+	spanItems, spanEntries, spanErr := b.prepareSpanBatch(batch)
 	if len(spanItems) > 0 {
-		b.writeSpanBatch(spanItems, spanEntries)
+		spanErr = errors.Join(spanErr, b.writeSpanBatch(spanItems, spanEntries))
 	}
+	return errors.Join(logErr, spanErr)
 }
 
-func (b *Batcher) processLogBatch(_ context.Context, batch []item) {
+func (b *Batcher) processLogBatch(_ context.Context, batch []item) error {
 	if len(batch) == 0 {
-		return
+		return nil
 	}
-	logItems, logEntries := b.prepareLogBatch(batch)
+	logItems, logEntries, err := b.prepareLogBatch(batch)
 	if len(logItems) == 0 {
-		return
+		return err
 	}
-	b.writeLogBatch(logItems, logEntries)
+	return errors.Join(err, b.writeLogBatch(logItems, logEntries))
 }
 
-func (b *Batcher) processSpanBatch(_ context.Context, batch []item) {
+func (b *Batcher) processSpanBatch(_ context.Context, batch []item) error {
 	if len(batch) == 0 {
-		return
+		return nil
 	}
-	spanItems, spanEntries := b.prepareSpanBatch(batch)
+	spanItems, spanEntries, err := b.prepareSpanBatch(batch)
 	if len(spanItems) == 0 {
-		return
+		return err
 	}
-	b.writeSpanBatch(spanItems, spanEntries)
+	return errors.Join(err, b.writeSpanBatch(spanItems, spanEntries))
 }
 
-func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.LogEntry) {
+func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.LogEntry, error) {
 	logItems := make([]storage.BatchItem, 0, len(batch))
 	var logEntries []*model.LogEntry
+	var errs []error
 	for _, it := range batch {
 		if it.log == nil {
 			continue
@@ -432,6 +586,7 @@ func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.L
 			b.logM.serializeErr.Inc()
 			b.log.Error("serialize log entry", "err", writeErr)
 			bufPool.Put(buf)
+			errs = append(errs, fmt.Errorf("serialize log: %w", writeErr))
 			continue
 		}
 		data := make([]byte, buf.Len())
@@ -446,12 +601,13 @@ func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.L
 			logEntries = append(logEntries, it.log)
 		}
 	}
-	return logItems, logEntries
+	return logItems, logEntries, errors.Join(errs...)
 }
 
-func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.SpanEntry) {
+func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.SpanEntry, error) {
 	spanItems := make([]storage.BatchItem, 0, len(batch))
 	var spanEntries []*model.SpanEntry
+	var errs []error
 	for _, it := range batch {
 		if it.span == nil {
 			continue
@@ -463,6 +619,7 @@ func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.
 			b.spanM.serializeErr.Inc()
 			b.log.Error("serialize span entry", "err", writeErr)
 			bufPool.Put(buf)
+			errs = append(errs, fmt.Errorf("serialize span: %w", writeErr))
 			continue
 		}
 		data := make([]byte, buf.Len())
@@ -477,24 +634,24 @@ func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.
 			spanEntries = append(spanEntries, it.span)
 		}
 	}
-	return spanItems, spanEntries
+	return spanItems, spanEntries, errors.Join(errs...)
 }
 
-func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry) {
+func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry) error {
 	targetMeta, hasTarget := b.logManager.ActiveSegmentMeta()
 	if err := b.logManager.WriteBatch(logItems); err != nil {
 		b.logM.writeFailed.Add(uint64(len(logItems)))
 		b.log.Error("log batch write failed", "err", err, "count", len(logItems))
 		b.recordLogFailure()
-		return
+		return err
 	}
 	if err := b.logManager.Flush(); err != nil {
 		b.logM.writeFailed.Add(uint64(len(logItems)))
 		b.log.Error("log segment flush failed", "err", err, "count", len(logItems))
 		b.recordLogFailure()
-		return
+		return err
 	}
-	b.logM.accepted.Add(uint64(len(logItems)))
+	b.logM.durable.Add(uint64(len(logItems)))
 	if hasTarget {
 		updateSparseFromBatchMeta(b.logSparse, targetMeta, logItems)
 	}
@@ -503,26 +660,27 @@ func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*mode
 	}
 	if b.cacheInvalidator != nil && len(logItems) > 0 {
 		from, to := batchTimeRange(logItems)
-		b.cacheInvalidator.InvalidateResultRange(from, to)
+		b.cacheInvalidator.InvalidateLogResultRange(from, to)
 	}
 	b.resetLogFailures()
+	return nil
 }
 
-func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry) {
+func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry) error {
 	targetMeta, hasTarget := b.spanManager.ActiveSegmentMeta()
 	if err := b.spanManager.WriteBatch(spanItems); err != nil {
 		b.spanM.writeFailed.Add(uint64(len(spanItems)))
 		b.log.Error("span batch write failed", "err", err, "count", len(spanItems))
 		b.recordSpanFailure()
-		return
+		return err
 	}
 	if err := b.spanManager.Flush(); err != nil {
 		b.spanM.writeFailed.Add(uint64(len(spanItems)))
 		b.log.Error("span segment flush failed", "err", err, "count", len(spanItems))
 		b.recordSpanFailure()
-		return
+		return err
 	}
-	b.spanM.accepted.Add(uint64(len(spanItems)))
+	b.spanM.durable.Add(uint64(len(spanItems)))
 	if hasTarget {
 		updateSparseFromBatchMeta(b.spanSparse, targetMeta, spanItems)
 	}
@@ -531,9 +689,10 @@ func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*m
 	}
 	if b.cacheInvalidator != nil && len(spanItems) > 0 {
 		from, to := batchTimeRange(spanItems)
-		b.cacheInvalidator.InvalidateResultRange(from, to)
+		b.cacheInvalidator.InvalidateSpanResultRange(from, to)
 	}
 	b.resetSpanFailures()
+	return nil
 }
 
 // batchTimeRange returns the min/max event timestamps of a written batch.

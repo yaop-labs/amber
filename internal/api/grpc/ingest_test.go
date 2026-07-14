@@ -13,7 +13,10 @@ import (
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
 )
 
@@ -22,13 +25,50 @@ type fakeSender struct {
 	spanErr       error
 	logBreakerOn  bool
 	spanBreakerOn bool
+	flushLogErr   error
+	flushSpanErr  error
 }
 
-func (f fakeSender) SendLog(model.LogEntry) error   { return f.logErr }
-func (f fakeSender) SendSpan(model.SpanEntry) error { return f.spanErr }
-func (f fakeSender) IsBreakerOpen() bool            { return f.logBreakerOn || f.spanBreakerOn }
-func (f fakeSender) IsLogBreakerOpen() bool         { return f.logBreakerOn }
-func (f fakeSender) IsSpanBreakerOpen() bool        { return f.spanBreakerOn }
+func (f fakeSender) SendLog(model.LogEntry) error     { return f.logErr }
+func (f fakeSender) SendSpan(model.SpanEntry) error   { return f.spanErr }
+func (f fakeSender) IsBreakerOpen() bool              { return f.logBreakerOn || f.spanBreakerOn }
+func (f fakeSender) IsLogBreakerOpen() bool           { return f.logBreakerOn }
+func (f fakeSender) IsSpanBreakerOpen() bool          { return f.spanBreakerOn }
+func (f fakeSender) FlushLogs(context.Context) error  { return f.flushLogErr }
+func (f fakeSender) FlushSpans(context.Context) error { return f.flushSpanErr }
+
+func TestLogsExportReturnsUnavailableOnRetryableRejection(t *testing.T) {
+	s := &logsServer{
+		batcher: fakeSender{logErr: ingest.ErrQueueFull},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	req := &collectorlogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "x"}}}}}},
+	}}}
+	if _, err := s.Export(context.Background(), req); status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (err %v)", status.Code(err), err)
+	}
+}
+
+func TestLogsExportReturnsUnavailableWhenDurabilityBarrierFails(t *testing.T) {
+	s := &logsServer{
+		batcher: fakeSender{flushLogErr: errors.New("fsync failed")},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if _, err := s.Export(context.Background(), &collectorlogs.ExportLogsServiceRequest{}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (err %v)", status.Code(err), err)
+	}
+}
+
+func TestLogsExportPreservesContextDeadline(t *testing.T) {
+	s := &logsServer{
+		batcher: fakeSender{flushLogErr: context.DeadlineExceeded},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if _, err := s.Export(context.Background(), &collectorlogs.ExportLogsServiceRequest{}); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("code = %v, want DeadlineExceeded (err %v)", status.Code(err), err)
+	}
+}
 
 func TestLogsExportReturnsPartialSuccessOnRejectedRecords(t *testing.T) {
 	s := &logsServer{

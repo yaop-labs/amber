@@ -53,7 +53,8 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, item := range req {
 		level, err := model.LevelFromString(item.Level)
 		if err != nil {
-			level = model.LevelInfo
+			rejected++
+			continue
 		}
 
 		attrs := make([]model.Attr, 0, len(item.Attrs))
@@ -70,15 +71,19 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if item.TraceID != "" {
 			b, err := hex.DecodeString(item.TraceID)
-			if err == nil && len(b) == 16 {
-				copy(entry.TraceID[:], b)
+			if err != nil || len(b) != 16 {
+				rejected++
+				continue
 			}
+			copy(entry.TraceID[:], b)
 		}
 		if item.SpanID != "" {
 			b, err := hex.DecodeString(item.SpanID)
-			if err == nil && len(b) == 8 {
-				copy(entry.SpanID[:], b)
+			if err != nil || len(b) != 8 {
+				rejected++
+				continue
 			}
+			copy(entry.SpanID[:], b)
 		}
 
 		if err := h.batcher.SendLog(entry); err != nil {

@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -208,6 +211,68 @@ func TestReconcile_IdempotentOnRerun(t *testing.T) {
 	}
 	if n2 != 0 {
 		t.Errorf("second reconcile should adopt nothing: got %d", n2)
+	}
+}
+
+func TestReconcile_AdoptedSegmentIsVisibleToRealQuery(t *testing.T) {
+	srcDir := t.TempDir()
+	smA, err := storage.OpenSegmentManager(srcDir, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Unix(1_700_000_000, 321)
+	entry := model.LogEntry{
+		ID:        model.MustNewEntryID(),
+		Timestamp: ts,
+		Level:     model.LevelError,
+		Service:   "remote-service",
+		Body:      "query me after adoption",
+	}
+	var encoded bytes.Buffer
+	if _, err := entry.WriteTo(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := smA.Write(encoded.Bytes(), ts.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if err := smA.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	remoteMeta := smA.Segments()[0]
+	if err := smA.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dstDir := t.TempDir()
+	store := newMemStore(dstDir)
+	uploadSegmentToMemStore(t, srcDir, remoteMeta.FileName, store)
+	smB, err := storage.OpenSegmentManager(dstDir, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer smB.Close()
+	if n, err := ReconcileFromRemote(context.Background(), smB, store, dstDir, quietLogger()); err != nil || n != 1 {
+		t.Fatalf("ReconcileFromRemote = %d, %v; want 1, nil", n, err)
+	}
+	active, ok := smB.ActiveSegmentMeta()
+	if !ok || active.ID == remoteMeta.ID {
+		t.Fatalf("reconcile left no independent active writer: active=%+v ok=%v", active, ok)
+	}
+
+	sparse := BuildSparseIndex(smB)
+	exec := query.NewExecutor(smB, smB, sparse, index.NewSparseIndex())
+	defer exec.Close()
+	result, err := exec.ExecLog(context.Background(), &query.LogQuery{
+		From:     ts.Add(-time.Second),
+		To:       ts.Add(time.Second),
+		Services: []string{"remote-service"},
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].ID != entry.ID {
+		t.Fatalf("adopted query entries = %+v, want ID %s", result.Entries, entry.ID)
 	}
 }
 

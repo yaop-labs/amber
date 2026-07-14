@@ -21,10 +21,8 @@ type ActiveIndexer interface {
 
 // CacheInvalidator drops cached query results affected by newly written entries.
 type CacheInvalidator interface {
-	// InvalidateResultRange drops cached query results whose window overlaps
-	// the written batch's event-time range (unixnano), so steady ingest only
-	// evicts results the new records can actually change.
-	InvalidateResultRange(from, to int64)
+	InvalidateLogResultRange(from, to int64)
+	InvalidateSpanResultRange(from, to int64)
 }
 
 // Handler is a synchronous ingest path: each IngestLog/IngestSpan writes one

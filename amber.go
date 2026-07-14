@@ -39,11 +39,26 @@ type (
 	SpanResult = query.SpanResult
 )
 
+type Status struct {
+	Ready                bool
+	Degraded             bool
+	Closing              bool
+	WALRepairEvents      uint64
+	IndexBootstrapErrors uint64
+	Reasons              []StatusReason
+}
+
+type StatusReason struct {
+	Code  string
+	Count uint64
+}
+
 // CardinalityLimits caps per-record attribute cardinality at ingest time.
 type CardinalityLimits struct {
 	MaxAttrsPerEntry      int
 	MaxAttrValueBytes     int
 	MaxAttrKeysPerService int
+	MaxServices           int
 }
 
 // S3Storage configures S3-compatible storage for sealed segments.
@@ -74,21 +89,45 @@ type Metrics struct {
 	CompactionMinBlocks int
 }
 
+// Retention configures database-owned retention for logs and spans. Local
+// limits require S3 and evict only the local cache; global limits remove the
+// segment from both local and remote storage.
+type Retention struct {
+	Logs     StreamRetention
+	Spans    StreamRetention
+	Interval time.Duration
+}
+
+// StreamRetention is the retention policy for one signal stream.
+type StreamRetention struct {
+	LocalMaxAge   time.Duration
+	LocalMaxBytes int64
+	MaxAge        time.Duration
+	MaxBytes      int64
+	MaxSegments   int
+}
+
 // Options configures Open.
 type Options struct {
 	SegmentMaxRecords uint64
-	SegmentMaxBytes   int64
-	BatchSize         int
-	BatchTimeout      time.Duration
-	QueueSize         int
-	BreakerThreshold  int
-	LogIngest         IngestLane
-	SpanIngest        IngestLane
-	IndexCacheSize    int
-	Cardinality       CardinalityLimits
-	S3                S3Storage
-	Metrics           Metrics
-	Logger            *slog.Logger
+	// SegmentMaxBytes counts uncompressed serialized payload and may be
+	// exceeded by one batch; it is not a physical file-size cap.
+	SegmentMaxBytes  int64
+	BatchSize        int
+	BatchTimeout     time.Duration
+	QueueSize        int
+	BreakerThreshold int
+	LogIngest        IngestLane
+	SpanIngest       IngestLane
+	IndexCacheSize   int
+	// IndexBootstrapWorkers bounds concurrent startup sidecar builds.
+	// Zero uses the conservative default of one.
+	IndexBootstrapWorkers int
+	Cardinality           CardinalityLimits
+	S3                    S3Storage
+	Metrics               Metrics
+	Retention             Retention
+	Logger                *slog.Logger
 
 	// MemoryLimit sets the Go runtime soft memory limit in bytes via
 	// debug.SetMemoryLimit. The limit is process-wide: it affects the host
@@ -124,10 +163,11 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	stack, err := runtime.New(ctx, runtime.Options{
-		DataDir:        dataDir,
-		Logger:         o.Logger,
-		IndexCacheSize: o.IndexCacheSize,
-		MemoryLimit:    o.MemoryLimit,
+		DataDir:               dataDir,
+		Logger:                o.Logger,
+		IndexCacheSize:        o.IndexCacheSize,
+		IndexBootstrapWorkers: o.IndexBootstrapWorkers,
+		MemoryLimit:           o.MemoryLimit,
 		Storage: runtime.StorageOptions{
 			SegmentMaxRecords:  o.SegmentMaxRecords,
 			SegmentMaxBytes:    o.SegmentMaxBytes,
@@ -159,6 +199,7 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 			MaxAttrsPerEntry:      o.Cardinality.MaxAttrsPerEntry,
 			MaxAttrValueBytes:     o.Cardinality.MaxAttrValueBytes,
 			MaxAttrKeysPerService: o.Cardinality.MaxAttrKeysPerService,
+			MaxServices:           o.Cardinality.MaxServices,
 		},
 		Metrics: runtime.MetricsOptions{
 			Disabled:            o.Metrics.Disabled,
@@ -169,6 +210,17 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 			MaxLabelsPerSeries:  o.Metrics.MaxLabelsPerSeries,
 			Retention:           o.Metrics.Retention,
 			CompactionMinBlocks: o.Metrics.CompactionMinBlocks,
+		},
+		Retention: runtime.RetentionOptions{
+			Interval: o.Retention.Interval,
+			Logs: runtime.StreamRetentionOptions{
+				LocalMaxAge: o.Retention.Logs.LocalMaxAge, LocalMaxBytes: o.Retention.Logs.LocalMaxBytes,
+				MaxAge: o.Retention.Logs.MaxAge, MaxTotalBytes: o.Retention.Logs.MaxBytes, MaxSegments: o.Retention.Logs.MaxSegments,
+			},
+			Spans: runtime.StreamRetentionOptions{
+				LocalMaxAge: o.Retention.Spans.LocalMaxAge, LocalMaxBytes: o.Retention.Spans.LocalMaxBytes,
+				MaxAge: o.Retention.Spans.MaxAge, MaxTotalBytes: o.Retention.Spans.MaxBytes, MaxSegments: o.Retention.Spans.MaxSegments,
+			},
 		},
 	})
 	if err != nil {
@@ -204,10 +256,9 @@ func (db *DB) Span(ctx context.Context, span SpanEntry) error {
 }
 
 // Flush blocks until every Log/Span call that returned before Flush started
-// has been written to the WAL and synced (or counted as dropped - write
-// failures surface via the ingest circuit breaker and metrics, not via
-// Flush's error). Use it as a durability barrier before process exit or
-// after writes the application cannot afford to lose.
+// has become durable and queryable. Covered serialization, WAL, segment, or
+// sync failures are returned to the caller. Use it as a durability barrier
+// before process exit or after writes the application cannot afford to lose.
 func (db *DB) Flush(ctx context.Context) error {
 	return db.stack.Batcher.Flush(ctx)
 }
@@ -248,6 +299,20 @@ func (db *DB) MetricStore() *metricsengine.Store { return db.stack.MetricStore }
 // IsReady reports whether bootstrap has finished loading sealed indexes.
 func (db *DB) IsReady() bool { return db.stack.IsReady() }
 
+// Status returns structured readiness and degraded-state details.
+func (db *DB) Status() Status {
+	s := db.stack.Status()
+	out := Status{
+		Ready: s.Ready, Degraded: s.Degraded, Closing: s.Closing,
+		WALRepairEvents: s.WALRepairEvents, IndexBootstrapErrors: s.IndexBootstrapErrors,
+		Reasons: make([]StatusReason, len(s.Reasons)),
+	}
+	for i, reason := range s.Reasons {
+		out.Reasons[i] = StatusReason{Code: reason.Code, Count: reason.Count}
+	}
+	return out
+}
+
 const shutdownTimeout = 30 * time.Second
 
 // Close shuts the database down cleanly: it drains the ingest queue, flushes,
@@ -266,7 +331,9 @@ var (
 
 // Ingest errors returned by Log and Span, for errors.Is.
 var (
-	ErrQueueFull   = ingest.ErrQueueFull
-	ErrBreakerOpen = ingest.ErrBreakerOpen
-	ErrCardinality = ingest.ErrCardinality
+	ErrQueueFull      = ingest.ErrQueueFull
+	ErrBreakerOpen    = ingest.ErrBreakerOpen
+	ErrCardinality    = ingest.ErrCardinality
+	ErrClosed         = ingest.ErrClosed
+	ErrRecordTooLarge = ingest.ErrRecordTooLarge
 )
