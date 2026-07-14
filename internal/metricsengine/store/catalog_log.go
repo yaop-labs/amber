@@ -164,17 +164,21 @@ func (c *catalogLog) sync() error {
 
 // Close drains the committer and closes the live log.
 func (c *catalogLog) Close() error {
+	var commitErr error
 	if c.committer != nil {
-		c.committer.flushAndStop()
+		commitErr = c.committer.flushAndStop()
 		c.committer = nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.f == nil {
-		return nil
+		return commitErr
 	}
 	err := c.f.Close()
 	c.f = nil
+	if commitErr != nil {
+		return commitErr
+	}
 	return err
 }
 

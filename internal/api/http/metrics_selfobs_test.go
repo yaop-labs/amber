@@ -39,6 +39,8 @@ func TestMetricsSelfobs_IngestCountersIncrement(t *testing.T) {
 					{
 						Name: "selfobs_test_counter_total",
 						Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+							IsMonotonic:            true,
 							DataPoints: []*metricspb.NumberDataPoint{
 								{TimeUnixNano: uint64(time.Now().UnixNano()), Value: &metricspb.NumberDataPoint_AsInt{AsInt: 7}},
 							},
@@ -47,6 +49,7 @@ func TestMetricsSelfobs_IngestCountersIncrement(t *testing.T) {
 					{
 						Name: "selfobs_test_hist_seconds",
 						Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 							DataPoints: []*metricspb.HistogramDataPoint{
 								{TimeUnixNano: uint64(time.Now().UnixNano()), Count: 3},
 							},

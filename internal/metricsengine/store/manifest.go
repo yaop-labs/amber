@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
+	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 )
 
 const manifestFileName = "manifest.json"
@@ -122,7 +123,13 @@ func rebuildManifest(dir string) (Manifest, error) {
 	paths = append(paths, blockPaths...)
 	paths = append(paths, compactPaths...)
 	sort.Strings(paths)
-	manifest := Manifest{Version: 1, Blocks: make([]BlockMeta, 0, len(paths))}
+	histPaths, err := filepath.Glob(filepath.Join(dir, "hist-*.mhb"))
+	if err != nil {
+		return Manifest{}, err
+	}
+	sort.Strings(histPaths)
+
+	manifest := Manifest{Version: 1, Blocks: make([]BlockMeta, 0, len(paths)+len(histPaths))}
 	for _, path := range paths {
 		directory, err := block.ReadDirectory(path)
 		if err != nil {
@@ -136,6 +143,21 @@ func rebuildManifest(dir string) (Manifest, error) {
 			SeriesCount: len(directory.Series),
 			SampleCount: directorySampleCount(directory),
 			LabelValues: labelValues(directory),
+		})
+	}
+	for _, path := range histPaths {
+		directory, err := histogram.ReadDirectory(path)
+		if err != nil {
+			return Manifest{}, err
+		}
+		minTime, maxTime, _ := directory.TimeRange()
+		manifest.Blocks = append(manifest.Blocks, BlockMeta{
+			Path:        filepath.Base(path),
+			Kind:        BlockKindHistogram,
+			MinTime:     minTime,
+			MaxTime:     maxTime,
+			SeriesCount: len(directory.Series),
+			LabelValues: histLabelValues(directory),
 		})
 	}
 	sortManifest(manifest.Blocks)

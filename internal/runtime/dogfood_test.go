@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/selfobs"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 // TestDogfoodScraper_AppendsSelfObs verifies the end-to-end loop: register a
@@ -18,7 +18,7 @@ func TestDogfoodScraper_AppendsSelfObs(t *testing.T) {
 	selfobs.RegisterCounterVec(cv)
 	cv.WithLabelValues("hit").Add(5)
 
-	store, err := mestore.Open(t.TempDir())
+	store, err := metricsengine.OpenStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

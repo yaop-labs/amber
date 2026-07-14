@@ -169,6 +169,69 @@ func TestOTLPMetrics_CounterRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOTLPMetrics_UnsupportedSumTemporalityNotStored(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := uint64(time.Now().UnixNano())
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{
+					{
+						Name: "delta_requests_total",
+						Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+							IsMonotonic:            true,
+							DataPoints: []*metricspb.NumberDataPoint{
+								{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsInt{AsInt: 3}},
+								{TimeUnixNano: now + 1, Value: &metricspb.NumberDataPoint_AsInt{AsInt: 4}},
+							},
+						}},
+					},
+					{
+						Name: "queue_depth",
+						Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+							IsMonotonic:            false,
+							DataPoints: []*metricspb.NumberDataPoint{
+								{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsInt{AsInt: 7}},
+							},
+						}},
+					},
+				},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec := h.post(t, "/v1/metrics", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Accepted    int `json:"accepted"`
+		Rejected    int `json:"rejected"`
+		Unsupported int `json:"unsupported"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Accepted != 0 || resp.Rejected != 0 || resp.Unsupported != 3 {
+		t.Fatalf("accepted/rejected/unsupported = %d/%d/%d, want 0/0/3",
+			resp.Accepted, resp.Rejected, resp.Unsupported)
+	}
+	stats, err := h.metricStore.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.BufferedSamples != 0 || stats.Samples != 0 {
+		t.Fatalf("stored samples = buffered:%d sealed:%d, want 0/0", stats.BufferedSamples, stats.Samples)
+	}
+}
+
 func TestOTLPMetrics_NonStringAttributesPreserveSeriesIdentity(t *testing.T) {
 	h := setupMetricsHarness(t)
 
@@ -241,6 +304,7 @@ func TestOTLPMetrics_ExplicitHistogramAccepted(t *testing.T) {
 				Metrics: []*metricspb.Metric{{
 					Name: "http_request_duration_seconds",
 					Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 						DataPoints: []*metricspb.HistogramDataPoint{{
 							TimeUnixNano:   uint64(time.Now().UnixNano()),
 							Count:          10,
@@ -276,6 +340,74 @@ func TestOTLPMetrics_ExplicitHistogramAccepted(t *testing.T) {
 	}
 }
 
+func TestOTLPMetrics_UnsupportedHistogramTemporalityNotStored(t *testing.T) {
+	h := setupMetricsHarness(t)
+
+	now := uint64(time.Now().UnixNano())
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{
+					{
+						Name: "delta_duration_seconds",
+						Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+							DataPoints: []*metricspb.HistogramDataPoint{{
+								TimeUnixNano:   now,
+								Count:          2,
+								BucketCounts:   []uint64{1, 1},
+								ExplicitBounds: []float64{0.5},
+							}},
+						}},
+					},
+					{
+						Name: "delta_rpc_seconds",
+						Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+							AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+							DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+								TimeUnixNano: now + 1,
+								Count:        2,
+								Scale:        1,
+								Positive: &metricspb.ExponentialHistogramDataPoint_Buckets{
+									BucketCounts: []uint64{2},
+								},
+							}},
+						}},
+					},
+				},
+			}},
+		}},
+	}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec := h.post(t, "/v1/metrics", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Accepted    int `json:"accepted"`
+		Rejected    int `json:"rejected"`
+		Unsupported int `json:"unsupported"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Accepted != 0 || resp.Rejected != 0 || resp.Unsupported != 2 {
+		t.Fatalf("accepted/rejected/unsupported = %d/%d/%d, want 0/0/2",
+			resp.Accepted, resp.Rejected, resp.Unsupported)
+	}
+	stats, err := h.metricStore.HistStats()
+	if err != nil {
+		t.Fatalf("HistStats: %v", err)
+	}
+	if stats.BufferedSamples != 0 || stats.Series != 0 {
+		t.Fatalf("stored histogram samples/series = buffered:%d sealed-series:%d, want 0/0", stats.BufferedSamples, stats.Series)
+	}
+}
+
 func TestOTLPMetrics_ExponentialHistogramAccepted(t *testing.T) {
 	h := setupMetricsHarness(t)
 
@@ -286,6 +418,7 @@ func TestOTLPMetrics_ExponentialHistogramAccepted(t *testing.T) {
 				Metrics: []*metricspb.Metric{{
 					Name: "rpc_latency_seconds",
 					Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 						DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
 							TimeUnixNano: uint64(time.Now().UnixNano()),
 							Count:        4,
@@ -341,6 +474,7 @@ func TestOTLPMetrics_HistogramAcceptedOnMetricStore(t *testing.T) {
 				Metrics: []*metricspb.Metric{{
 					Name: "h",
 					Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 						DataPoints: []*metricspb.HistogramDataPoint{{
 							TimeUnixNano:   uint64(time.Now().UnixNano()),
 							BucketCounts:   []uint64{1},
@@ -548,6 +682,48 @@ func TestOTLPMetrics_NoStoreReturns503(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestOTLPMetrics_AppendFailureReturnsRetryableError(t *testing.T) {
+	dir := t.TempDir()
+	metricStore, err := metricsengine.OpenStore(filepath.Join(dir, "metrics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metricStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mux.Handle("POST /v1/metrics", NewOTLPHandler(noopBatcher(t), metricStore, logger))
+
+	req := &collectormetrics.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: stringValue("checkout")},
+			}},
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "closed_store_gauge",
+					Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{{
+							TimeUnixNano: uint64(time.Now().UnixNano()),
+							Value:        &metricspb.NumberDataPoint_AsInt{AsInt: 1},
+						}},
+					}},
+				}},
+			}},
+		}},
+	}
+	body, _ := proto.Marshal(req)
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httpReq)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503 retryable failure", rec.Code, rec.Body.String())
 	}
 }
 

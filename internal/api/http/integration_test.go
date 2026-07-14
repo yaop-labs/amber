@@ -392,7 +392,7 @@ func TestRoutes_OTLPJSONResponseAndRetryableFailure(t *testing.T) {
 		t.Fatalf("decode retryable status: %v", err)
 	}
 	if rpcStatus.Code != int32(codesUnavailable) || rpcStatus.Message == "" {
-		t.Fatalf("retryable OTLP status = %+v", rpcStatus)
+		t.Fatalf("retryable OTLP status code=%d message=%q", rpcStatus.Code, rpcStatus.Message)
 	}
 }
 

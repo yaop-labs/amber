@@ -9,6 +9,7 @@ package otlpmetrics
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -16,6 +17,7 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/metricsengine/engine"
 	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	meotlp "github.com/yaop-labs/amber/internal/metricsengine/otlp"
 	"github.com/yaop-labs/amber/internal/selfobs"
@@ -29,9 +31,14 @@ type Result struct {
 	Unsupported int
 }
 
-// Ingest converts req and writes it to store, returning point counts. store
-// must be non-nil; callers gate on metric-store availability before calling.
-func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServiceRequest, log *slog.Logger) Result {
+// Ingest converts req and writes it to store, returning point counts. Permanent
+// per-point conversion failures are reported in Result. Durable write failures
+// are returned as errors so transports can fail the whole request and let OTLP
+// clients retry.
+//
+// store must be non-nil; callers gate on metric-store availability before
+// calling.
+func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServiceRequest, log *slog.Logger) (Result, error) {
 	var res Result
 	// Histogram series from one request are written as one block.
 	var expAll []histogram.ExpSeries
@@ -43,24 +50,44 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 			scopeAttrs := kvToMap(sm.Scope.GetAttributes())
 			for _, metric := range sm.Metrics {
 				switch data := metric.Data.(type) {
-				case *metricspb.Metric_Gauge, *metricspb.Metric_Sum:
-					_ = data // type-asserted only to route to scalar path.
-					a, r := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
+				case *metricspb.Metric_Gauge:
+					a, r, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
 					res.Accepted += a
 					res.Rejected += r
+					if err != nil {
+						return res, err
+					}
+				case *metricspb.Metric_Sum:
+					if !supportedCounterSum(data.Sum) {
+						recordUnsupported(&res, "sum_temporality", len(data.Sum.GetDataPoints()))
+						continue
+					}
+					a, r, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
+					res.Accepted += a
+					res.Rejected += r
+					if err != nil {
+						return res, err
+					}
 				case *metricspb.Metric_Histogram:
+					if !supportedCumulativeTemporality(data.Histogram.GetAggregationTemporality()) {
+						recordUnsupported(&res, "histogram_temporality", len(data.Histogram.GetDataPoints()))
+						continue
+					}
 					series := explicitSeriesFor(metric, data.Histogram, resourceAttrs, scopeAttrs)
 					res.Accepted += sumExplicitPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Add(uint64(sumExplicitPoints(series)))
 					explicitAll = append(explicitAll, series...)
 				case *metricspb.Metric_ExponentialHistogram:
+					if !supportedCumulativeTemporality(data.ExponentialHistogram.GetAggregationTemporality()) {
+						recordUnsupported(&res, "exphistogram_temporality", len(data.ExponentialHistogram.GetDataPoints()))
+						continue
+					}
 					series := expSeriesFor(metric, data.ExponentialHistogram, resourceAttrs, scopeAttrs)
 					res.Accepted += sumExpPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("exphistogram").Add(uint64(sumExpPoints(series)))
 					expAll = append(expAll, series...)
 				default:
-					res.Unsupported++
-					selfobs.MetricsIngestUnsupported.WithLabelValues("unknown").Add(1)
+					recordUnsupported(&res, "unknown", 1)
 				}
 			}
 		}
@@ -77,9 +104,10 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 			res.Accepted -= pts
 			selfobs.MetricsIngestRejected.WithLabelValues("hist_write").Add(uint64(pts))
 			log.Warn("histogram append failed", "err", err)
+			return res, fmt.Errorf("otlp metrics histogram append: %w", err)
 		}
 	}
-	return res
+	return res, nil
 }
 
 // nanosToMillis converts an OTLP timestamp (uint64 unix nanos) into the
@@ -89,10 +117,10 @@ func nanosToMillis(unixNano uint64) int64 {
 }
 
 // ingestScalar writes Gauge and Sum points to the scalar metric store.
-func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resourceAttrs, scopeAttrs map[string]string, log *slog.Logger) (int, int) {
+func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resourceAttrs, scopeAttrs map[string]string, log *slog.Logger) (int, int, error) {
 	addPoints, kind := pointsForMetric(metric)
 	if !kind.supported || len(addPoints) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 	batch := metricsengine.OTLPBatch{
 		ResourceAttributes: resourceAttrs,
@@ -103,7 +131,7 @@ func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resource
 	if err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("conversion").Add(uint64(len(addPoints)))
 		log.Warn("otlp metric sample conversion failed", "metric", metric.Name, "err", err)
-		return 0, len(addPoints)
+		return 0, len(addPoints), nil
 	}
 	if skipped > 0 {
 		// NaN/+/-Inf/int64-overflow float points: unencodable in the int64
@@ -111,17 +139,33 @@ func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resource
 		selfobs.MetricsIngestRejected.WithLabelValues("value_unencodable").Add(uint64(skipped))
 	}
 	if len(samples) == 0 {
-		return 0, skipped
+		return 0, skipped, nil
 	}
 	if _, err := store.AppendBatch(samples); err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("append").Add(uint64(len(samples)))
 		if !errors.Is(err, metricsengine.ErrNoSamples) {
 			log.Warn("otlp metric append failed", "metric", metric.Name, "err", err)
 		}
-		return 0, len(samples) + skipped
+		return 0, len(samples) + skipped, fmt.Errorf("otlp metrics append %q: %w", metric.Name, err)
 	}
 	selfobs.MetricsIngestAccepted.WithLabelValues(kind.label).Add(uint64(len(samples)))
-	return len(samples), skipped
+	return len(samples), skipped, nil
+}
+
+func supportedCounterSum(sum *metricspb.Sum) bool {
+	return sum.GetIsMonotonic() && supportedCumulativeTemporality(sum.GetAggregationTemporality())
+}
+
+func supportedCumulativeTemporality(temporality metricspb.AggregationTemporality) bool {
+	return temporality == metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE
+}
+
+func recordUnsupported(res *Result, label string, points int) {
+	if points <= 0 {
+		return
+	}
+	res.Unsupported += points
+	selfobs.MetricsIngestUnsupported.WithLabelValues(label).Add(uint64(points))
 }
 
 // expSeriesFor converts one OTLP ExponentialHistogram metric into adapter
@@ -187,16 +231,16 @@ func explicitSeriesFor(metric *metricspb.Metric, hist *metricspb.Histogram, reso
 
 // sketchSamples flattens converted series into per-tick sketch samples for
 // the store; series IDs are assigned globally by the store's catalog.
-func sketchSamples(exp []histogram.ExpSeries, explicit []histogram.ExplicitSeries) []metricsengine.SketchSample {
-	out := make([]metricsengine.SketchSample, 0, sumExpPoints(exp)+sumExplicitPoints(explicit))
+func sketchSamples(exp []histogram.ExpSeries, explicit []histogram.ExplicitSeries) []engine.SketchSample {
+	out := make([]engine.SketchSample, 0, sumExpPoints(exp)+sumExplicitPoints(explicit))
 	for _, series := range exp {
 		for i, ts := range series.Timestamps {
-			out = append(out, metricsengine.SketchSample{Labels: series.Labels, Timestamp: ts, Exp: series.Sketches[i]})
+			out = append(out, engine.SketchSample{Labels: series.Labels, Timestamp: ts, Exp: series.Sketches[i]})
 		}
 	}
 	for _, series := range explicit {
 		for i, ts := range series.Timestamps {
-			out = append(out, metricsengine.SketchSample{Labels: series.Labels, Timestamp: ts, Explicit: series.Buckets[i]})
+			out = append(out, engine.SketchSample{Labels: series.Labels, Timestamp: ts, Explicit: series.Buckets[i]})
 		}
 	}
 	return out

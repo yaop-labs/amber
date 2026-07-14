@@ -449,6 +449,7 @@ func seedExpHistogram(t *testing.T, h *metricsHarness, name string, attrs map[st
 				Metrics: []*metricspb.Metric{{
 					Name: name,
 					Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 						DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
 							TimeUnixNano: uint64(time.Now().UnixNano()),
 							Scale:        scale,

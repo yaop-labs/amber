@@ -21,10 +21,10 @@ import (
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
-	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/storage"
+	"github.com/yaop-labs/amber/metricsengine"
 )
 
 func joinS3Prefix(parts ...string) string {
@@ -223,7 +223,7 @@ type Stack struct {
 	Batcher     *ingest.Batcher
 
 	// MetricStore is nil when metrics are disabled.
-	MetricStore *mestore.Store
+	MetricStore *metricsengine.Store
 
 	dogfoodStop chan struct{}
 	dogfoodDone chan struct{}
@@ -261,18 +261,30 @@ func (s *Stack) IsReady() bool { return s.ready.Load() }
 // Status returns a consistent operational snapshot.
 func (s *Stack) Status() Status {
 	s.statusMu.RLock()
-	defer s.statusMu.RUnlock()
-	reasons := make([]StatusReason, 0, len(s.degradedReasons))
+	reasonCounts := make(map[string]uint64, len(s.degradedReasons)+1)
 	for code, count := range s.degradedReasons {
+		reasonCounts[code] = count
+	}
+	closing := s.closing
+	walRepairEvents := s.walRepairEvents
+	indexBootstrapErrors := s.indexBootstrapErrors
+	s.statusMu.RUnlock()
+
+	if s.MetricStore != nil && s.MetricStore.LastBackgroundError() != nil {
+		reasonCounts["metrics_background_error"]++
+	}
+
+	reasons := make([]StatusReason, 0, len(reasonCounts))
+	for code, count := range reasonCounts {
 		reasons = append(reasons, StatusReason{Code: code, Count: count})
 	}
 	sort.Slice(reasons, func(i, j int) bool { return reasons[i].Code < reasons[j].Code })
 	return Status{
-		Ready:                s.ready.Load() && !s.closing,
+		Ready:                s.ready.Load() && !closing,
 		Degraded:             len(reasons) > 0,
-		Closing:              s.closing,
-		WALRepairEvents:      s.walRepairEvents,
-		IndexBootstrapErrors: s.indexBootstrapErrors,
+		Closing:              closing,
+		WALRepairEvents:      walRepairEvents,
+		IndexBootstrapErrors: indexBootstrapErrors,
 		Reasons:              reasons,
 	}
 }
@@ -469,7 +481,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		},
 	})
 
-	var metricStore *mestore.Store
+	var metricStore *metricsengine.Store
 	if !cfg.Metrics.Disabled {
 		metricsDir := cfg.Metrics.Dir
 		if metricsDir == "" {
@@ -489,7 +501,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 				cacheBudget = effectiveLimit / 2
 			}
 		}
-		ms, err := mestore.OpenWithOptions(metricsDir, mestore.Options{
+		ms, err := metricsengine.OpenStoreWithOptions(metricsDir, metricsengine.StoreOptions{
 			FlushInterval:       cfg.Metrics.FlushInterval,
 			MaxBufferedSamples:  cfg.Metrics.MaxBufferedSamples,
 			MaxActiveSeries:     cfg.Metrics.MaxActiveSeries,
@@ -508,6 +520,12 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			_ = logManager.Close()
 			_ = spanManager.Close()
 			return nil, fmt.Errorf("runtime: open metric store: %w", err)
+		}
+		if ms.WALRecoveryStats().TruncatedBytes > 0 {
+			s.markDegraded("metrics_wal_tail_repaired")
+		}
+		if unknown := ms.UnknownWALSeries(); unknown > 0 {
+			s.markDegradedN("metrics_wal_unknown_series", uint64(unknown))
 		}
 		metricStore = ms
 	}

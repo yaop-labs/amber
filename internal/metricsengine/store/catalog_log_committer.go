@@ -21,6 +21,7 @@ type catalogCommitter struct {
 	syncedSeq      atomic.Uint64
 	pending        *sync.Cond
 	closed         bool
+	terminalErr    error
 	closeOnce      sync.Once
 	stop           chan struct{}
 	done           chan struct{}
@@ -51,6 +52,11 @@ func (c *catalogCommitter) Append(rec []byte) error {
 		return nil
 	}
 	c.mu.Lock()
+	if c.terminalErr != nil {
+		err := c.terminalErr
+		c.mu.Unlock()
+		return err
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return errCatalogCommitterClosed
@@ -75,6 +81,11 @@ func (c *catalogCommitter) Append(rec []byte) error {
 		c.lastWrittenSeq = mySeq
 	}
 	for c.syncedSeq.Load() < mySeq {
+		if c.terminalErr != nil {
+			err := c.terminalErr
+			c.mu.Unlock()
+			return err
+		}
 		if c.closed {
 			c.mu.Unlock()
 			return errCatalogCommitterClosed
@@ -102,15 +113,18 @@ func (c *catalogCommitter) run() {
 }
 
 // flushAndStop drains pending writes and stops the goroutine.
-func (c *catalogCommitter) flushAndStop() {
+func (c *catalogCommitter) flushAndStop() error {
+	var lastErr error
 	c.closeOnce.Do(func() {
 		close(c.stop)
 		<-c.done
 		c.mu.Lock()
+		lastErr = c.terminalErr
 		c.closed = true
 		c.mu.Unlock()
 		c.pending.Broadcast()
 	})
+	return lastErr
 }
 
 func (c *catalogCommitter) tick() error {
@@ -122,6 +136,7 @@ func (c *catalogCommitter) tick() error {
 		return nil
 	}
 	if err := c.log.sync(); err != nil {
+		c.fail(err)
 		return err
 	}
 	c.syncedSeq.Store(target)
@@ -129,4 +144,13 @@ func (c *catalogCommitter) tick() error {
 	c.pending.Broadcast()
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *catalogCommitter) fail(err error) {
+	c.mu.Lock()
+	if c.terminalErr == nil {
+		c.terminalErr = err
+	}
+	c.pending.Broadcast()
+	c.mu.Unlock()
 }
