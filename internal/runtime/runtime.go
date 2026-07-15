@@ -366,8 +366,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			_ = dirLock.Release()
 		}
 	}()
-	journalEnabled, err := shouldEnableOTLPJournal(cfg.DataDir)
-	if err != nil {
+	if err := validateOTLPV4Root(cfg.DataDir); err != nil {
 		return nil, err
 	}
 	identity, err := dbmeta.LoadOrCreate(cfg.DataDir)
@@ -482,9 +481,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		s.markDegraded("backup_state_corrupt")
 		cfg.Logger.Warn("backup operational state is invalid", "err", backupStateErr)
 	}
-	if !journalEnabled {
-		s.markDegraded("otlp_v3_compatibility")
-	}
 	s.walRepairEvents = logManager.WALCorruptRecords() + spanManager.WALCorruptRecords()
 	if s.walRepairEvents > 0 {
 		s.markDegradedN("wal_tail_repaired", s.walRepairEvents)
@@ -581,27 +577,42 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		metricStore = ms
 	}
 
-	var otlpJournal *otlpv4.Journal
-	if journalEnabled {
-		otlpJournal, err = otlpv4.OpenJournal(cfg.DataDir, policy)
-		if err != nil {
-			if metricStore != nil {
-				_ = metricStore.Close()
-			}
-			if logUp != nil {
-				logUp.Stop()
-			}
-			if spanUp != nil {
-				spanUp.Stop()
-			}
-			_ = logManager.Close()
-			_ = spanManager.Close()
-			return nil, fmt.Errorf("runtime: open OTLP v4 journal: %w", err)
-		}
-		batcher.SetReplaySink(otlpJournal)
+	otlpJournal, err := otlpv4.OpenJournal(cfg.DataDir, policy)
+	if err != nil {
 		if metricStore != nil {
-			metricStore.SetReplaySink(otlpJournal)
+			_ = metricStore.Close()
 		}
+		if logUp != nil {
+			logUp.Stop()
+		}
+		if spanUp != nil {
+			spanUp.Stop()
+		}
+		_ = logManager.Close()
+		_ = spanManager.Close()
+		return nil, fmt.Errorf("runtime: open OTLP v4 journal: %w", err)
+	}
+	if stats, statsErr := otlpJournal.Stats(); statsErr != nil {
+		_ = otlpJournal.Close()
+		if metricStore != nil {
+			_ = metricStore.Close()
+		}
+		if logUp != nil {
+			logUp.Stop()
+		}
+		if spanUp != nil {
+			spanUp.Stop()
+		}
+		_ = logManager.Close()
+		_ = spanManager.Close()
+		return nil, fmt.Errorf("runtime: read OTLP v4 journal stats: %w", statsErr)
+	} else if stats.WALCorruptRecords > 0 {
+		s.walRepairEvents += stats.WALCorruptRecords
+		s.markDegradedN("otlp_v4_wal_tail_repaired", stats.WALCorruptRecords)
+	}
+	batcher.SetReplaySink(otlpJournal)
+	if metricStore != nil {
+		metricStore.SetReplaySink(otlpJournal)
 	}
 
 	s.LogManager = logManager
@@ -774,27 +785,27 @@ func (s *Stack) close() error {
 	return errors.Join(errs...)
 }
 
-func shouldEnableOTLPJournal(root string) (bool, error) {
+func validateOTLPV4Root(root string) error {
 	journalPath := filepath.Join(root, otlpv4.DirectoryName)
 	if info, err := os.Lstat(journalPath); err == nil {
 		if !info.IsDir() {
-			return false, errors.New("runtime: OTLP v4 journal path is not a directory")
+			return errors.New("runtime: OTLP v4 journal path is not a directory")
 		}
-		return true, nil
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("runtime: inspect OTLP v4 journal: %w", err)
+		return fmt.Errorf("runtime: inspect OTLP v4 journal: %w", err)
 	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return false, fmt.Errorf("runtime: inspect data root: %w", err)
+		return fmt.Errorf("runtime: inspect data root: %w", err)
 	}
 	for _, entry := range entries {
 		switch entry.Name() {
 		case fslock.LockFileName, dbmeta.IdentityFileName, dbmeta.BackupStateFileName:
 			continue
 		default:
-			return false, nil
+			return fmt.Errorf("runtime: data root contains engine state but no %s journal", otlpv4.DirectoryName)
 		}
 	}
-	return true, nil
+	return nil
 }

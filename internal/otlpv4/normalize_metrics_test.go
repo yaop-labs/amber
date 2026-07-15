@@ -11,7 +11,7 @@ import (
 	memodel "github.com/yaop-labs/amber/internal/metricsengine/model"
 )
 
-func TestNormalizedMetricSampleV3(t *testing.T) {
+func TestNormalizedMetricSampleNative(t *testing.T) {
 	tests := []struct {
 		name   string
 		sample memodel.Sample
@@ -53,7 +53,7 @@ func TestNormalizedMetricSampleV3(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			envelope, err := NormalizedMetricSampleV3(test.sample)
+			envelope, err := NormalizedMetricSampleNative(test.sample)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -73,7 +73,7 @@ func TestNormalizedMetricSampleV3(t *testing.T) {
 	}
 }
 
-func TestNormalizedMetricSketchV3(t *testing.T) {
+func TestNormalizedMetricSketchNative(t *testing.T) {
 	labels := memodel.LabelSet{{Name: memodel.MetricNameLabel, Value: "latency"}, {Name: "route", Value: "/"}}
 	tests := []struct {
 		name   string
@@ -110,7 +110,7 @@ func TestNormalizedMetricSketchV3(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			envelope, err := NormalizedMetricSketchV3(test.sample)
+			envelope, err := NormalizedMetricSketchNative(test.sample)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -124,7 +124,7 @@ func TestNormalizedMetricSketchV3(t *testing.T) {
 	}
 }
 
-func TestNormalizedMetricV3RejectsAmbiguousMetadata(t *testing.T) {
+func TestNormalizedMetricNativeRejectsAmbiguousMetadata(t *testing.T) {
 	base := memodel.Sample{Type: memodel.MetricTypeGauge}
 	for _, labels := range []memodel.LabelSet{
 		{{Name: memodel.MetricNameLabel, Value: ""}},
@@ -132,8 +132,8 @@ func TestNormalizedMetricV3RejectsAmbiguousMetadata(t *testing.T) {
 		{{Name: memodel.MetricNameLabel, Value: "a"}, {Name: scaleLabel, Value: "0"}},
 	} {
 		base.Labels = labels
-		if _, err := NormalizedMetricSampleV3(base); err == nil {
-			t.Fatalf("NormalizedMetricSampleV3() error = nil for labels %v", labels)
+		if _, err := NormalizedMetricSampleNative(base); err == nil {
+			t.Fatalf("NormalizedMetricSampleNative() error = nil for labels %v", labels)
 		}
 	}
 }

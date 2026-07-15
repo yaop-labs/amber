@@ -446,7 +446,7 @@ func buildCheckpointVector(files []FileEntry, sealed map[string]bool) Checkpoint
 func validateOTLPJournal(ctx context.Context, root string) error {
 	path := filepath.Join(root, otlpv4.DirectoryName)
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return errors.New("backup: OTLP v4 replay journal is required")
 	} else if err != nil {
 		return fmt.Errorf("backup: inspect OTLP replay journal: %w", err)
 	}

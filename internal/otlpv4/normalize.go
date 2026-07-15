@@ -13,12 +13,6 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
-// NormalizedLogV3 projects one legacy normalized log entry into the smallest
-// OTLP request that preserves every field available in the v3 record.
-func NormalizedLogV3(entry model.LogEntry) (Envelope, error) {
-	return normalizedLog(entry, FidelityNormalizedV3)
-}
-
 // NormalizedLogNative projects a native Amber log into canonical OTLP.
 func NormalizedLogNative(entry model.LogEntry) (Envelope, error) {
 	return normalizedLog(entry, FidelityNormalizedNative)
@@ -49,12 +43,6 @@ func normalizedLog(entry model.LogEntry, fidelity Fidelity) (Envelope, error) {
 		}},
 	}
 	return New(SignalLogs, fidelity, request)
-}
-
-// NormalizedSpanV3 projects one legacy normalized span entry into the smallest
-// OTLP request that preserves every field available in the v3 record.
-func NormalizedSpanV3(entry model.SpanEntry) (Envelope, error) {
-	return normalizedSpan(entry, FidelityNormalizedV3)
 }
 
 // NormalizedSpanNative projects a native Amber span into canonical OTLP.
@@ -103,7 +91,7 @@ func normalizedSeverity(level model.Level) (logspb.SeverityNumber, error) {
 	case model.LevelFatal:
 		return logspb.SeverityNumber_SEVERITY_NUMBER_FATAL, nil
 	default:
-		return 0, fmt.Errorf("otlpv4: unsupported v3 log level %d", level)
+		return 0, fmt.Errorf("otlpv4: unsupported native log level %d", level)
 	}
 }
 
@@ -116,7 +104,7 @@ func normalizedStatus(status model.SpanStatus) (*tracepb.Status, error) {
 	case model.SpanStatusError:
 		return &tracepb.Status{Code: tracepb.Status_STATUS_CODE_ERROR}, nil
 	default:
-		return nil, fmt.Errorf("otlpv4: unsupported v3 span status %d", status)
+		return nil, fmt.Errorf("otlpv4: unsupported native span status %d", status)
 	}
 }
 

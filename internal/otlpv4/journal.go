@@ -42,6 +42,17 @@ type Journal struct {
 	closeErr  error
 }
 
+// Stats is a cheap operational snapshot of the canonical replay journal.
+type Stats struct {
+	SealedSegments    int
+	ActiveSegment     bool
+	ActiveRecords     uint64
+	TotalRecords      uint64
+	SegmentBytes      int64
+	WALBytes          int64
+	WALCorruptRecords uint64
+}
+
 type formatManifest struct {
 	JournalFormatVersion int    `json:"journal_format_version"`
 	EnvelopeMagic        string `json:"envelope_magic"`
@@ -179,6 +190,23 @@ func (j *Journal) AppendNormalizedMetricSketches(samples []engine.SketchSample) 
 		return fmt.Errorf("otlpv4: append normalized metric sketches: %w", err)
 	}
 	return nil
+}
+
+// Stats reports journal growth and WAL repair state without replaying records.
+func (j *Journal) Stats() (Stats, error) {
+	stats, err := j.manager.Stats()
+	if err != nil {
+		return Stats{}, fmt.Errorf("otlpv4: journal stats: %w", err)
+	}
+	return Stats{
+		SealedSegments:    stats.SealedSegments,
+		ActiveSegment:     stats.ActiveSegment,
+		ActiveRecords:     stats.ActiveRecords,
+		TotalRecords:      stats.TotalRecords,
+		SegmentBytes:      stats.SegmentBytes,
+		WALBytes:          stats.WALBytes,
+		WALCorruptRecords: stats.WALCorruptRecords,
+	}, nil
 }
 
 // Close seals the current journal segment and closes its WAL.
@@ -379,4 +407,27 @@ func closedJournalSegmentPaths(dir string) ([]string, error) {
 		paths = append(paths, path)
 	}
 	return paths, nil
+}
+
+func readRegular(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	return os.ReadFile(path) //nolint:gosec
+}
+
+func decodeStrictJSON(payload []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing data")
+	}
+	return nil
 }

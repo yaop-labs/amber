@@ -14,7 +14,7 @@ import (
 	"github.com/yaop-labs/amber/internal/model"
 )
 
-func TestNormalizedLogV3MatchesStoredProjection(t *testing.T) {
+func TestNormalizedLogNativeMatchesStoredProjection(t *testing.T) {
 	source := richLogsRequest().ResourceLogs[0]
 	service, host := ingest.ExtractResource(source.Resource.Attributes)
 	entry, err := ingest.OTLPLogToEntry(source.ScopeLogs[0].LogRecords[0], service, host)
@@ -23,11 +23,11 @@ func TestNormalizedLogV3MatchesStoredProjection(t *testing.T) {
 	}
 	entry.ID = model.EntryID{1, 2, 3}
 
-	envelope, err := NormalizedLogV3(entry)
+	envelope, err := NormalizedLogNative(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if envelope.Fidelity() != FidelityNormalizedV3 || envelope.Signal() != SignalLogs {
+	if envelope.Fidelity() != FidelityNormalizedNative || envelope.Signal() != SignalLogs {
 		t.Fatalf("envelope metadata = (%v, %v)", envelope.Signal(), envelope.Fidelity())
 	}
 	message, err := envelope.Request()
@@ -55,7 +55,7 @@ func TestNormalizedLogV3MatchesStoredProjection(t *testing.T) {
 	}
 }
 
-func TestNormalizedSpanV3MatchesStoredProjection(t *testing.T) {
+func TestNormalizedSpanNativeMatchesStoredProjection(t *testing.T) {
 	source := richTracesRequest().ResourceSpans[0]
 	service, _ := ingest.ExtractResource(source.Resource.Attributes)
 	entry, err := ingest.OTLPSpanToEntry(source.ScopeSpans[0].Spans[0], service)
@@ -64,7 +64,7 @@ func TestNormalizedSpanV3MatchesStoredProjection(t *testing.T) {
 	}
 	entry.ID = model.EntryID{4, 5, 6}
 
-	envelope, err := NormalizedSpanV3(entry)
+	envelope, err := NormalizedSpanNative(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,16 +90,16 @@ func TestNormalizedSpanV3MatchesStoredProjection(t *testing.T) {
 	}
 }
 
-func TestNormalizedV3IsDeterministicAndRejectsUnknownEnums(t *testing.T) {
+func TestNormalizedNativeIsDeterministicAndRejectsUnknownEnums(t *testing.T) {
 	entry := model.LogEntry{
 		Timestamp: time.Unix(0, 123), Level: model.LevelInfo, Service: "api", Host: "node",
 		Body: "hello", Attrs: []model.Attr{{Key: "k", Value: "v"}},
 	}
-	first, err := NormalizedLogV3(entry)
+	first, err := NormalizedLogNative(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := NormalizedLogV3(entry)
+	second, err := NormalizedLogNative(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,13 +112,13 @@ func TestNormalizedV3IsDeterministicAndRejectsUnknownEnums(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(a, b) {
-		t.Fatal("same v3 entry produced different envelope bytes")
+		t.Fatal("same native entry produced different envelope bytes")
 	}
 	entry.Level = model.Level(255)
-	if _, err := NormalizedLogV3(entry); err == nil {
-		t.Fatal("NormalizedLogV3() error = nil for unknown level")
+	if _, err := NormalizedLogNative(entry); err == nil {
+		t.Fatal("NormalizedLogNative() error = nil for unknown level")
 	}
-	if _, err := NormalizedSpanV3(model.SpanEntry{Status: model.SpanStatus(255)}); err == nil {
-		t.Fatal("NormalizedSpanV3() error = nil for unknown status")
+	if _, err := NormalizedSpanNative(model.SpanEntry{Status: model.SpanStatus(255)}); err == nil {
+		t.Fatal("NormalizedSpanNative() error = nil for unknown status")
 	}
 }

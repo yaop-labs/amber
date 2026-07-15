@@ -18,12 +18,6 @@ import (
 
 const scaleLabel = "__scale__"
 
-// NormalizedMetricSampleV3 projects one legacy scalar sample into the smallest
-// OTLP request that preserves its stored labels, timestamp, type, and value.
-func NormalizedMetricSampleV3(sample memodel.Sample) (Envelope, error) {
-	return normalizedMetricSample(sample, FidelityNormalizedV3)
-}
-
 // NormalizedMetricSampleNative projects one native scalar metric sample.
 func NormalizedMetricSampleNative(sample memodel.Sample) (Envelope, error) {
 	return normalizedMetricSample(sample, FidelityNormalizedNative)
@@ -54,15 +48,9 @@ func normalizedMetricSample(sample memodel.Sample, fidelity Fidelity) (Envelope,
 			IsMonotonic:            true,
 		}}
 	default:
-		return Envelope{}, fmt.Errorf("otlpv4: unsupported v3 scalar metric type %d", sample.Type)
+		return Envelope{}, fmt.Errorf("otlpv4: unsupported native scalar metric type %d", sample.Type)
 	}
 	return normalizedMetricEnvelope(context, metric, fidelity)
-}
-
-// NormalizedMetricSketchV3 projects one legacy histogram tick into OTLP. The
-// stored sketch payload is retained; unavailable OTLP metadata remains absent.
-func NormalizedMetricSketchV3(sample engine.SketchSample) (Envelope, error) {
-	return normalizedMetricSketch(sample, FidelityNormalizedV3)
 }
 
 // NormalizedMetricSketchNative projects one native histogram tick.
@@ -72,7 +60,7 @@ func NormalizedMetricSketchNative(sample engine.SketchSample) (Envelope, error) 
 
 func normalizedMetricSketch(sample engine.SketchSample, fidelity Fidelity) (Envelope, error) {
 	if (sample.Exp == nil) == (sample.Explicit == nil) {
-		return Envelope{}, errors.New("otlpv4: v3 sketch must set exactly one histogram payload")
+		return Envelope{}, errors.New("otlpv4: native sketch must set exactly one histogram payload")
 	}
 	context, err := splitMetricLabels(sample.Labels)
 	if err != nil {
@@ -144,16 +132,16 @@ func splitMetricLabels(labels memodel.LabelSet) (normalizedMetricContext, error)
 		switch {
 		case label.Name == memodel.MetricNameLabel:
 			if context.hasName {
-				return normalizedMetricContext{}, errors.New("otlpv4: duplicate v3 metric name label")
+				return normalizedMetricContext{}, errors.New("otlpv4: duplicate native metric name label")
 			}
 			context.name, context.hasName = label.Value, true
 		case label.Name == scaleLabel:
 			if context.hasScale {
-				return normalizedMetricContext{}, errors.New("otlpv4: duplicate v3 metric scale label")
+				return normalizedMetricContext{}, errors.New("otlpv4: duplicate native metric scale label")
 			}
 			scale, err := strconv.ParseInt(label.Value, 10, 64)
 			if err != nil || scale <= 0 {
-				return normalizedMetricContext{}, fmt.Errorf("otlpv4: invalid v3 metric scale %q", label.Value)
+				return normalizedMetricContext{}, fmt.Errorf("otlpv4: invalid native metric scale %q", label.Value)
 			}
 			context.scale, context.hasScale = scale, true
 		case strings.HasPrefix(label.Name, "resource."):
@@ -165,7 +153,7 @@ func splitMetricLabels(labels memodel.LabelSet) (normalizedMetricContext, error)
 		}
 	}
 	if !context.hasName || context.name == "" {
-		return normalizedMetricContext{}, errors.New("otlpv4: v3 metric name label is required")
+		return normalizedMetricContext{}, errors.New("otlpv4: native metric name label is required")
 	}
 	return context, nil
 }

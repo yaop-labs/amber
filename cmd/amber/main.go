@@ -157,8 +157,9 @@ func run() error {
 	selfobs.RegisterGaugeFunc("amber_segments_total", "Number of segments tracked by a manager.", func() float64 {
 		return float64(stack.LogManager.SegmentCount() + stack.SpanManager.SegmentCount())
 	})
+	readOTLPReplayMetrics := registerOTLPReplayMetrics(stack.OTLPJournal)
 	selfobs.RegisterCounterFunc("amber_wal_corrupt_records_total", "Malformed WAL records observed during replay.", func() float64 {
-		return float64(stack.LogManager.WALCorruptRecords() + stack.SpanManager.WALCorruptRecords())
+		return float64(stack.LogManager.WALCorruptRecords()+stack.SpanManager.WALCorruptRecords()) + readOTLPReplayMetrics().walRepairEvents
 	})
 	registerCheckpointMetrics(stack.Status, time.Now)
 

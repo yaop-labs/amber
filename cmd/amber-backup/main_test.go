@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/yaop-labs/amber/internal/otlpv4"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func TestRunCreateVerifyRestore(t *testing.T) {
@@ -17,6 +20,13 @@ func TestRunCreateVerifyRestore(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("data"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
+	}
+	journal, err := otlpv4.OpenJournal(source, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open OTLP v4 journal: %v", err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatalf("close OTLP v4 journal: %v", err)
 	}
 	snapshot := filepath.Join(root, "snapshot")
 	restored := filepath.Join(root, "restored")

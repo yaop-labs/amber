@@ -45,14 +45,15 @@ func (s Signal) String() string {
 	}
 }
 
-// Fidelity states whether Payload is accepted original OTLP, a deterministic
-// legacy-v3 projection, or a normalized native-ingest projection.
+// Fidelity states whether Payload is accepted original OTLP or a deterministic
+// normalized native-ingest projection.
 type Fidelity uint8
 
 const (
-	FidelityOTLP Fidelity = iota + 1
-	FidelityNormalizedV3
-	FidelityNormalizedNative
+	FidelityOTLP Fidelity = 1
+	// Value 2 is intentionally unsupported so the existing native AOT4 wire
+	// value remains stable after removal of the pre-production migration path.
+	FidelityNormalizedNative Fidelity = 3
 )
 
 // Envelope contains one deterministic protobuf OTLP Export request. Payload is
@@ -209,7 +210,7 @@ func validateSignal(signal Signal) error {
 }
 
 func validateFidelity(fidelity Fidelity) error {
-	if fidelity != FidelityOTLP && fidelity != FidelityNormalizedV3 && fidelity != FidelityNormalizedNative {
+	if fidelity != FidelityOTLP && fidelity != FidelityNormalizedNative {
 		return fmt.Errorf("otlpv4: unsupported fidelity %d", fidelity)
 	}
 	return nil
