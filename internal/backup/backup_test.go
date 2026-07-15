@@ -12,6 +12,7 @@ import (
 
 	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/fslock"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -30,6 +31,7 @@ func TestCreateVerifyRestoreRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "logs", "LOCK"), nil, 0o600); err != nil {
 		t.Fatalf("write nested lock: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 
 	snapshot := filepath.Join(root, "snapshot")
 	created, err := Create(context.Background(), source, snapshot)
@@ -42,11 +44,15 @@ func TestCreateVerifyRestoreRoundTrip(t *testing.T) {
 	if len(created.Manifest.Checkpoints.Logs.WALBoundaries) != 1 {
 		t.Fatalf("log WAL boundaries = %+v", created.Manifest.Checkpoints.Logs.WALBoundaries)
 	}
-	legacyManifest := created.Manifest
-	legacyManifest.SnapshotFormatVersion = 1
-	legacyManifest.Checkpoints.OTLPReplay = EngineCheckpoint{}
-	if err := legacyManifest.validate(); err != nil {
-		t.Fatalf("v1 manifest compatibility: %v", err)
+	unsupportedManifest := created.Manifest
+	unsupportedManifest.SnapshotFormatVersion = 1
+	if err := unsupportedManifest.validate(); err == nil {
+		t.Fatal("v1 manifest was accepted")
+	}
+	missingOTLPManifest := created.Manifest
+	missingOTLPManifest.Checkpoints.OTLPReplay = EngineCheckpoint{}
+	if err := missingOTLPManifest.validate(); err == nil {
+		t.Fatal("manifest without OTLP v4 checkpoint was accepted")
 	}
 	state, err := dbmeta.LoadBackupState(source)
 	if err != nil {
@@ -108,6 +114,24 @@ func TestCreateRejectsLockedDataRoot(t *testing.T) {
 	_, err = Create(context.Background(), source, filepath.Join(root, "snapshot"))
 	if !errors.Is(err, fslock.ErrLocked) {
 		t.Fatalf("Create error = %v, want ErrLocked", err)
+	}
+}
+
+func TestCreateRequiresOTLPV4Journal(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("engine state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Create(context.Background(), source, filepath.Join(root, "snapshot"))
+	if err == nil || !strings.Contains(err.Error(), "OTLP v4 replay journal is required") {
+		t.Fatalf("Create error = %v, want required OTLP v4 journal", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "snapshot")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected backup published snapshot: %v", err)
 	}
 }
 
@@ -231,9 +255,21 @@ func createFixtureSnapshot(t *testing.T) (string, string) {
 	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("original"), 0o600); err != nil {
 		t.Fatalf("write payload: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 	snapshot := filepath.Join(root, "snapshot")
 	if _, err := Create(context.Background(), source, snapshot); err != nil {
 		t.Fatalf("Create fixture: %v", err)
 	}
 	return root, snapshot
+}
+
+func createEmptyOTLPJournal(t *testing.T, root string) {
+	t.Helper()
+	journal, err := otlpv4.OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open OTLP v4 fixture journal: %v", err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatalf("close OTLP v4 fixture journal: %v", err)
+	}
 }

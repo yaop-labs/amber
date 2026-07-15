@@ -936,6 +936,53 @@ func (sm *SegmentManager) SegmentCount() int {
 	return len(sm.meta.Segments)
 }
 
+// ManagerStats is a consistent operational snapshot of one segment manager.
+// SegmentBytes is physical container size and excludes the WAL and sidecars.
+type ManagerStats struct {
+	SealedSegments    int
+	ActiveSegment     bool
+	ActiveRecords     uint64
+	TotalRecords      uint64
+	SegmentBytes      int64
+	WALBytes          int64
+	WALCorruptRecords uint64
+}
+
+// Stats returns record and disk-usage counters without scanning segment data.
+func (sm *SegmentManager) Stats() (ManagerStats, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var stats ManagerStats
+	for _, segment := range sm.meta.Segments {
+		if segment.Sealed {
+			stats.SealedSegments++
+			stats.TotalRecords += segment.RecordCount
+			stats.SegmentBytes += segment.SizeBytes
+			continue
+		}
+		stats.ActiveSegment = true
+		if sm.active != nil {
+			stats.ActiveRecords = sm.active.RecordCount()
+			stats.TotalRecords += stats.ActiveRecords
+		}
+		info, err := os.Stat(filepath.Join(sm.dir, segment.FileName)) //nolint:gosec
+		if err != nil {
+			return ManagerStats{}, fmt.Errorf("segmgr: stat active segment: %w", err)
+		}
+		stats.SegmentBytes += info.Size()
+	}
+	if sm.wal != nil {
+		walBytes, err := sm.wal.Size()
+		if err != nil {
+			return ManagerStats{}, fmt.Errorf("segmgr: read WAL size: %w", err)
+		}
+		stats.WALBytes = walBytes
+		stats.WALCorruptRecords = sm.wal.CorruptRecords()
+	}
+	return stats, nil
+}
+
 // RemoveSegment deletes a sealed segment and its sidecars and drops it from the
 // metadata, the terminal step of retention.
 func (sm *SegmentManager) RemoveSegment(id uint32) error {

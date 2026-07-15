@@ -51,6 +51,7 @@ func TestS3TransportMinIOIntegration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "payload.bin"), payload, 0o600); err != nil {
 		t.Fatalf("write payload: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 	localSnapshot := filepath.Join(root, "snapshot")
 	created, err := Create(ctx, source, localSnapshot)
 	if err != nil {

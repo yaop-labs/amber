@@ -89,7 +89,7 @@ func parseManifest(payload []byte) (Manifest, error) {
 }
 
 func (m Manifest) validate() error {
-	if m.SnapshotFormatVersion < 1 || m.SnapshotFormatVersion > SnapshotFormatVersion {
+	if m.SnapshotFormatVersion != SnapshotFormatVersion {
 		return fmt.Errorf("backup: unsupported snapshot format version %d", m.SnapshotFormatVersion)
 	}
 	if err := m.Database.Validate(); err != nil {
@@ -144,6 +144,9 @@ func (m Manifest) validate() error {
 		if err := validateCheckpoint(item.name, item.prefix, item.checkpoint, files); err != nil {
 			return err
 		}
+	}
+	if !m.Checkpoints.OTLPReplay.Present {
+		return errors.New("backup: OTLP v4 checkpoint is required")
 	}
 	return nil
 }

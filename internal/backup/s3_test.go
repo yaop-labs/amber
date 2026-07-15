@@ -57,6 +57,7 @@ func TestS3TransportUploadDownloadRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("remote backup"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 	snapshot := filepath.Join(root, "snapshot")
 	created, err := Create(context.Background(), source, snapshot)
 	if err != nil {
@@ -105,6 +106,7 @@ func TestS3TransportRejectsCorruptObjectWithoutPublishing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("original"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 	snapshot := filepath.Join(root, "snapshot")
 	created, err := Create(context.Background(), source, snapshot)
 	if err != nil {
@@ -281,6 +283,7 @@ func uploadedDrillSnapshot(t *testing.T) (*S3Transport, Verification) {
 	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("drill payload"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
+	createEmptyOTLPJournal(t, source)
 	created, err := Create(context.Background(), source, filepath.Join(root, "snapshot"))
 	if err != nil {
 		t.Fatalf("Create: %v", err)

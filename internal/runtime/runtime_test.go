@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -43,6 +44,13 @@ func TestStatusReportsDegradedReasonsAndClosing(t *testing.T) {
 
 func TestStatusReportsMetricsWALRepair(t *testing.T) {
 	dataDir := t.TempDir()
+	journal, err := otlpv4.OpenJournal(dataDir, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
 	metricsDir := filepath.Join(dataDir, "metrics")
 	if err := os.MkdirAll(metricsDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -356,14 +364,14 @@ func TestCloseContinuesAfterBatchErrorAndReleasesDataDir(t *testing.T) {
 	}
 }
 
-func TestRuntimeOTLPJournalModes(t *testing.T) {
+func TestRuntimeRequiresOTLPV4Journal(t *testing.T) {
 	t.Run("new root enables v4", func(t *testing.T) {
 		root := t.TempDir()
 		stack, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stack.OTLPJournal == nil || statusHasReason(stack.Status(), "otlp_v3_compatibility", 1) {
+		if stack.OTLPJournal == nil {
 			t.Fatalf("new-root status = %+v journal=%v", stack.Status(), stack.OTLPJournal)
 		}
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -376,7 +384,7 @@ func TestRuntimeOTLPJournalModes(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy root stays compatibility-only", func(t *testing.T) {
+	t.Run("existing engine root without v4 is rejected", func(t *testing.T) {
 		root := t.TempDir()
 		if _, err := dbmeta.LoadOrCreate(root); err != nil {
 			t.Fatal(err)
@@ -388,17 +396,11 @@ func TestRuntimeOTLPJournalModes(t *testing.T) {
 		if err := manager.Close(); err != nil {
 			t.Fatal(err)
 		}
-		stack, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
-		if err != nil {
-			t.Fatal(err)
+		if _, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}}); err == nil {
+			t.Fatal("New() error = nil for existing engine root without OTLP v4")
 		}
-		if stack.OTLPJournal != nil || !statusHasReason(stack.Status(), "otlp_v3_compatibility", 1) {
-			t.Fatalf("legacy status = %+v journal=%v", stack.Status(), stack.OTLPJournal)
-		}
-		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := stack.Close(closeCtx); err != nil {
-			t.Fatal(err)
+		if _, err := os.Stat(filepath.Join(root, otlpv4.DirectoryName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rejected root was modified with OTLP v4 journal: %v", err)
 		}
 	})
 
@@ -411,6 +413,48 @@ func TestRuntimeOTLPJournalModes(t *testing.T) {
 			t.Fatal("New() error = nil for invalid journal path")
 		}
 	})
+}
+
+func TestRuntimeReportsOTLPJournalWALRepair(t *testing.T) {
+	root := t.TempDir()
+	stack, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := stack.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := filepath.Join(root, otlpv4.DirectoryName, "amber.wal")
+	wal, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.Write([]byte{1, 2, 3}); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := reopened.Close(ctx); err != nil {
+			t.Errorf("close reopened runtime: %v", err)
+		}
+	}()
+	status := reopened.Status()
+	if status.WALRepairEvents != 1 || !statusHasReason(status, "otlp_v4_wal_tail_repaired", 1) {
+		t.Fatalf("status after OTLP WAL repair = %+v", status)
+	}
 }
 
 func flushBatcher(t *testing.T, stack *Stack) {

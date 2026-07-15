@@ -65,7 +65,7 @@ func TestJournalReopensAfterUnsealedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope, err := New(SignalLogs, FidelityNormalizedV3, richLogsRequest())
+	envelope, err := New(SignalLogs, FidelityNormalizedNative, richLogsRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +92,110 @@ func TestJournalReopensAfterUnsealedWrites(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("replayed %d envelopes, want 1", count)
+	}
+}
+
+func TestJournalStatsTrackActiveSealedAndReopenedState(t *testing.T) {
+	root := t.TempDir()
+	policy := storage.RotationPolicy{MaxRecords: 2, MaxBytes: 1 << 20}
+	journal, err := OpenJournal(root, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initial, err := journal.Stats()
+	if err != nil {
+		t.Fatalf("initial Stats: %v", err)
+	}
+	if !initial.ActiveSegment || initial.SealedSegments != 0 || initial.TotalRecords != 0 || initial.SegmentBytes != 0 || initial.WALBytes != 0 {
+		t.Fatalf("initial stats = %+v", initial)
+	}
+	if err := journal.Append(envelope, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	active, err := journal.Stats()
+	if err != nil {
+		t.Fatalf("active Stats: %v", err)
+	}
+	if active.ActiveRecords != 1 || active.TotalRecords != 1 || active.WALBytes <= 0 {
+		t.Fatalf("active stats = %+v", active)
+	}
+	if err := journal.Append(envelope, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := journal.Stats()
+	if err != nil {
+		t.Fatalf("rotated Stats: %v", err)
+	}
+	if rotated.SealedSegments != 1 || !rotated.ActiveSegment || rotated.ActiveRecords != 0 || rotated.TotalRecords != 2 || rotated.WALBytes != 0 {
+		t.Fatalf("rotated stats = %+v", rotated)
+	}
+	if err := journal.Append(envelope, time.Unix(3, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenJournal(root, policy)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened journal: %v", err)
+		}
+	}()
+	stats, err := reopened.Stats()
+	if err != nil {
+		t.Fatalf("reopened Stats: %v", err)
+	}
+	if stats.SealedSegments != 2 || !stats.ActiveSegment || stats.ActiveRecords != 0 || stats.TotalRecords != 3 || stats.WALBytes != 0 {
+		t.Fatalf("reopened stats = %+v", stats)
+	}
+}
+
+func TestJournalStatsReportRepairedWALTail(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	walPath := filepath.Join(root, DirectoryName, "amber.wal")
+	wal, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.Write([]byte{1, 2, 3}); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened journal: %v", err)
+		}
+	}()
+	stats, err := reopened.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.WALCorruptRecords != 1 || stats.WALBytes != 0 {
+		t.Fatalf("repaired stats = %+v", stats)
 	}
 }
 

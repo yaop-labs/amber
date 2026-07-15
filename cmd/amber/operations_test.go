@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/config"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
+	"github.com/yaop-labs/amber/internal/storage"
+	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 )
 
 func TestHTTPAuthMetricsPolicy(t *testing.T) {
@@ -96,6 +99,53 @@ func TestRegisterCheckpointMetrics(t *testing.T) {
 		"amber_backup_age_seconds":                      2 * time.Hour.Seconds(),
 		"amber_restore_last_verified_timestamp_seconds": unixSeconds(status.LastVerifiedRestore.VerifiedAt),
 		"amber_restore_verification_age_seconds":        30 * time.Minute.Seconds(),
+	}
+	for name, expected := range want {
+		if got, ok := values[name]; !ok || got != expected {
+			t.Errorf("%s = %v, present=%v; want %v", name, got, ok, expected)
+		}
+	}
+}
+
+func TestRegisterOTLPReplayMetrics(t *testing.T) {
+	root := t.TempDir()
+	journal, err := otlpv4.OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := journal.Close(); err != nil {
+			t.Errorf("close journal: %v", err)
+		}
+	}()
+	if err := journal.AppendRequest(otlpv4.SignalLogs, &collectorlogs.ExportLogsServiceRequest{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	read := registerOTLPReplayMetrics(journal)
+	metrics := read()
+	if metrics.enabled != 1 || metrics.statsError != 0 || metrics.sealedSegments != 1 ||
+		metrics.activeSegment != 1 || metrics.activeRecords != 0 || metrics.totalRecords != 1 ||
+		metrics.segmentBytes <= 0 || metrics.walBytes != 0 || metrics.storageBytes != metrics.segmentBytes ||
+		metrics.walRepairEvents != 0 {
+		t.Fatalf("OTLP replay metrics = %+v", metrics)
+	}
+
+	values := make(map[string]float64)
+	for _, sample := range selfobs.Snapshot() {
+		values[sample.Name] = sample.Value
+	}
+	want := map[string]float64{
+		"amber_otlp_replay_enabled":                 metrics.enabled,
+		"amber_otlp_replay_stats_error":             metrics.statsError,
+		"amber_otlp_replay_sealed_segments":         metrics.sealedSegments,
+		"amber_otlp_replay_active_segment":          metrics.activeSegment,
+		"amber_otlp_replay_active_records":          metrics.activeRecords,
+		"amber_otlp_replay_records":                 metrics.totalRecords,
+		"amber_otlp_replay_segment_bytes":           metrics.segmentBytes,
+		"amber_otlp_replay_wal_bytes":               metrics.walBytes,
+		"amber_otlp_replay_storage_bytes":           metrics.storageBytes,
+		"amber_otlp_replay_wal_repair_events_total": metrics.walRepairEvents,
 	}
 	for name, expected := range want {
 		if got, ok := values[name]; !ok || got != expected {

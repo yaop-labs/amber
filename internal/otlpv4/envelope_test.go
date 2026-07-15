@@ -91,7 +91,10 @@ func TestEnvelopeRejectsCorruptionAndTypeMismatch(t *testing.T) {
 	if _, err := New(SignalLogs, FidelityOTLP, richTracesRequest()); err == nil {
 		t.Fatal("New() error = nil for mismatched signal")
 	}
-	envelope, err := New(SignalLogs, FidelityNormalizedV3, richLogsRequest())
+	if _, err := New(SignalLogs, Fidelity(2), richLogsRequest()); err == nil {
+		t.Fatal("New() error = nil for removed fidelity")
+	}
+	envelope, err := New(SignalLogs, FidelityNormalizedNative, richLogsRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
