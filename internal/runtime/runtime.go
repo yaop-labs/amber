@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -239,6 +241,7 @@ type Stack struct {
 	SpanDir     string
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
+	OTLPJournal *otlpv4.Journal
 
 	// MetricStore is nil when metrics are disabled.
 	MetricStore *metricsengine.Store
@@ -363,6 +366,10 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			_ = dirLock.Release()
 		}
 	}()
+	journalEnabled, err := shouldEnableOTLPJournal(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	identity, err := dbmeta.LoadOrCreate(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("runtime: open database identity: %w", err)
@@ -475,6 +482,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		s.markDegraded("backup_state_corrupt")
 		cfg.Logger.Warn("backup operational state is invalid", "err", backupStateErr)
 	}
+	if !journalEnabled {
+		s.markDegraded("otlp_v3_compatibility")
+	}
 	s.walRepairEvents = logManager.WALCorruptRecords() + spanManager.WALCorruptRecords()
 	if s.walRepairEvents > 0 {
 		s.markDegradedN("wal_tail_repaired", s.walRepairEvents)
@@ -571,6 +581,29 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		metricStore = ms
 	}
 
+	var otlpJournal *otlpv4.Journal
+	if journalEnabled {
+		otlpJournal, err = otlpv4.OpenJournal(cfg.DataDir, policy)
+		if err != nil {
+			if metricStore != nil {
+				_ = metricStore.Close()
+			}
+			if logUp != nil {
+				logUp.Stop()
+			}
+			if spanUp != nil {
+				spanUp.Stop()
+			}
+			_ = logManager.Close()
+			_ = spanManager.Close()
+			return nil, fmt.Errorf("runtime: open OTLP v4 journal: %w", err)
+		}
+		batcher.SetReplaySink(otlpJournal)
+		if metricStore != nil {
+			metricStore.SetReplaySink(otlpJournal)
+		}
+	}
+
 	s.LogManager = logManager
 	s.SpanManager = spanManager
 	s.LogSparse = logSparse
@@ -580,6 +613,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	s.Executor = exec
 	s.Batcher = batcher
 	s.MetricStore = metricStore
+	s.OTLPJournal = otlpJournal
 	s.logUploader = logUp
 	s.spanUploader = spanUp
 	if closer, ok := logRemote.(io.Closer); ok {
@@ -712,6 +746,11 @@ func (s *Stack) close() error {
 			errs = append(errs, fmt.Errorf("runtime: close metric store: %w", err))
 		}
 	}
+	if s.OTLPJournal != nil {
+		if err := s.OTLPJournal.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close OTLP v4 journal: %w", err))
+		}
+	}
 	if s.Executor != nil {
 		s.Executor.Close()
 	}
@@ -733,4 +772,29 @@ func (s *Stack) close() error {
 		errs = append(errs, fmt.Errorf("runtime: release dir lock: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+func shouldEnableOTLPJournal(root string) (bool, error) {
+	journalPath := filepath.Join(root, otlpv4.DirectoryName)
+	if info, err := os.Lstat(journalPath); err == nil {
+		if !info.IsDir() {
+			return false, errors.New("runtime: OTLP v4 journal path is not a directory")
+		}
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("runtime: inspect OTLP v4 journal: %w", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, fmt.Errorf("runtime: inspect data root: %w", err)
+	}
+	for _, entry := range entries {
+		switch entry.Name() {
+		case fslock.LockFileName, dbmeta.IdentityFileName, dbmeta.BackupStateFileName:
+			continue
+		default:
+			return false, nil
+		}
+	}
+	return true, nil
 }

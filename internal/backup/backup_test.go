@@ -42,6 +42,12 @@ func TestCreateVerifyRestoreRoundTrip(t *testing.T) {
 	if len(created.Manifest.Checkpoints.Logs.WALBoundaries) != 1 {
 		t.Fatalf("log WAL boundaries = %+v", created.Manifest.Checkpoints.Logs.WALBoundaries)
 	}
+	legacyManifest := created.Manifest
+	legacyManifest.SnapshotFormatVersion = 1
+	legacyManifest.Checkpoints.OTLPReplay = EngineCheckpoint{}
+	if err := legacyManifest.validate(); err != nil {
+		t.Fatalf("v1 manifest compatibility: %v", err)
+	}
 	state, err := dbmeta.LoadBackupState(source)
 	if err != nil {
 		t.Fatalf("load source backup state: %v", err)

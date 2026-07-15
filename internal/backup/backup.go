@@ -19,6 +19,7 @@ import (
 	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/fslock"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -78,6 +79,9 @@ func Create(ctx context.Context, dataRoot, snapshotDir string) (Verification, er
 		return Verification{}, err
 	}
 	if err := validateMetricsManifest(dataDir); err != nil {
+		return Verification{}, err
+	}
+	if err := validateOTLPJournal(ctx, dataDir); err != nil {
 		return Verification{}, err
 	}
 	manifest := Manifest{
@@ -187,6 +191,9 @@ func Verify(ctx context.Context, snapshotDir string) (Verification, error) {
 	if err := validateMetricsManifest(dataDir); err != nil {
 		return Verification{}, err
 	}
+	if err := validateOTLPJournal(ctx, dataDir); err != nil {
+		return Verification{}, err
+	}
 	return Verification{Manifest: manifest, Checkpoint: checkpoint}, nil
 }
 
@@ -246,6 +253,9 @@ func Restore(ctx context.Context, snapshotDir, dataRoot string) (Verification, e
 		}
 	}
 	if err := validateMetricsManifest(staging); err != nil {
+		return Verification{}, err
+	}
+	if err := validateOTLPJournal(ctx, staging); err != nil {
 		return Verification{}, err
 	}
 	state, err := dbmeta.LoadBackupState(staging)
@@ -311,7 +321,7 @@ func validateCreatePaths(dataRoot, snapshotDir string) (string, string, error) {
 
 func validateLocalEventStores(root string) (map[string]bool, error) {
 	sealed := make(map[string]bool)
-	for _, dir := range []string{"logs", "spans"} {
+	for _, dir := range []string{"logs", "spans", otlpv4.DirectoryName} {
 		metaPath := filepath.Join(root, dir, "meta.json")
 		payload, err := os.ReadFile(metaPath) //nolint:gosec
 		if errors.Is(err, os.ErrNotExist) {
@@ -429,7 +439,21 @@ func buildCheckpointVector(files []FileEntry, sealed map[string]bool) Checkpoint
 	populate("logs", &vector.Logs, "amber.wal")
 	populate("spans", &vector.Traces, "amber.wal")
 	populate("metrics", &vector.Metrics, "head.wal")
+	populate(otlpv4.DirectoryName, &vector.OTLPReplay, "amber.wal")
 	return vector
+}
+
+func validateOTLPJournal(ctx context.Context, root string) error {
+	path := filepath.Join(root, otlpv4.DirectoryName)
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("backup: inspect OTLP replay journal: %w", err)
+	}
+	if err := otlpv4.Replay(ctx, root, func(otlpv4.Envelope) error { return nil }); err != nil {
+		return fmt.Errorf("backup: verify OTLP replay journal: %w", err)
+	}
+	return nil
 }
 
 func snapshotFileSet(dataDir string) (map[string]string, error) {

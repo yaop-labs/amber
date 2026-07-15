@@ -8,6 +8,7 @@ import (
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/storage"
@@ -24,6 +25,7 @@ type RoutesDeps struct {
 	// (counters, gauges, histograms). nil disables /v1/metrics ingest and the
 	// metric query endpoints.
 	MetricStore *metricsengine.Store
+	OTLPJournal *otlpv4.Journal
 	IsReady     func() bool
 	Status      func() runtime.Status
 	Logger      *slog.Logger
@@ -75,6 +77,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/services", auth(NewServicesHandler(deps.Executor, deps.Logger)))
 
 	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger, cfg.MaxRequestBytes)
+	otlpH.journal = deps.OTLPJournal
 	mux.Handle("POST /v1/logs", authPost(otlpH))
 	mux.Handle("POST /v1/traces", authPost(otlpH))
 	mux.Handle("POST /v1/metrics", authPost(otlpH))

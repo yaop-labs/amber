@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 	"github.com/yaop-labs/amber/metricsengine"
@@ -31,6 +33,8 @@ import (
 type metricsHarness struct {
 	mux         *http.ServeMux
 	metricStore *metricsengine.Store
+	root        string
+	journal     *otlpv4.Journal
 }
 
 func setupMetricsHarness(t *testing.T) *metricsHarness {
@@ -65,6 +69,10 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 	if err != nil {
 		t.Fatalf("open metric store: %v", err)
 	}
+	journal, err := otlpv4.OpenJournal(dir, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open OTLP journal: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	var ready atomic.Bool
@@ -73,6 +81,7 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 		Batcher: batcher, Executor: exec,
 		LogManager: logManager, LogSparse: logSparse,
 		MetricStore: metricStore,
+		OTLPJournal: journal,
 		IsReady:     ready.Load, Logger: log,
 	}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
 
@@ -80,13 +89,14 @@ func setupMetricsHarness(t *testing.T) *metricsHarness {
 		cancel()
 		batcher.Wait()
 		_ = metricStore.Close()
+		_ = journal.Close()
 		_ = logSparse.Save(logDir)
 		_ = spanSparse.Save(spanDir)
 		_ = logManager.Close()
 		_ = spanManager.Close()
 	})
 
-	return &metricsHarness{mux: mux, metricStore: metricStore}
+	return &metricsHarness{mux: mux, metricStore: metricStore, root: dir, journal: journal}
 }
 
 func (h *metricsHarness) post(t *testing.T, path string, body []byte) *httptest.ResponseRecorder {
@@ -166,6 +176,56 @@ func TestOTLPMetrics_CounterRoundTrip(t *testing.T) {
 	}
 	if got := rates["api"]; got <= 0 {
 		t.Fatalf("rates[api] = %v, want > 0", got)
+	}
+}
+
+func TestOTLPMetrics_JournalRetainsAcceptedSubset(t *testing.T) {
+	h := setupMetricsHarness(t)
+	accepted := &metricspb.NumberDataPoint{TimeUnixNano: 1_000_000, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.25}}
+	rejected := &metricspb.NumberDataPoint{TimeUnixNano: 2_000_000, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: math.NaN()}}
+	req := &collectormetrics.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{
+			{Name: "temperature", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{accepted, rejected}}}},
+			{Name: "unsupported", Data: &metricspb.Metric_Summary{Summary: &metricspb.Summary{DataPoints: []*metricspb.SummaryDataPoint{{TimeUnixNano: 3_000_000}}}}},
+		}}},
+	}}}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := h.post(t, "/v1/metrics", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Accepted, Rejected, Unsupported int
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Accepted != 1 || response.Rejected != 1 || response.Unsupported != 1 {
+		t.Fatalf("response = %+v", response)
+	}
+	if err := h.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := otlpv4.MetricsSubset(req, map[proto.Message]struct{}{accepted: {}})
+	count := 0
+	if err := otlpv4.Replay(context.Background(), h.root, func(envelope otlpv4.Envelope) error {
+		count++
+		message, err := envelope.Request()
+		if err != nil {
+			return err
+		}
+		if !proto.Equal(message, want) {
+			t.Fatalf("replayed metrics differ: %v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("journal record count = %d", count)
 	}
 }
 

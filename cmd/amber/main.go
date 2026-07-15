@@ -222,7 +222,7 @@ func run() error {
 			return fmt.Errorf("configure grpc reef: %w", err)
 		}
 		tlsconf.WarnIfPlaintext(log, "amber-grpc", cfg.API.Security.TLS.Enabled)
-		grpcServer := ambergrpc.NewServer(stack.Batcher, stack.MetricStore, int(cfg.API.MaxRequestBytes), log, grpcOpts...)
+		grpcServer := ambergrpc.NewServerWithJournal(stack.Batcher, stack.MetricStore, stack.OTLPJournal, int(cfg.API.MaxRequestBytes), log, grpcOpts...)
 		go func() {
 			log.Info("grpc server listening", "addr", cfg.API.GRPCAddr)
 			if err := ambergrpc.ListenAndServe(grpcServer, cfg.API.GRPCAddr); err != nil {
@@ -276,6 +276,7 @@ func run() error {
 		LogManager:  stack.LogManager,
 		LogSparse:   stack.LogSparse,
 		MetricStore: stack.MetricStore,
+		OTLPJournal: stack.OTLPJournal,
 		IsReady:     stack.IsReady,
 		Status:      stack.Status,
 		Logger:      log,

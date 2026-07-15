@@ -12,12 +12,15 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
 type sender interface {
 	SendLog(model.LogEntry) error
 	SendSpan(model.SpanEntry) error
+	SendOTLPLog(model.LogEntry) error
+	SendOTLPSpan(model.SpanEntry) error
 	IsBreakerOpen() bool
 	IsLogBreakerOpen() bool
 	IsSpanBreakerOpen() bool
@@ -31,14 +34,23 @@ type sender interface {
 // embedded metric store; a nil store leaves MetricsService unregistered so
 // metric clients receive Unimplemented (metrics disabled).
 func NewServer(batcher sender, metricStore *metricsengine.Store, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
+	return newServer(batcher, metricStore, nil, maxRecvBytes, log, opts...)
+}
+
+// NewServerWithJournal is NewServer with lossless accepted-OTLP recording.
+func NewServerWithJournal(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
+	return newServer(batcher, metricStore, journal, maxRecvBytes, log, opts...)
+}
+
+func newServer(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
 	if maxRecvBytes > 0 {
 		opts = append(opts, grpc.MaxRecvMsgSize(maxRecvBytes))
 	}
 	s := grpc.NewServer(opts...)
-	collectorlogs.RegisterLogsServiceServer(s, &logsServer{batcher: batcher, log: log})
-	collectortrace.RegisterTraceServiceServer(s, &tracesServer{batcher: batcher, log: log})
+	collectorlogs.RegisterLogsServiceServer(s, &logsServer{batcher: batcher, journal: journal, log: log})
+	collectortrace.RegisterTraceServiceServer(s, &tracesServer{batcher: batcher, journal: journal, log: log})
 	if metricStore != nil {
-		collectormetrics.RegisterMetricsServiceServer(s, &metricsServer{store: metricStore, log: log})
+		collectormetrics.RegisterMetricsServiceServer(s, &metricsServer{store: metricStore, journal: journal, log: log})
 	}
 	return s
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -17,7 +18,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/yaop-labs/amber/internal/otlpv4"
+	"github.com/yaop-labs/amber/internal/storage"
 	"github.com/yaop-labs/amber/metricsengine"
 	"github.com/yaop-labs/reef/bearer"
 	"github.com/yaop-labs/reef/grpcreef"
@@ -107,6 +111,51 @@ func TestMetricsExportUnsupportedReportsPartialSuccess(t *testing.T) {
 	}
 	if resp.GetPartialSuccess().GetErrorMessage() == "" {
 		t.Fatal("expected partial success error message")
+	}
+}
+
+func TestMetricsExportJournalExcludesRejectedAndUnsupportedPoints(t *testing.T) {
+	root := t.TempDir()
+	journal, err := otlpv4.OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &metricsServer{store: openStore(t), journal: journal, log: discardLog()}
+	accepted := &metricspb.NumberDataPoint{TimeUnixNano: 1_000_000, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.25}}
+	rejected := &metricspb.NumberDataPoint{TimeUnixNano: 2_000_000, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: math.NaN()}}
+	req := &collectormetrics.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{
+			{Name: "temperature", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{accepted, rejected}}}},
+			{Name: "unsupported", Data: &metricspb.Metric_Summary{Summary: &metricspb.Summary{DataPoints: []*metricspb.SummaryDataPoint{{TimeUnixNano: 3_000_000}}}}},
+		}}},
+	}}}
+	response, err := s.Export(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetPartialSuccess().GetRejectedDataPoints() != 2 {
+		t.Fatalf("partial success = %v", response.GetPartialSuccess())
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := otlpv4.MetricsSubset(req, map[proto.Message]struct{}{accepted: {}})
+	count := 0
+	if err := otlpv4.Replay(context.Background(), root, func(envelope otlpv4.Envelope) error {
+		count++
+		message, err := envelope.Request()
+		if err != nil {
+			return err
+		}
+		if !proto.Equal(message, want) {
+			t.Fatalf("replayed metrics differ: %v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("journal record count = %d", count)
 	}
 }
 

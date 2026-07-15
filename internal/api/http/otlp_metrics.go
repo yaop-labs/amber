@@ -3,10 +3,12 @@ package http
 import (
 	"io"
 	"net/http"
+	"time"
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 
 	"github.com/yaop-labs/amber/internal/otlpmetrics"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 )
 
 func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -27,6 +29,12 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := otlpmetrics.Ingest(h.metricStore, req, h.log)
+	if h.journal != nil && res.AcceptedRequest != nil {
+		if journalErr := h.journal.AppendRequest(otlpv4.SignalMetrics, res.AcceptedRequest, time.Now()); journalErr != nil {
+			writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "metrics replay journal failed; retry request")
+			return
+		}
+	}
 	if err != nil {
 		writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "metrics durable ingest failed; retry request")
 		return
