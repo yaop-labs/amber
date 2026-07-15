@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -129,4 +130,164 @@ func TestS3TransportRejectsInvalidCheckpoint(t *testing.T) {
 	if _, err := transport.Download(context.Background(), "not-a-checkpoint", filepath.Join(t.TempDir(), "snapshot")); err == nil {
 		t.Fatal("Download accepted invalid checkpoint")
 	}
+}
+
+func TestS3TransportDrillRestoresProbesAndCleansWorkspace(t *testing.T) {
+	transport, created := uploadedDrillSnapshot(t)
+	workspace := filepath.Join(t.TempDir(), "drill")
+	result, err := transport.Drill(context.Background(), created.Checkpoint, DrillOptions{
+		Workspace:          workspace,
+		ExpectedDatabaseID: created.Manifest.Database.ID,
+		Probe: func(_ context.Context, restoredRoot string, verified Verification) (SemanticProbe, error) {
+			payload, err := os.ReadFile(filepath.Join(restoredRoot, "payload"))
+			if err != nil {
+				return SemanticProbe{}, err
+			}
+			if string(payload) != "drill payload" {
+				return SemanticProbe{}, fmt.Errorf("payload = %q", payload)
+			}
+			return SemanticProbe{
+				Ready:             true,
+				DatabaseID:        verified.Manifest.Database.ID,
+				RestoreCheckpoint: verified.Checkpoint,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Drill: %v", err)
+	}
+	if result.Verification.Checkpoint != created.Checkpoint || result.DataBytes <= 0 || !result.Probe.Ready {
+		t.Fatalf("drill result = %+v", result)
+	}
+	if result.TotalElapsed <= 0 {
+		t.Fatalf("total elapsed = %s", result.TotalElapsed)
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drill workspace was not removed: %v", err)
+	}
+}
+
+func TestS3TransportDrillRejectsWrongIdentityAndCleansWorkspace(t *testing.T) {
+	transport, created := uploadedDrillSnapshot(t)
+	workspace := filepath.Join(t.TempDir(), "drill")
+	probeCalled := false
+	_, err := transport.Drill(context.Background(), created.Checkpoint, DrillOptions{
+		Workspace:          workspace,
+		ExpectedDatabaseID: "01J00000000000000000000000",
+		Probe: func(context.Context, string, Verification) (SemanticProbe, error) {
+			probeCalled = true
+			return SemanticProbe{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match expected") {
+		t.Fatalf("Drill error = %v", err)
+	}
+	if probeCalled {
+		t.Fatal("semantic probe ran for the wrong database identity")
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drill workspace was not removed: %v", err)
+	}
+}
+
+func TestS3TransportDrillCleansWorkspaceAfterProbeFailure(t *testing.T) {
+	transport, created := uploadedDrillSnapshot(t)
+	workspace := filepath.Join(t.TempDir(), "drill")
+	_, err := transport.Drill(context.Background(), created.Checkpoint, DrillOptions{
+		Workspace: workspace,
+		Probe: func(context.Context, string, Verification) (SemanticProbe, error) {
+			return SemanticProbe{}, errors.New("probe failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "probe failed") {
+		t.Fatalf("Drill error = %v", err)
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drill workspace was not removed: %v", err)
+	}
+}
+
+func TestS3TransportDrillRejectsProbeIdentity(t *testing.T) {
+	transport, created := uploadedDrillSnapshot(t)
+	workspace := filepath.Join(t.TempDir(), "drill")
+	_, err := transport.Drill(context.Background(), created.Checkpoint, DrillOptions{
+		Workspace: workspace,
+		Probe: func(_ context.Context, _ string, verified Verification) (SemanticProbe, error) {
+			return SemanticProbe{
+				Ready:             true,
+				DatabaseID:        "different-database",
+				RestoreCheckpoint: verified.Checkpoint,
+			}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "different database identity") {
+		t.Fatalf("Drill error = %v", err)
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drill workspace was not removed: %v", err)
+	}
+}
+
+func TestS3TransportDrillPreservesExistingWorkspace(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "drill")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	sentinel := filepath.Join(workspace, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	transport := &S3Transport{objects: newMemoryObjectStore()}
+	_, err := transport.Drill(context.Background(), strings.Repeat("a", 64), DrillOptions{
+		Workspace: workspace,
+		Probe: func(context.Context, string, Verification) (SemanticProbe, error) {
+			return SemanticProbe{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "workspace already exists") {
+		t.Fatalf("Drill error = %v", err)
+	}
+	if payload, err := os.ReadFile(sentinel); err != nil || string(payload) != "keep" {
+		t.Fatalf("sentinel = %q, err=%v", payload, err)
+	}
+}
+
+func TestS3TransportDrillCancellationDoesNotCreateWorkspace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	workspace := filepath.Join(t.TempDir(), "drill")
+	transport := &S3Transport{objects: newMemoryObjectStore()}
+	_, err := transport.Drill(ctx, strings.Repeat("a", 64), DrillOptions{
+		Workspace: workspace,
+		Probe: func(context.Context, string, Verification) (SemanticProbe, error) {
+			return SemanticProbe{}, nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Drill error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled drill created workspace: %v", err)
+	}
+}
+
+func uploadedDrillSnapshot(t *testing.T) (*S3Transport, Verification) {
+	t.Helper()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0o750); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("drill payload"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	created, err := Create(context.Background(), source, filepath.Join(root, "snapshot"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	transport := &S3Transport{objects: newMemoryObjectStore(), prefix: "drill-test"}
+	if _, err := transport.Upload(context.Background(), filepath.Join(root, "snapshot")); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	return transport, created
 }

@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,5 +82,34 @@ func TestS3TransportMinIOIntegration(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("restored payload length = %d, want %d", len(got), len(payload))
+	}
+
+	workspace := filepath.Join(root, "drill")
+	drilled, err := transport.Drill(ctx, created.Checkpoint, DrillOptions{
+		Workspace:          workspace,
+		ExpectedDatabaseID: created.Manifest.Database.ID,
+		Probe: func(_ context.Context, restoredRoot string, verified Verification) (SemanticProbe, error) {
+			got, err := os.ReadFile(filepath.Join(restoredRoot, "payload.bin"))
+			if err != nil {
+				return SemanticProbe{}, err
+			}
+			if !bytes.Equal(got, payload) {
+				return SemanticProbe{}, errors.New("drill restored a different payload")
+			}
+			return SemanticProbe{
+				Ready:             true,
+				DatabaseID:        verified.Manifest.Database.ID,
+				RestoreCheckpoint: verified.Checkpoint,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Drill: %v", err)
+	}
+	if drilled.Verification.Checkpoint != created.Checkpoint || !drilled.Probe.Ready {
+		t.Fatalf("drill result = %+v", drilled)
+	}
+	if _, err := os.Lstat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drill workspace was not removed: %v", err)
 	}
 }
