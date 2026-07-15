@@ -11,7 +11,9 @@ import (
 
 	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 func TestStatusReportsDegradedReasonsAndClosing(t *testing.T) {
@@ -352,6 +354,63 @@ func TestCloseContinuesAfterBatchErrorAndReleasesDataDir(t *testing.T) {
 	if err := reopened.Close(closeCtx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRuntimeOTLPJournalModes(t *testing.T) {
+	t.Run("new root enables v4", func(t *testing.T) {
+		root := t.TempDir()
+		stack, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stack.OTLPJournal == nil || statusHasReason(stack.Status(), "otlp_v3_compatibility", 1) {
+			t.Fatalf("new-root status = %+v journal=%v", stack.Status(), stack.OTLPJournal)
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stack.Close(closeCtx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(root, otlpv4.DirectoryName, otlpv4.FormatFileName)); err != nil {
+			t.Fatalf("v4 format manifest: %v", err)
+		}
+	})
+
+	t.Run("legacy root stays compatibility-only", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := dbmeta.LoadOrCreate(root); err != nil {
+			t.Fatal(err)
+		}
+		manager, err := storage.OpenSegmentManager(filepath.Join(root, "logs"), storage.DefaultRotationPolicy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Close(); err != nil {
+			t.Fatal(err)
+		}
+		stack, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stack.OTLPJournal != nil || !statusHasReason(stack.Status(), "otlp_v3_compatibility", 1) {
+			t.Fatalf("legacy status = %+v journal=%v", stack.Status(), stack.OTLPJournal)
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stack.Close(closeCtx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("invalid journal path blocks open", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, otlpv4.DirectoryName), []byte("invalid"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}}); err == nil {
+			t.Fatal("New() error = nil for invalid journal path")
+		}
+	})
 }
 
 func flushBatcher(t *testing.T, stack *Stack) {

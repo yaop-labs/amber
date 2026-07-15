@@ -19,8 +19,9 @@ import (
 )
 
 type item struct {
-	log  *model.LogEntry
-	span *model.SpanEntry
+	log          *model.LogEntry
+	span         *model.SpanEntry
+	nativeReplay bool
 	// barrier marks a Flush sentinel: the worker flushes the pending batch,
 	// then reports the lane's sticky outcome. Never carries data.
 	barrier chan error
@@ -59,6 +60,7 @@ type Batcher struct {
 	spanFailures     atomic.Uint64
 	guard            *CardinalityGuard
 	cacheInvalidator CacheInvalidator
+	replaySink       ReplaySink
 
 	// admitMu makes the open->closing transition atomic with respect to queue
 	// admission. Once beginClose returns, every Send that held the read lock has
@@ -137,6 +139,13 @@ type Deps struct {
 	Guard       *CardinalityGuard
 	Invalidator CacheInvalidator
 	Logger      *slog.Logger
+	ReplaySink  ReplaySink
+}
+
+// ReplaySink records native model entries after their query projection is durable.
+type ReplaySink interface {
+	AppendNormalizedLogs([]model.LogEntry) error
+	AppendNormalizedSpans([]model.SpanEntry) error
 }
 
 // Config tunes the batcher. The top-level fields are defaults; Logs and Spans
@@ -187,12 +196,16 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		spanBreaker:      spanCfg.breakerThreshold,
 		guard:            deps.Guard,
 		cacheInvalidator: deps.Invalidator,
+		replaySink:       deps.ReplaySink,
 		accepting:        true,
 		closeDone:        make(chan struct{}),
 		logM:             newKindMetrics("log"),
 		spanM:            newKindMetrics("span"),
 	}
 }
+
+// SetReplaySink attaches the native replay sink before Start.
+func (b *Batcher) SetReplaySink(sink ReplaySink) { b.replaySink = sink }
 
 func resolveLaneConfig(base Config, lane LaneConfig) laneConfig {
 	batchSize := base.BatchSize
@@ -268,6 +281,16 @@ func (b *Batcher) Wait() {
 // ErrCardinality when the entry is rejected; a nil return means queued, not yet
 // durable (the worker writes and fsyncs it).
 func (b *Batcher) SendLog(entry model.LogEntry) error {
+	return b.sendLog(entry, true)
+}
+
+// SendOTLPLog enqueues a log whose original OTLP representation is recorded
+// by the transport after its durability barrier.
+func (b *Batcher) SendOTLPLog(entry model.LogEntry) error {
+	return b.sendLog(entry, false)
+}
+
+func (b *Batcher) sendLog(entry model.LogEntry, nativeReplay bool) error {
 	b.admitMu.RLock()
 	defer b.admitMu.RUnlock()
 	if !b.accepting {
@@ -287,7 +310,7 @@ func (b *Batcher) SendLog(entry model.LogEntry) error {
 	}
 	reason, admitted := b.guard.Admit(entry.Service, entry.Attrs, func() bool {
 		select {
-		case b.logQueue <- item{log: &entry}:
+		case b.logQueue <- item{log: &entry, nativeReplay: nativeReplay}:
 			return true
 		default:
 			return false
@@ -313,6 +336,15 @@ func (b *Batcher) SendLog(entry model.LogEntry) error {
 
 // SendSpan enqueues a span, mirroring SendLog's reject errors and async semantics.
 func (b *Batcher) SendSpan(span model.SpanEntry) error {
+	return b.sendSpan(span, true)
+}
+
+// SendOTLPSpan is SendOTLPLog for a trace span.
+func (b *Batcher) SendOTLPSpan(span model.SpanEntry) error {
+	return b.sendSpan(span, false)
+}
+
+func (b *Batcher) sendSpan(span model.SpanEntry, nativeReplay bool) error {
 	b.admitMu.RLock()
 	defer b.admitMu.RUnlock()
 	if !b.accepting {
@@ -332,7 +364,7 @@ func (b *Batcher) SendSpan(span model.SpanEntry) error {
 	}
 	reason, admitted := b.guard.Admit(span.Service, span.Attrs, func() bool {
 		select {
-		case b.spanQueue <- item{span: &span}:
+		case b.spanQueue <- item{span: &span, nativeReplay: nativeReplay}:
 			return true
 		default:
 			return false
@@ -538,14 +570,14 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) error {
 		return nil
 	}
 
-	logItems, logEntries, logErr := b.prepareLogBatch(batch)
+	logItems, logEntries, replayLogs, logErr := b.prepareLogBatch(batch)
 	if len(logItems) > 0 {
-		logErr = errors.Join(logErr, b.writeLogBatch(logItems, logEntries))
+		logErr = errors.Join(logErr, b.writeLogBatch(logItems, logEntries, replayLogs))
 	}
 
-	spanItems, spanEntries, spanErr := b.prepareSpanBatch(batch)
+	spanItems, spanEntries, replaySpans, spanErr := b.prepareSpanBatch(batch)
 	if len(spanItems) > 0 {
-		spanErr = errors.Join(spanErr, b.writeSpanBatch(spanItems, spanEntries))
+		spanErr = errors.Join(spanErr, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
 	}
 	return errors.Join(logErr, spanErr)
 }
@@ -554,27 +586,28 @@ func (b *Batcher) processLogBatch(_ context.Context, batch []item) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	logItems, logEntries, err := b.prepareLogBatch(batch)
+	logItems, logEntries, replayLogs, err := b.prepareLogBatch(batch)
 	if len(logItems) == 0 {
 		return err
 	}
-	return errors.Join(err, b.writeLogBatch(logItems, logEntries))
+	return errors.Join(err, b.writeLogBatch(logItems, logEntries, replayLogs))
 }
 
 func (b *Batcher) processSpanBatch(_ context.Context, batch []item) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	spanItems, spanEntries, err := b.prepareSpanBatch(batch)
+	spanItems, spanEntries, replaySpans, err := b.prepareSpanBatch(batch)
 	if len(spanItems) == 0 {
 		return err
 	}
-	return errors.Join(err, b.writeSpanBatch(spanItems, spanEntries))
+	return errors.Join(err, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
 }
 
-func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.LogEntry, error) {
+func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.LogEntry, []model.LogEntry, error) {
 	logItems := make([]storage.BatchItem, 0, len(batch))
 	var logEntries []*model.LogEntry
+	var replayEntries []model.LogEntry
 	var errs []error
 	for _, it := range batch {
 		if it.log == nil {
@@ -601,13 +634,17 @@ func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.L
 			}
 			logEntries = append(logEntries, it.log)
 		}
+		if b.replaySink != nil && it.nativeReplay {
+			replayEntries = append(replayEntries, *it.log)
+		}
 	}
-	return logItems, logEntries, errors.Join(errs...)
+	return logItems, logEntries, replayEntries, errors.Join(errs...)
 }
 
-func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.SpanEntry, error) {
+func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.SpanEntry, []model.SpanEntry, error) {
 	spanItems := make([]storage.BatchItem, 0, len(batch))
 	var spanEntries []*model.SpanEntry
+	var replayEntries []model.SpanEntry
 	var errs []error
 	for _, it := range batch {
 		if it.span == nil {
@@ -634,11 +671,14 @@ func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.
 			}
 			spanEntries = append(spanEntries, it.span)
 		}
+		if b.replaySink != nil && it.nativeReplay {
+			replayEntries = append(replayEntries, *it.span)
+		}
 	}
-	return spanItems, spanEntries, errors.Join(errs...)
+	return spanItems, spanEntries, replayEntries, errors.Join(errs...)
 }
 
-func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry) error {
+func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry, replayEntries []model.LogEntry) error {
 	targetMeta, hasTarget := b.logManager.ActiveSegmentMeta()
 	if err := b.logManager.WriteBatch(logItems); err != nil {
 		b.logM.writeFailed.Add(uint64(len(logItems)))
@@ -651,6 +691,14 @@ func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*mode
 		b.log.Error("log segment flush failed", "err", err, "count", len(logItems))
 		b.recordLogFailure()
 		return err
+	}
+	if len(replayEntries) != 0 {
+		if err := b.replaySink.AppendNormalizedLogs(replayEntries); err != nil {
+			b.logM.writeFailed.Add(uint64(len(replayEntries)))
+			b.log.Error("native log replay write failed", "err", err, "count", len(replayEntries))
+			b.recordLogFailure()
+			return err
+		}
 	}
 	b.logM.durable.Add(uint64(len(logItems)))
 	if hasTarget {
@@ -667,7 +715,7 @@ func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*mode
 	return nil
 }
 
-func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry) error {
+func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*model.SpanEntry, replayEntries []model.SpanEntry) error {
 	targetMeta, hasTarget := b.spanManager.ActiveSegmentMeta()
 	if err := b.spanManager.WriteBatch(spanItems); err != nil {
 		b.spanM.writeFailed.Add(uint64(len(spanItems)))
@@ -680,6 +728,14 @@ func (b *Batcher) writeSpanBatch(spanItems []storage.BatchItem, spanEntries []*m
 		b.log.Error("span segment flush failed", "err", err, "count", len(spanItems))
 		b.recordSpanFailure()
 		return err
+	}
+	if len(replayEntries) != 0 {
+		if err := b.replaySink.AppendNormalizedSpans(replayEntries); err != nil {
+			b.spanM.writeFailed.Add(uint64(len(replayEntries)))
+			b.log.Error("native span replay write failed", "err", err, "count", len(replayEntries))
+			b.recordSpanFailure()
+			return err
+		}
 	}
 	b.spanM.durable.Add(uint64(len(spanItems)))
 	if hasTarget {

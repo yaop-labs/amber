@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -16,8 +17,11 @@ import (
 
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
@@ -26,6 +30,7 @@ import (
 type OTLPHandler struct {
 	batcher        *ingest.Batcher
 	metricStore    *metricsengine.Store // nil when metrics are disabled
+	journal        *otlpv4.Journal
 	log            *slog.Logger
 	maxRequestSize int64
 }
@@ -124,16 +129,27 @@ func (h *OTLPHandler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	var rejected int64
 	var transient error
+	accepted := make(map[*logspb.LogRecord]struct{})
 	for _, rl := range req.ResourceLogs {
+		if rl == nil {
+			continue
+		}
 		service, host := ingest.ExtractResource(rl.Resource.GetAttributes())
 		for _, sl := range rl.ScopeLogs {
+			if sl == nil {
+				continue
+			}
 			for _, lr := range sl.LogRecords {
+				if lr == nil {
+					rejected++
+					continue
+				}
 				entry, err := ingest.OTLPLogToEntry(lr, service, host)
 				if err != nil {
 					rejected++
 					continue
 				}
-				if err := h.batcher.SendLog(entry); err != nil {
+				if err := h.batcher.SendOTLPLog(entry); err != nil {
 					if retryableHTTPIngestError(err) {
 						transient = err
 					} else {
@@ -144,12 +160,19 @@ func (h *OTLPHandler) handleLogs(w http.ResponseWriter, r *http.Request) {
 					}
 					continue
 				}
+				accepted[lr] = struct{}{}
 			}
 		}
 	}
 
-	if err := h.batcher.FlushLogs(r.Context()); err != nil && transient == nil {
-		transient = err
+	flushErr := h.batcher.FlushLogs(r.Context())
+	if flushErr != nil && transient == nil {
+		transient = flushErr
+	}
+	if flushErr == nil && h.journal != nil && len(accepted) != 0 {
+		if err := h.journal.AppendRequest(otlpv4.SignalLogs, otlpv4.LogsSubset(req, accepted), time.Now()); err != nil {
+			transient = err
+		}
 	}
 	if transient != nil {
 		writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "durable ingest handoff failed; retry request")
@@ -184,16 +207,27 @@ func (h *OTLPHandler) handleTraces(w http.ResponseWriter, r *http.Request) {
 
 	var rejected int64
 	var transient error
+	accepted := make(map[*tracepb.Span]struct{})
 	for _, rs := range req.ResourceSpans {
+		if rs == nil {
+			continue
+		}
 		service, _ := ingest.ExtractResource(rs.Resource.GetAttributes())
 		for _, ss := range rs.ScopeSpans {
+			if ss == nil {
+				continue
+			}
 			for _, sp := range ss.Spans {
+				if sp == nil {
+					rejected++
+					continue
+				}
 				span, err := ingest.OTLPSpanToEntry(sp, service)
 				if err != nil {
 					rejected++
 					continue
 				}
-				if err := h.batcher.SendSpan(span); err != nil {
+				if err := h.batcher.SendOTLPSpan(span); err != nil {
 					if retryableHTTPIngestError(err) {
 						transient = err
 					} else {
@@ -204,12 +238,19 @@ func (h *OTLPHandler) handleTraces(w http.ResponseWriter, r *http.Request) {
 					}
 					continue
 				}
+				accepted[sp] = struct{}{}
 			}
 		}
 	}
 
-	if err := h.batcher.FlushSpans(r.Context()); err != nil && transient == nil {
-		transient = err
+	flushErr := h.batcher.FlushSpans(r.Context())
+	if flushErr != nil && transient == nil {
+		transient = flushErr
+	}
+	if flushErr == nil && h.journal != nil && len(accepted) != 0 {
+		if err := h.journal.AppendRequest(otlpv4.SignalTraces, otlpv4.TracesSubset(req, accepted), time.Now()); err != nil {
+			transient = err
+		}
 	}
 	if transient != nil {
 		writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "durable ingest handoff failed; retry request")

@@ -15,9 +15,12 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/otlpv4"
+	"github.com/yaop-labs/amber/internal/storage"
 )
 
 type fakeSender struct {
@@ -29,13 +32,15 @@ type fakeSender struct {
 	flushSpanErr  error
 }
 
-func (f fakeSender) SendLog(model.LogEntry) error     { return f.logErr }
-func (f fakeSender) SendSpan(model.SpanEntry) error   { return f.spanErr }
-func (f fakeSender) IsBreakerOpen() bool              { return f.logBreakerOn || f.spanBreakerOn }
-func (f fakeSender) IsLogBreakerOpen() bool           { return f.logBreakerOn }
-func (f fakeSender) IsSpanBreakerOpen() bool          { return f.spanBreakerOn }
-func (f fakeSender) FlushLogs(context.Context) error  { return f.flushLogErr }
-func (f fakeSender) FlushSpans(context.Context) error { return f.flushSpanErr }
+func (f fakeSender) SendLog(model.LogEntry) error       { return f.logErr }
+func (f fakeSender) SendSpan(model.SpanEntry) error     { return f.spanErr }
+func (f fakeSender) SendOTLPLog(model.LogEntry) error   { return f.logErr }
+func (f fakeSender) SendOTLPSpan(model.SpanEntry) error { return f.spanErr }
+func (f fakeSender) IsBreakerOpen() bool                { return f.logBreakerOn || f.spanBreakerOn }
+func (f fakeSender) IsLogBreakerOpen() bool             { return f.logBreakerOn }
+func (f fakeSender) IsSpanBreakerOpen() bool            { return f.spanBreakerOn }
+func (f fakeSender) FlushLogs(context.Context) error    { return f.flushLogErr }
+func (f fakeSender) FlushSpans(context.Context) error   { return f.flushSpanErr }
 
 func TestLogsExportReturnsUnavailableOnRetryableRejection(t *testing.T) {
 	s := &logsServer{
@@ -135,5 +140,52 @@ func TestTracesExportReturnsPartialSuccessOnRejectedSpans(t *testing.T) {
 	}
 	if got := resp.GetPartialSuccess().GetErrorMessage(); got == "" {
 		t.Fatal("expected partial success error message")
+	}
+}
+
+func TestTracesExportJournalRetainsAcceptedSubset(t *testing.T) {
+	root := t.TempDir()
+	journal, err := otlpv4.OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &tracesServer{batcher: fakeSender{}, journal: journal, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	accepted := &tracepb.Span{
+		TraceId: []byte("0123456789abcdef"), SpanId: []byte("span-123"), ParentSpanId: []byte("parent-1"),
+		Name: "GET /rich", Kind: tracepb.Span_SPAN_KIND_SERVER, StartTimeUnixNano: 1, EndTimeUnixNano: 2,
+		Events: []*tracepb.Span_Event{{TimeUnixNano: 2, Name: "done"}},
+	}
+	rejected := proto.Clone(accepted).(*tracepb.Span)
+	rejected.SpanId = []byte{1}
+	req := &collectortrace.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		SchemaUrl: "https://example.test/resource", ScopeSpans: []*tracepb.ScopeSpans{{SchemaUrl: "https://example.test/scope", Spans: []*tracepb.Span{accepted, rejected}}},
+	}}}
+	response, err := s.Export(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetPartialSuccess().GetRejectedSpans() != 1 {
+		t.Fatalf("partial success = %v", response.GetPartialSuccess())
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := otlpv4.TracesSubset(req, map[*tracepb.Span]struct{}{accepted: {}})
+	count := 0
+	if err := otlpv4.Replay(context.Background(), root, func(envelope otlpv4.Envelope) error {
+		count++
+		message, err := envelope.Request()
+		if err != nil {
+			return err
+		}
+		if !proto.Equal(message, want) {
+			t.Fatalf("replayed traces differ: %v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("journal record count = %d", count)
 	}
 }

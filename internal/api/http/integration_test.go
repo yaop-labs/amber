@@ -28,6 +28,7 @@ import (
 	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -40,6 +41,8 @@ type apiHarness struct {
 	logSparse   *index.SparseIndex
 	spanSparse  *index.SparseIndex
 	cancel      context.CancelFunc
+	root        string
+	journal     *otlpv4.Journal
 }
 
 func setupAPIHarness(t *testing.T) *apiHarness {
@@ -66,15 +69,20 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 	ctx, cancel := context.WithCancel(context.Background())
 	batcher := ingest.NewBatcher(ingest.Deps{LogManager: logManager, SpanManager: spanManager, LogSparse: logSparse, SpanSparse: spanSparse, Indexer: exec.ActiveIndex(), Logger: log}, ingest.Config{BatchSize: 16, BatchTimeout: 2 * time.Millisecond, QueueSize: 256})
 	batcher.Start(ctx)
+	journal, err := otlpv4.OpenJournal(dir, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("open OTLP journal: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	var ready atomic.Bool
 	ready.Store(true)
-	RegisterRoutes(mux, RoutesDeps{Batcher: batcher, Executor: exec, LogManager: logManager, LogSparse: logSparse, IsReady: ready.Load, Logger: log}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
+	RegisterRoutes(mux, RoutesDeps{Batcher: batcher, Executor: exec, LogManager: logManager, LogSparse: logSparse, OTLPJournal: journal, IsReady: ready.Load, Logger: log}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
 
 	t.Cleanup(func() {
 		cancel()
 		batcher.Wait()
+		_ = journal.Close()
 		_ = logSparse.Save(logDir)
 		_ = spanSparse.Save(spanDir)
 		_ = logManager.Close()
@@ -89,6 +97,8 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 		logSparse:   logSparse,
 		spanSparse:  spanSparse,
 		cancel:      cancel,
+		root:        dir,
+		journal:     journal,
 	}
 }
 
@@ -393,6 +403,61 @@ func TestRoutes_OTLPJSONResponseAndRetryableFailure(t *testing.T) {
 	}
 	if rpcStatus.Code != int32(codesUnavailable) || rpcStatus.Message == "" {
 		t.Fatalf("retryable OTLP status code=%d message=%q", rpcStatus.Code, rpcStatus.Message)
+	}
+}
+
+func TestRoutes_OTLPJournalRetainsOnlyAcceptedRichLog(t *testing.T) {
+	h := setupAPIHarness(t)
+	accepted := &logspb.LogRecord{
+		TimeUnixNano: 123456789, ObservedTimeUnixNano: 123456999,
+		SeverityNumber: logspb.SeverityNumber_SEVERITY_NUMBER_WARN2, SeverityText: "custom-warning",
+		Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{
+			Values: []*commonpb.KeyValue{{Key: "message", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "rich"}}}},
+		}}},
+		Attributes: []*commonpb.KeyValue{{Key: "retry", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}}},
+		TraceId:    bytes.Repeat([]byte{1}, 16), SpanId: bytes.Repeat([]byte{2}, 8), Flags: 1,
+	}
+	rejected := proto.Clone(accepted).(*logspb.LogRecord)
+	rejected.TraceId = []byte{1}
+	req := &collectorlogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		Resource:  &resourcepb.Resource{Attributes: []*commonpb.KeyValue{{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "api"}}}}},
+		SchemaUrl: "https://example.test/resource", ScopeLogs: []*logspb.ScopeLogs{{SchemaUrl: "https://example.test/scope", LogRecords: []*logspb.LogRecord{accepted, rejected}}},
+	}}}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := h.do(t, http.MethodPost, "/v1/logs", body, map[string]string{"Content-Type": "application/x-protobuf"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	var response collectorlogs.ExportLogsServiceResponse
+	if err := proto.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.GetPartialSuccess().GetRejectedLogRecords() != 1 {
+		t.Fatalf("partial success = %v", response.GetPartialSuccess())
+	}
+	if err := h.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := otlpv4.LogsSubset(req, map[*logspb.LogRecord]struct{}{accepted: {}})
+	count := 0
+	if err := otlpv4.Replay(context.Background(), h.root, func(envelope otlpv4.Envelope) error {
+		count++
+		message, err := envelope.Request()
+		if err != nil {
+			return err
+		}
+		if envelope.Fidelity() != otlpv4.FidelityOTLP || !proto.Equal(message, want) {
+			t.Fatalf("journal replay differs: %v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("journal record count = %d", count)
 	}
 }
 

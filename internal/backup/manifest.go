@@ -17,7 +17,7 @@ import (
 
 const (
 	// SnapshotFormatVersion is the current backup manifest format.
-	SnapshotFormatVersion = 1
+	SnapshotFormatVersion = 2
 	ManifestFileName      = "manifest.json"
 	CompletionFileName    = "COMPLETE"
 	DataDirectoryName     = "data"
@@ -34,10 +34,11 @@ type Manifest struct {
 
 // CheckpointVector records the consistency boundary for every Amber engine.
 type CheckpointVector struct {
-	Logs     EngineCheckpoint `json:"logs"`
-	Traces   EngineCheckpoint `json:"traces"`
-	Metrics  EngineCheckpoint `json:"metrics"`
-	Profiles EngineCheckpoint `json:"profiles"`
+	Logs       EngineCheckpoint `json:"logs"`
+	Traces     EngineCheckpoint `json:"traces"`
+	Metrics    EngineCheckpoint `json:"metrics"`
+	OTLPReplay EngineCheckpoint `json:"otlp_v4"`
+	Profiles   EngineCheckpoint `json:"profiles"`
 }
 
 // EngineCheckpoint names the files that define one engine's offline state.
@@ -88,7 +89,7 @@ func parseManifest(payload []byte) (Manifest, error) {
 }
 
 func (m Manifest) validate() error {
-	if m.SnapshotFormatVersion != SnapshotFormatVersion {
+	if m.SnapshotFormatVersion < 1 || m.SnapshotFormatVersion > SnapshotFormatVersion {
 		return fmt.Errorf("backup: unsupported snapshot format version %d", m.SnapshotFormatVersion)
 	}
 	if err := m.Database.Validate(); err != nil {
@@ -136,6 +137,7 @@ func (m Manifest) validate() error {
 		{name: "logs", prefix: "logs", checkpoint: m.Checkpoints.Logs},
 		{name: "traces", prefix: "spans", checkpoint: m.Checkpoints.Traces},
 		{name: "metrics", prefix: "metrics", checkpoint: m.Checkpoints.Metrics},
+		{name: "otlp_v4", prefix: "otlp_v4", checkpoint: m.Checkpoints.OTLPReplay},
 		{name: "profiles", prefix: "profiles", checkpoint: m.Checkpoints.Profiles},
 	}
 	for _, item := range checkpoints {

@@ -1,0 +1,382 @@
+package otlpv4
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/yaop-labs/amber/internal/metricsengine/engine"
+	memodel "github.com/yaop-labs/amber/internal/metricsengine/model"
+	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/storage"
+	"google.golang.org/protobuf/proto"
+)
+
+const (
+	// DirectoryName is the database-root directory containing the canonical
+	// OTLP replay journal.
+	DirectoryName = "otlp_v4"
+	// FormatFileName identifies the journal format independently from the
+	// database identity and the reusable segment container version.
+	FormatFileName = "FORMAT.json"
+
+	journalFormatVersion = 1
+)
+
+// Journal appends canonical OTLP envelopes through Amber's WAL-backed segment
+// durability protocol. The segment format remains a container detail; every
+// record is independently identified and verified as AOT4.
+type Journal struct {
+	manager   *storage.SegmentManager
+	closeOnce sync.Once
+	closeErr  error
+}
+
+type formatManifest struct {
+	JournalFormatVersion int    `json:"journal_format_version"`
+	EnvelopeMagic        string `json:"envelope_magic"`
+	EnvelopeVersion      uint16 `json:"envelope_version"`
+}
+
+// OpenJournal opens or creates the canonical journal below dataRoot.
+func OpenJournal(dataRoot string, policy storage.RotationPolicy) (*Journal, error) {
+	dir := filepath.Join(dataRoot, DirectoryName)
+	if err := os.MkdirAll(dir, 0o750); err != nil { //nolint:gosec
+		return nil, fmt.Errorf("otlpv4: create journal directory: %w", err)
+	}
+	if err := ensureFormatManifest(dir); err != nil {
+		return nil, err
+	}
+	manager, err := storage.OpenSegmentManager(dir, policy)
+	if err != nil {
+		return nil, fmt.Errorf("otlpv4: open journal storage: %w", err)
+	}
+	return &Journal{manager: manager}, nil
+}
+
+// Append durably records one envelope before the caller acknowledges it.
+func (j *Journal) Append(envelope Envelope, acceptedAt time.Time) error {
+	if acceptedAt.IsZero() {
+		return errors.New("otlpv4: accepted time is required")
+	}
+	record, err := envelope.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	if err := j.manager.Write(record, acceptedAt.UnixNano()); err != nil {
+		return fmt.Errorf("otlpv4: append journal: %w", err)
+	}
+	return nil
+}
+
+// AppendRequest wraps and appends one accepted original OTLP request.
+func (j *Journal) AppendRequest(signal Signal, request proto.Message, acceptedAt time.Time) error {
+	envelope, err := New(signal, FidelityOTLP, request)
+	if err != nil {
+		return err
+	}
+	return j.Append(envelope, acceptedAt)
+}
+
+// AppendNormalizedLogs records native logs as one envelope per database entry.
+func (j *Journal) AppendNormalizedLogs(entries []model.LogEntry) error {
+	items := make([]storage.BatchItem, 0, len(entries))
+	for _, entry := range entries {
+		envelope, err := NormalizedLogNative(entry)
+		if err != nil {
+			return err
+		}
+		record, err := envelope.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		items = append(items, storage.BatchItem{Data: record, TS: entry.Timestamp.UnixNano()})
+	}
+	if err := j.manager.WriteBatch(items); err != nil {
+		return fmt.Errorf("otlpv4: append normalized logs: %w", err)
+	}
+	return nil
+}
+
+// AppendNormalizedSpans records native spans as one envelope per database entry.
+func (j *Journal) AppendNormalizedSpans(entries []model.SpanEntry) error {
+	items := make([]storage.BatchItem, 0, len(entries))
+	for _, entry := range entries {
+		envelope, err := NormalizedSpanNative(entry)
+		if err != nil {
+			return err
+		}
+		record, err := envelope.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		items = append(items, storage.BatchItem{Data: record, TS: entry.StartTime.UnixNano()})
+	}
+	if err := j.manager.WriteBatch(items); err != nil {
+		return fmt.Errorf("otlpv4: append normalized spans: %w", err)
+	}
+	return nil
+}
+
+// AppendNormalizedMetricSamples records native scalar samples.
+func (j *Journal) AppendNormalizedMetricSamples(samples []memodel.Sample) error {
+	items := make([]storage.BatchItem, 0, len(samples))
+	for _, sample := range samples {
+		envelope, err := NormalizedMetricSampleNative(sample)
+		if err != nil {
+			return err
+		}
+		record, err := envelope.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		items = append(items, storage.BatchItem{Data: record, TS: sample.Timestamp * int64(time.Millisecond)})
+	}
+	if err := j.manager.WriteBatch(items); err != nil {
+		return fmt.Errorf("otlpv4: append normalized metric samples: %w", err)
+	}
+	return nil
+}
+
+// AppendNormalizedMetricFloat records the original scaled-float native call.
+func (j *Journal) AppendNormalizedMetricFloat(labels memodel.LabelSet, typ memodel.MetricType, timestamp int64, value float64, scale int64) error {
+	stored := int64(math.Round(value * float64(scale)))
+	normalizedLabels := make(memodel.LabelSet, 0, len(labels)+1)
+	for _, label := range labels {
+		if label.Name != scaleLabel {
+			normalizedLabels = append(normalizedLabels, label)
+		}
+	}
+	normalizedLabels = append(normalizedLabels, memodel.Label{Name: scaleLabel, Value: strconv.FormatInt(scale, 10)})
+	return j.AppendNormalizedMetricSamples([]memodel.Sample{{Labels: normalizedLabels, Type: typ, Timestamp: timestamp, Value: stored}})
+}
+
+// AppendNormalizedMetricSketches records native histogram ticks.
+func (j *Journal) AppendNormalizedMetricSketches(samples []engine.SketchSample) error {
+	items := make([]storage.BatchItem, 0, len(samples))
+	for _, sample := range samples {
+		envelope, err := NormalizedMetricSketchNative(sample)
+		if err != nil {
+			return err
+		}
+		record, err := envelope.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		items = append(items, storage.BatchItem{Data: record, TS: sample.Timestamp * int64(time.Millisecond)})
+	}
+	if err := j.manager.WriteBatch(items); err != nil {
+		return fmt.Errorf("otlpv4: append normalized metric sketches: %w", err)
+	}
+	return nil
+}
+
+// Close seals the current journal segment and closes its WAL.
+func (j *Journal) Close() error {
+	j.closeOnce.Do(func() {
+		j.closeErr = j.manager.Close()
+	})
+	return j.closeErr
+}
+
+// Replay scans a closed journal in append order. It validates the journal
+// manifest, segment container, AOT4 checksum, and protobuf payload before fn is
+// called. Replay is intentionally offline so its end boundary cannot race
+// ingest or segment rotation.
+func Replay(ctx context.Context, dataRoot string, fn func(Envelope) error) error {
+	if fn == nil {
+		return errors.New("otlpv4: replay callback is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir := filepath.Join(dataRoot, DirectoryName)
+	if err := loadFormatManifest(dir); err != nil {
+		return err
+	}
+	paths, err := closedJournalSegmentPaths(dir)
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		reader, err := storage.OpenSegmentReader(path, nil)
+		if err != nil {
+			return fmt.Errorf("otlpv4: open journal segment %s: %w", filepath.Base(path), err)
+		}
+		scanErr := reader.Scan(func(record []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			envelope, err := Parse(record)
+			if err != nil {
+				return fmt.Errorf("otlpv4: parse journal record: %w", err)
+			}
+			return fn(envelope)
+		})
+		closeErr := reader.Close()
+		if scanErr != nil {
+			return fmt.Errorf("otlpv4: replay journal segment %s: %w", filepath.Base(path), scanErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("otlpv4: close journal segment %s: %w", filepath.Base(path), closeErr)
+		}
+	}
+	return nil
+}
+
+func ensureFormatManifest(dir string) error {
+	path := filepath.Join(dir, FormatFileName)
+	if _, err := os.Lstat(path); err == nil {
+		return loadFormatManifest(dir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("otlpv4: inspect format manifest: %w", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("otlpv4: inspect journal directory: %w", err)
+	}
+	tmp := path + ".tmp"
+	for _, entry := range entries {
+		if entry.Name() != FormatFileName+".tmp" || entry.IsDir() {
+			return errors.New("otlpv4: journal has data but no format manifest")
+		}
+	}
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("otlpv4: remove stale format manifest: %w", err)
+	}
+	manifest := formatManifest{
+		JournalFormatVersion: journalFormatVersion,
+		EnvelopeMagic:        magic,
+		EnvelopeVersion:      FormatVersion,
+	}
+	payload, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("otlpv4: encode format manifest: %w", err)
+	}
+	payload = append(payload, '\n')
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("otlpv4: create format manifest: %w", err)
+	}
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("otlpv4: write format manifest: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("otlpv4: sync format manifest: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("otlpv4: close format manifest: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("otlpv4: publish format manifest: %w", err)
+	}
+	removeTmp = false
+	directory, err := os.Open(dir) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("otlpv4: open journal directory for sync: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return fmt.Errorf("otlpv4: sync journal directory: %w", err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("otlpv4: close journal directory: %w", err)
+	}
+	return nil
+}
+
+func loadFormatManifest(dir string) error {
+	path := filepath.Join(dir, FormatFileName)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("otlpv4: inspect format manifest: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("otlpv4: format manifest is not a regular file")
+	}
+	payload, err := os.ReadFile(path) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("otlpv4: read format manifest: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var manifest formatManifest
+	if err := decoder.Decode(&manifest); err != nil {
+		return fmt.Errorf("otlpv4: parse format manifest: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("otlpv4: parse format manifest: trailing data")
+	}
+	if manifest.JournalFormatVersion != journalFormatVersion ||
+		manifest.EnvelopeMagic != magic || manifest.EnvelopeVersion != FormatVersion {
+		return fmt.Errorf(
+			"otlpv4: unsupported journal format %d/%q/%d",
+			manifest.JournalFormatVersion, manifest.EnvelopeMagic, manifest.EnvelopeVersion,
+		)
+	}
+	return nil
+}
+
+func closedJournalSegmentPaths(dir string) ([]string, error) {
+	walInfo, err := os.Lstat(filepath.Join(dir, "amber.wal"))
+	if err != nil {
+		return nil, fmt.Errorf("otlpv4: inspect journal WAL: %w", err)
+	}
+	if !walInfo.Mode().IsRegular() || walInfo.Size() != 0 {
+		return nil, errors.New("otlpv4: journal WAL is not cleanly closed")
+	}
+	payload, err := readRegular(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		return nil, fmt.Errorf("otlpv4: read journal storage metadata: %w", err)
+	}
+	var meta storage.StoreMeta
+	if err := decodeStrictJSON(payload, &meta); err != nil {
+		return nil, fmt.Errorf("otlpv4: parse journal storage metadata: %w", err)
+	}
+	segments := append([]storage.SegmentMeta(nil), meta.Segments...)
+	sort.Slice(segments, func(i, j int) bool { return segments[i].ID < segments[j].ID })
+	paths := make([]string, 0, len(segments))
+	seen := make(map[uint32]struct{}, len(segments))
+	for _, segment := range segments {
+		parsedID, ok := storage.ParseSegmentID(segment.FileName)
+		if !ok || parsedID != segment.ID || !segment.Sealed || segment.DeletePending || !segment.HasLocalCopy() {
+			return nil, fmt.Errorf("otlpv4: invalid closed journal segment %q", segment.FileName)
+		}
+		if _, duplicate := seen[segment.ID]; duplicate {
+			return nil, fmt.Errorf("otlpv4: duplicate journal segment %d", segment.ID)
+		}
+		seen[segment.ID] = struct{}{}
+		path := filepath.Join(dir, segment.FileName)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, fmt.Errorf("otlpv4: inspect journal segment %s: %w", segment.FileName, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("otlpv4: journal segment %s is not regular", segment.FileName)
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}

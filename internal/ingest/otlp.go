@@ -16,6 +16,9 @@ import (
 // ExtractResource pulls service.name and host.name from OTLP resource attributes.
 func ExtractResource(attrs []*commonpb.KeyValue) (service, host string) {
 	for _, kv := range attrs {
+		if kv == nil {
+			continue
+		}
 		switch kv.Key {
 		case "service.name":
 			service = kv.Value.GetStringValue()
@@ -41,6 +44,9 @@ func OTLPLogToEntry(lr *logspb.LogRecord, service, host string) (model.LogEntry,
 
 	attrs := make([]model.Attr, 0, len(lr.Attributes))
 	for _, kv := range lr.Attributes {
+		if kv == nil {
+			continue
+		}
 		attrs = append(attrs, model.Attr{
 			Key:   kv.Key,
 			Value: AnyValueToString(kv.Value),
@@ -102,6 +108,9 @@ func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) 
 	entry.Status = OTLPStatusToModel(sp.Status)
 
 	for _, kv := range sp.Attributes {
+		if kv == nil {
+			continue
+		}
 		entry.Attrs = append(entry.Attrs, model.Attr{
 			Key:   kv.Key,
 			Value: AnyValueToString(kv.Value),

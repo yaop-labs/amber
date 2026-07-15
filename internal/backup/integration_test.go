@@ -12,6 +12,7 @@ import (
 	"github.com/yaop-labs/amber"
 	"github.com/yaop-labs/amber/internal/backup"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
@@ -54,9 +55,22 @@ func TestRestoredDatabaseOpensWithLogsAndMetrics(t *testing.T) {
 	if len(created.Manifest.Checkpoints.Metrics.ImmutableFiles) == 0 {
 		t.Fatal("metrics checkpoint has no immutable block")
 	}
+	if !created.Manifest.Checkpoints.OTLPReplay.Present || len(created.Manifest.Checkpoints.OTLPReplay.ImmutableFiles) == 0 {
+		t.Fatalf("OTLP replay checkpoint = %+v", created.Manifest.Checkpoints.OTLPReplay)
+	}
 	restored := filepath.Join(root, "restored")
 	if _, err := backup.Restore(context.Background(), snapshot, restored); err != nil {
 		t.Fatalf("restore snapshot: %v", err)
+	}
+	replayed := 0
+	if err := otlpv4.Replay(context.Background(), restored, func(otlpv4.Envelope) error {
+		replayed++
+		return nil
+	}); err != nil {
+		t.Fatalf("replay restored OTLP journal: %v", err)
+	}
+	if replayed != 3 {
+		t.Fatalf("restored OTLP replay count = %d, want 3", replayed)
 	}
 
 	manifestPayload, err := os.ReadFile(filepath.Join(restored, "metrics", "manifest.json"))

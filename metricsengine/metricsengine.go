@@ -89,8 +89,19 @@ var ErrActiveSeriesLimitExceeded = store.ErrActiveSeriesLimitExceeded
 // stats, and lifecycle operations to the internal implementation without
 // exporting planner/execution internals as part of the public method set.
 type Store struct {
-	inner *store.Store
+	inner      *store.Store
+	replaySink ReplaySink
 }
+
+// ReplaySink records native metric calls in Amber's canonical replay stream.
+type ReplaySink interface {
+	AppendNormalizedMetricSamples([]Sample) error
+	AppendNormalizedMetricFloat(LabelSet, MetricType, int64, float64, int64) error
+	AppendNormalizedMetricSketches([]engine.SketchSample) error
+}
+
+// SetReplaySink attaches the runtime-owned replay sink before concurrent use.
+func (s *Store) SetReplaySink(sink ReplaySink) { s.replaySink = sink }
 
 // OpenStore opens a metrics store at dir with default options.
 func OpenStore(dir string) (*Store, error) {
@@ -120,18 +131,46 @@ func OpenStoreConfigured(cfg StoreConfig) (*Store, error) {
 }
 
 func (s *Store) Append(labels LabelSet, typ MetricType, timestamp int64, value int64) (SeriesID, error) {
-	return s.inner.Append(labels, typ, timestamp, value)
+	id, err := s.inner.Append(labels, typ, timestamp, value)
+	if err != nil || s.replaySink == nil {
+		return id, err
+	}
+	err = s.replaySink.AppendNormalizedMetricSamples([]Sample{{Labels: labels, Type: typ, Timestamp: timestamp, Value: value}})
+	return id, err
 }
 
 func (s *Store) AppendBatch(samples []Sample) ([]SeriesID, error) {
+	ids, err := s.inner.AppendBatch(samples)
+	if err != nil || s.replaySink == nil {
+		return ids, err
+	}
+	return ids, s.replaySink.AppendNormalizedMetricSamples(samples)
+}
+
+// AppendBatchOTLP writes an OTLP-derived projection whose original request is
+// recorded by the transport-level durability boundary.
+func (s *Store) AppendBatchOTLP(samples []Sample) ([]SeriesID, error) {
 	return s.inner.AppendBatch(samples)
 }
 
 func (s *Store) AppendScaledFloat(labels LabelSet, typ MetricType, timestamp int64, value float64, scale int64) (SeriesID, error) {
-	return s.inner.AppendScaledFloat(labels, typ, timestamp, value, scale)
+	id, err := s.inner.AppendScaledFloat(labels, typ, timestamp, value, scale)
+	if err != nil || s.replaySink == nil {
+		return id, err
+	}
+	return id, s.replaySink.AppendNormalizedMetricFloat(labels, typ, timestamp, value, scale)
 }
 
 func (s *Store) AppendSketches(samples []engine.SketchSample) ([]SeriesID, error) {
+	ids, err := s.inner.AppendSketches(samples)
+	if err != nil || s.replaySink == nil {
+		return ids, err
+	}
+	return ids, s.replaySink.AppendNormalizedMetricSketches(samples)
+}
+
+// AppendSketchesOTLP is AppendBatchOTLP for histogram projections.
+func (s *Store) AppendSketchesOTLP(samples []engine.SketchSample) ([]SeriesID, error) {
 	return s.inner.AppendSketches(samples)
 }
 

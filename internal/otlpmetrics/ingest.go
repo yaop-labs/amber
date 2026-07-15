@@ -11,24 +11,28 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/metricsengine/engine"
 	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	meotlp "github.com/yaop-labs/amber/internal/metricsengine/otlp"
+	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
 // Result reports the per-request point counts produced by Ingest.
 type Result struct {
-	Accepted    int
-	Rejected    int
-	Unsupported int
+	Accepted        int
+	Rejected        int
+	Unsupported     int
+	AcceptedRequest *collectormetrics.ExportMetricsServiceRequest
 }
 
 // Ingest converts req and writes it to store, returning point counts. Permanent
@@ -38,22 +42,42 @@ type Result struct {
 //
 // store must be non-nil; callers gate on metric-store availability before
 // calling.
-func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServiceRequest, log *slog.Logger) (Result, error) {
-	var res Result
+func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServiceRequest, log *slog.Logger) (res Result, returnErr error) {
+	if req == nil {
+		return res, errors.New("otlp metrics request is nil")
+	}
+	acceptedPoints := make(map[proto.Message]struct{})
+	defer func() {
+		res.AcceptedRequest = otlpv4.MetricsSubset(req, acceptedPoints)
+	}()
 	// Histogram series from one request are written as one block.
 	var expAll []histogram.ExpSeries
 	var explicitAll []histogram.ExplicitSeries
+	var acceptedHistograms []proto.Message
 
 	for _, rm := range req.ResourceMetrics {
+		if rm == nil {
+			continue
+		}
 		resourceAttrs := kvToMap(rm.Resource.GetAttributes())
 		for _, sm := range rm.ScopeMetrics {
+			if sm == nil {
+				continue
+			}
 			scopeAttrs := kvToMap(sm.Scope.GetAttributes())
 			for _, metric := range sm.Metrics {
+				if metric == nil {
+					recordUnsupported(&res, "unknown", 1)
+					continue
+				}
 				switch data := metric.Data.(type) {
 				case *metricspb.Metric_Gauge:
-					a, r, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
+					a, r, points, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
 					res.Accepted += a
 					res.Rejected += r
+					for _, point := range points {
+						acceptedPoints[point] = struct{}{}
+					}
 					if err != nil {
 						return res, err
 					}
@@ -62,9 +86,12 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 						recordUnsupported(&res, "sum_temporality", len(data.Sum.GetDataPoints()))
 						continue
 					}
-					a, r, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
+					a, r, points, err := ingestScalar(store, metric, resourceAttrs, scopeAttrs, log)
 					res.Accepted += a
 					res.Rejected += r
+					for _, point := range points {
+						acceptedPoints[point] = struct{}{}
+					}
 					if err != nil {
 						return res, err
 					}
@@ -77,6 +104,11 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 					res.Accepted += sumExplicitPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("histogram").Add(uint64(sumExplicitPoints(series)))
 					explicitAll = append(explicitAll, series...)
+					for _, point := range data.Histogram.GetDataPoints() {
+						if point != nil {
+							acceptedHistograms = append(acceptedHistograms, point)
+						}
+					}
 				case *metricspb.Metric_ExponentialHistogram:
 					if !supportedCumulativeTemporality(data.ExponentialHistogram.GetAggregationTemporality()) {
 						recordUnsupported(&res, "exphistogram_temporality", len(data.ExponentialHistogram.GetDataPoints()))
@@ -86,6 +118,11 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 					res.Accepted += sumExpPoints(series)
 					selfobs.MetricsIngestAccepted.WithLabelValues("exphistogram").Add(uint64(sumExpPoints(series)))
 					expAll = append(expAll, series...)
+					for _, point := range data.ExponentialHistogram.GetDataPoints() {
+						if point != nil {
+							acceptedHistograms = append(acceptedHistograms, point)
+						}
+					}
 				default:
 					recordUnsupported(&res, "unknown", 1)
 				}
@@ -95,7 +132,7 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 
 	if len(expAll) > 0 || len(explicitAll) > 0 {
 		sketches := sketchSamples(expAll, explicitAll)
-		if _, err := store.AppendSketches(sketches); err != nil {
+		if _, err := store.AppendSketchesOTLP(sketches); err != nil {
 			// Treat append failure as ingest rejection: the histogram data
 			// never landed. Count by point total, not series count, so the
 			// counter matches scalar semantics.
@@ -105,6 +142,9 @@ func Ingest(store *metricsengine.Store, req *collectormetrics.ExportMetricsServi
 			selfobs.MetricsIngestRejected.WithLabelValues("hist_write").Add(uint64(pts))
 			log.Warn("histogram append failed", "err", err)
 			return res, fmt.Errorf("otlp metrics histogram append: %w", err)
+		}
+		for _, point := range acceptedHistograms {
+			acceptedPoints[point] = struct{}{}
 		}
 	}
 	return res, nil
@@ -117,10 +157,10 @@ func nanosToMillis(unixNano uint64) int64 {
 }
 
 // ingestScalar writes Gauge and Sum points to the scalar metric store.
-func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resourceAttrs, scopeAttrs map[string]string, log *slog.Logger) (int, int, error) {
-	addPoints, kind := pointsForMetric(metric)
+func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resourceAttrs, scopeAttrs map[string]string, log *slog.Logger) (int, int, []*metricspb.NumberDataPoint, error) {
+	addPoints, sourcePoints, kind := pointsForMetric(metric)
 	if !kind.supported || len(addPoints) == 0 {
-		return 0, 0, nil
+		return 0, 0, nil, nil
 	}
 	batch := metricsengine.OTLPBatch{
 		ResourceAttributes: resourceAttrs,
@@ -131,7 +171,7 @@ func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resource
 	if err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("conversion").Add(uint64(len(addPoints)))
 		log.Warn("otlp metric sample conversion failed", "metric", metric.Name, "err", err)
-		return 0, len(addPoints), nil
+		return 0, len(addPoints), nil, nil
 	}
 	if skipped > 0 {
 		// NaN/+/-Inf/int64-overflow float points: unencodable in the int64
@@ -139,17 +179,17 @@ func ingestScalar(store *metricsengine.Store, metric *metricspb.Metric, resource
 		selfobs.MetricsIngestRejected.WithLabelValues("value_unencodable").Add(uint64(skipped))
 	}
 	if len(samples) == 0 {
-		return 0, skipped, nil
+		return 0, skipped, nil, nil
 	}
-	if _, err := store.AppendBatch(samples); err != nil {
+	if _, err := store.AppendBatchOTLP(samples); err != nil {
 		selfobs.MetricsIngestRejected.WithLabelValues("append").Add(uint64(len(samples)))
 		if !errors.Is(err, metricsengine.ErrNoSamples) {
 			log.Warn("otlp metric append failed", "metric", metric.Name, "err", err)
 		}
-		return 0, len(samples) + skipped, fmt.Errorf("otlp metrics append %q: %w", metric.Name, err)
+		return 0, len(samples) + skipped, nil, fmt.Errorf("otlp metrics append %q: %w", metric.Name, err)
 	}
 	selfobs.MetricsIngestAccepted.WithLabelValues(kind.label).Add(uint64(len(samples)))
-	return len(samples), skipped, nil
+	return len(samples), skipped, acceptedScalarPoints(sourcePoints), nil
 }
 
 func supportedCounterSum(sum *metricspb.Sum) bool {
@@ -178,6 +218,9 @@ func expSeriesFor(metric *metricspb.Metric, hist *metricspb.ExponentialHistogram
 	}
 	points := make([]meotlp.ExponentialHistogramPoint, 0, len(dps))
 	for _, dp := range dps {
+		if dp == nil {
+			continue
+		}
 		pos := dp.GetPositive()
 		neg := dp.GetNegative()
 		p := meotlp.ExponentialHistogramPoint{
@@ -211,6 +254,9 @@ func explicitSeriesFor(metric *metricspb.Metric, hist *metricspb.Histogram, reso
 	}
 	points := make([]meotlp.ExplicitHistogramPoint, 0, len(dps))
 	for _, dp := range dps {
+		if dp == nil {
+			continue
+		}
 		p := meotlp.ExplicitHistogramPoint{
 			Name:           metric.Name,
 			Timestamp:      nanosToMillis(dp.TimeUnixNano),
@@ -271,20 +317,26 @@ type metricKindStatus struct {
 // points. The Ingest switch dispatches histogram/exp-histogram data to the
 // histogram-store path before this is called, so only Gauge/Sum reach here;
 // everything else is treated as "unknown".
-func pointsForMetric(metric *metricspb.Metric) ([]metricsengine.OTLPPoint, metricKindStatus) {
+func pointsForMetric(metric *metricspb.Metric) ([]metricsengine.OTLPPoint, []*metricspb.NumberDataPoint, metricKindStatus) {
 	switch data := metric.Data.(type) {
 	case *metricspb.Metric_Gauge:
-		return numberPoints(metric.Name, metricsengine.OTLPMetricGauge, data.Gauge.GetDataPoints()), metricKindStatus{supported: true, label: "gauge"}
+		points, sources := numberPoints(metric.Name, metricsengine.OTLPMetricGauge, data.Gauge.GetDataPoints())
+		return points, sources, metricKindStatus{supported: true, label: "gauge"}
 	case *metricspb.Metric_Sum:
-		return numberPoints(metric.Name, metricsengine.OTLPMetricSum, data.Sum.GetDataPoints()), metricKindStatus{supported: true, label: "sum"}
+		points, sources := numberPoints(metric.Name, metricsengine.OTLPMetricSum, data.Sum.GetDataPoints())
+		return points, sources, metricKindStatus{supported: true, label: "sum"}
 	default:
-		return nil, metricKindStatus{supported: false, label: "unknown"}
+		return nil, nil, metricKindStatus{supported: false, label: "unknown"}
 	}
 }
 
-func numberPoints(name string, kind metricsengine.OTLPMetricKind, dps []*metricspb.NumberDataPoint) []metricsengine.OTLPPoint {
+func numberPoints(name string, kind metricsengine.OTLPMetricKind, dps []*metricspb.NumberDataPoint) ([]metricsengine.OTLPPoint, []*metricspb.NumberDataPoint) {
 	points := make([]metricsengine.OTLPPoint, 0, len(dps))
+	sources := make([]*metricspb.NumberDataPoint, 0, len(dps))
 	for _, dp := range dps {
+		if dp == nil {
+			continue
+		}
 		point := metricsengine.OTLPPoint{
 			Name:       name,
 			Kind:       kind,
@@ -302,8 +354,25 @@ func numberPoints(name string, kind metricsengine.OTLPMetricKind, dps []*metrics
 			continue
 		}
 		points = append(points, point)
+		sources = append(sources, dp)
 	}
-	return points
+	return points, sources
+}
+
+func acceptedScalarPoints(points []*metricspb.NumberDataPoint) []*metricspb.NumberDataPoint {
+	accepted := make([]*metricspb.NumberDataPoint, 0, len(points))
+	for _, point := range points {
+		switch value := point.Value.(type) {
+		case *metricspb.NumberDataPoint_AsInt:
+			accepted = append(accepted, point)
+		case *metricspb.NumberDataPoint_AsDouble:
+			scaled := math.Round(value.AsDouble * 1000)
+			if !math.IsNaN(scaled) && scaled < float64(math.MaxInt64) && scaled > float64(math.MinInt64) {
+				accepted = append(accepted, point)
+			}
+		}
+	}
+	return accepted
 }
 
 func kvToMap(kvs []*commonpb.KeyValue) map[string]string {
@@ -312,6 +381,9 @@ func kvToMap(kvs []*commonpb.KeyValue) map[string]string {
 	}
 	out := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
+		if kv == nil {
+			continue
+		}
 		out[kv.Key] = ingest.AnyValueToString(kv.Value)
 	}
 	return out
