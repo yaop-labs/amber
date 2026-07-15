@@ -2,7 +2,6 @@
 package http
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/query"
+	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/storage"
 	"github.com/yaop-labs/amber/metricsengine"
 )
@@ -25,7 +25,7 @@ type RoutesDeps struct {
 	// metric query endpoints.
 	MetricStore *metricsengine.Store
 	IsReady     func() bool
-	Status      func() any
+	Status      func() runtime.Status
 	Logger      *slog.Logger
 }
 
@@ -42,8 +42,18 @@ type RoutesConfig struct {
 // admin, health) onto mux, applying API-key auth and the body-size limit.
 func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		if deps.Status == nil {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+		status := deps.Status()
+		health := "ok"
+		if status.Degraded {
+			health = "degraded"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": health, "ready": status.Ready, "degraded": status.Degraded, "reasons": status.Reasons,
+		})
 	})
 
 	mux.Handle("GET /readyz", ReadyHandler(deps.IsReady))

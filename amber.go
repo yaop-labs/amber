@@ -43,9 +43,24 @@ type Status struct {
 	Ready                bool
 	Degraded             bool
 	Closing              bool
+	DatabaseID           string
 	WALRepairEvents      uint64
 	IndexBootstrapErrors uint64
+	LastSuccessfulBackup *BackupCheckpointStatus
+	LastVerifiedRestore  *RestoreCheckpointStatus
 	Reasons              []StatusReason
+}
+
+type BackupCheckpointStatus struct {
+	Checkpoint        string
+	SnapshotCreatedAt time.Time
+	CompletedAt       time.Time
+}
+
+type RestoreCheckpointStatus struct {
+	Checkpoint        string
+	SnapshotCreatedAt time.Time
+	VerifiedAt        time.Time
 }
 
 type StatusReason struct {
@@ -304,8 +319,19 @@ func (db *DB) Status() Status {
 	s := db.stack.Status()
 	out := Status{
 		Ready: s.Ready, Degraded: s.Degraded, Closing: s.Closing,
+		DatabaseID:      s.DatabaseID,
 		WALRepairEvents: s.WALRepairEvents, IndexBootstrapErrors: s.IndexBootstrapErrors,
 		Reasons: make([]StatusReason, len(s.Reasons)),
+	}
+	if s.LastSuccessfulBackup != nil {
+		out.LastSuccessfulBackup = &BackupCheckpointStatus{
+			Checkpoint: s.LastSuccessfulBackup.Checkpoint, SnapshotCreatedAt: s.LastSuccessfulBackup.SnapshotCreatedAt, CompletedAt: s.LastSuccessfulBackup.CompletedAt,
+		}
+	}
+	if s.LastVerifiedRestore != nil {
+		out.LastVerifiedRestore = &RestoreCheckpointStatus{
+			Checkpoint: s.LastVerifiedRestore.Checkpoint, SnapshotCreatedAt: s.LastVerifiedRestore.SnapshotCreatedAt, VerifiedAt: s.LastVerifiedRestore.VerifiedAt,
+		}
 	}
 	for i, reason := range s.Reasons {
 		out.Reasons[i] = StatusReason{Code: reason.Code, Count: reason.Count}

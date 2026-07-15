@@ -277,7 +277,7 @@ func run() error {
 		LogSparse:   stack.LogSparse,
 		MetricStore: stack.MetricStore,
 		IsReady:     stack.IsReady,
-		Status:      func() any { return stack.Status() },
+		Status:      stack.Status,
 		Logger:      log,
 	}, amberhttp.RoutesConfig{
 		MaxRequestBytes: cfg.API.MaxRequestBytes,

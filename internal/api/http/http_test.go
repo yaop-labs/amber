@@ -15,6 +15,7 @@ import (
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
+	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -125,6 +126,32 @@ func TestWriteError(t *testing.T) {
 	json.NewDecoder(rec.Body).Decode(&body)
 	if body["error"] != "bad input" {
 		t.Errorf("error message: got %q", body["error"])
+	}
+}
+
+func TestHealthIncludesDegradedRuntimeStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, RoutesDeps{
+		IsReady: func() bool { return true },
+		Status: func() runtime.Status {
+			return runtime.Status{Ready: true, Degraded: true, DatabaseID: "db-1"}
+		},
+		Logger: slog.Default(),
+	}, RoutesConfig{})
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("health status code = %d", recorder.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if body["status"] != "degraded" || body["degraded"] != true || body["ready"] != true {
+		t.Fatalf("health body = %+v", body)
+	}
+	if _, exposed := body["database"]; exposed {
+		t.Fatalf("unauthenticated health exposed database details: %+v", body)
 	}
 }
 

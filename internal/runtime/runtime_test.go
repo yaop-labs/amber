@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/query"
 )
@@ -63,6 +64,28 @@ func TestStatusReportsMetricsWALRepair(t *testing.T) {
 	got := stack.Status()
 	if !got.Degraded || !statusHasReason(got, "metrics_wal_tail_repaired", 1) {
 		t.Fatalf("status = %+v, want metrics_wal_tail_repaired degraded reason", got)
+	}
+}
+
+func TestStatusReportsCorruptBackupState(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, dbmeta.BackupStateFileName), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stack, err := New(context.Background(), Options{DataDir: dataDir, Metrics: MetricsOptions{Disabled: true}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stack.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	status := stack.Status()
+	if status.DatabaseID == "" || !status.Degraded || !statusHasReason(status, "backup_state_corrupt", 1) {
+		t.Fatalf("status = %+v, want database ID and backup_state_corrupt", status)
 	}
 }
 

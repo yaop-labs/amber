@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/bootstrap"
+	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
@@ -80,12 +81,27 @@ type StreamRetentionOptions struct {
 // Degraded means requests remain correct through a documented fallback, while
 // Ready reports whether new traffic may be served.
 type Status struct {
-	Ready                bool           `json:"ready"`
-	Degraded             bool           `json:"degraded"`
-	Closing              bool           `json:"closing"`
-	WALRepairEvents      uint64         `json:"wal_repair_events"`
-	IndexBootstrapErrors uint64         `json:"index_bootstrap_errors"`
-	Reasons              []StatusReason `json:"reasons,omitempty"`
+	Ready                bool                     `json:"ready"`
+	Degraded             bool                     `json:"degraded"`
+	Closing              bool                     `json:"closing"`
+	DatabaseID           string                   `json:"database_id"`
+	WALRepairEvents      uint64                   `json:"wal_repair_events"`
+	IndexBootstrapErrors uint64                   `json:"index_bootstrap_errors"`
+	LastSuccessfulBackup *BackupCheckpointStatus  `json:"last_successful_backup,omitempty"`
+	LastVerifiedRestore  *RestoreCheckpointStatus `json:"last_verified_restore,omitempty"`
+	Reasons              []StatusReason           `json:"reasons,omitempty"`
+}
+
+type BackupCheckpointStatus struct {
+	Checkpoint        string    `json:"checkpoint"`
+	SnapshotCreatedAt time.Time `json:"snapshot_created_at"`
+	CompletedAt       time.Time `json:"completed_at"`
+}
+
+type RestoreCheckpointStatus struct {
+	Checkpoint        string    `json:"checkpoint"`
+	SnapshotCreatedAt time.Time `json:"snapshot_created_at"`
+	VerifiedAt        time.Time `json:"verified_at"`
 }
 
 type StatusReason struct {
@@ -213,6 +229,8 @@ func (o Options) withDefaults() Options {
 // workers (uploaders, dogfood scraper, sealed-index bootstrap). It holds the
 // data-directory lock. amber.DB and cmd/amber are thin wrappers over it.
 type Stack struct {
+	Identity    dbmeta.Identity
+	backupState dbmeta.BackupState
 	LogManager  *storage.SegmentManager
 	SpanManager *storage.SegmentManager
 	LogSparse   *index.SparseIndex
@@ -279,14 +297,26 @@ func (s *Stack) Status() Status {
 		reasons = append(reasons, StatusReason{Code: code, Count: count})
 	}
 	sort.Slice(reasons, func(i, j int) bool { return reasons[i].Code < reasons[j].Code })
-	return Status{
+	status := Status{
 		Ready:                s.ready.Load() && !closing,
 		Degraded:             len(reasons) > 0,
 		Closing:              closing,
+		DatabaseID:           s.Identity.ID,
 		WALRepairEvents:      walRepairEvents,
 		IndexBootstrapErrors: indexBootstrapErrors,
 		Reasons:              reasons,
 	}
+	if checkpoint := s.backupState.LastSuccessful; checkpoint != nil {
+		status.LastSuccessfulBackup = &BackupCheckpointStatus{
+			Checkpoint: checkpoint.Checkpoint, SnapshotCreatedAt: checkpoint.SnapshotCreatedAt, CompletedAt: checkpoint.CompletedAt,
+		}
+	}
+	if checkpoint := s.backupState.LastVerifiedRestore; checkpoint != nil {
+		status.LastVerifiedRestore = &RestoreCheckpointStatus{
+			Checkpoint: checkpoint.Checkpoint, SnapshotCreatedAt: checkpoint.SnapshotCreatedAt, VerifiedAt: checkpoint.VerifiedAt,
+		}
+	}
+	return status
 }
 
 func (s *Stack) markDegraded(reason string) { s.markDegradedN(reason, 1) }
@@ -333,6 +363,11 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			_ = dirLock.Release()
 		}
 	}()
+	identity, err := dbmeta.LoadOrCreate(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: open database identity: %w", err)
+	}
+	backupState, backupStateErr := dbmeta.LoadBackupState(cfg.DataDir)
 
 	logDir := filepath.Join(cfg.DataDir, "logs")
 	spanDir := filepath.Join(cfg.DataDir, "spans")
@@ -431,8 +466,14 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	ready := &atomic.Bool{}
 	s := &Stack{
-		ready: ready, closeDone: make(chan struct{}), bootstrapDone: make(chan struct{}),
+		Identity:    identity,
+		backupState: backupState,
+		ready:       ready, closeDone: make(chan struct{}), bootstrapDone: make(chan struct{}),
 		degradedReasons: make(map[string]uint64),
+	}
+	if backupStateErr != nil {
+		s.markDegraded("backup_state_corrupt")
+		cfg.Logger.Warn("backup operational state is invalid", "err", backupStateErr)
 	}
 	s.walRepairEvents = logManager.WALCorruptRecords() + spanManager.WALCorruptRecords()
 	if s.walRepairEvents > 0 {
