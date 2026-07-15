@@ -82,6 +82,46 @@ jobs:
           cache: true
       - run: go build ./...
 
+  s3-integration:
+    name: S3 backup integration
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Start MinIO
+        run: |
+          docker run --detach --name amber-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=amber-test \
+            --env MINIO_ROOT_PASSWORD=amber-test-secret \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs amber-minio
+          exit 1
+      - name: Test S3 snapshot round trip
+        env:
+          AMBER_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          AMBER_TEST_S3_BUCKET: amber-backup-integration
+          AWS_ACCESS_KEY_ID: amber-test
+          AWS_SECRET_ACCESS_KEY: amber-test-secret
+          AWS_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: go test ./internal/backup -run '^TestS3TransportMinIOIntegration$' -count=1 -timeout=2m
+      - name: MinIO logs
+        if: failure()
+        run: docker logs amber-minio
+
   # ---- Stage 3: test with the race detector (gated by build) ----
   test:
     name: Test (race)
