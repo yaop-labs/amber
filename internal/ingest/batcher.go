@@ -248,10 +248,11 @@ func (b *Batcher) Start(ctx context.Context) {
 	go b.run(workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, b.processLogBatch)
 	go b.run(workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, b.processSpanBatch)
 	if ctx.Done() != nil {
+		shutdownCtx := context.WithoutCancel(ctx)
 		go func() {
 			select {
 			case <-ctx.Done():
-				_ = b.Close(context.Background())
+				_ = b.Close(shutdownCtx)
 			case <-b.closeDone:
 			}
 		}()

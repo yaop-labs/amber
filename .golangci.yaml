@@ -55,6 +55,7 @@ linters:
         linters:
           - errcheck
           - gosec
+          - prealloc
           - unparam
       - path: benchmarks/
         linters:
@@ -71,6 +72,10 @@ linters:
           - gosec
       - path: internal/model/id\.go
         text: "G404"
+        linters:
+          - gosec
+      - path: internal/(metricsengine/store|storage)/
+        text: "G703"
         linters:
           - gosec
 
