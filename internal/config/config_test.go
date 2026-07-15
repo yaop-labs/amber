@@ -25,6 +25,9 @@ func TestDefault(t *testing.T) {
 	if cfg.API.HTTPAddr != "localhost:8080" {
 		t.Errorf("HTTPAddr: got %q, want localhost:8080", cfg.API.HTTPAddr)
 	}
+	if !cfg.API.MetricsPublic {
+		t.Error("MetricsPublic: got false, want backward-compatible true default")
+	}
 
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("default config should be valid: %v", err)
@@ -61,8 +64,8 @@ ingest:
 api:
   http_addr: ":9090"
   grpc_addr: ":4318"
-  security:
-    insecure: true
+  metrics_public: false
+  api_key: scraper-secret
 log:
   level: debug
   format: json
@@ -109,6 +112,9 @@ runtime:
 	}
 	if cfg.API.GRPCAddr != ":4318" {
 		t.Errorf("GRPCAddr: got %q", cfg.API.GRPCAddr)
+	}
+	if cfg.API.MetricsPublic {
+		t.Error("API.MetricsPublic: got true, want explicitly configured false")
 	}
 	if cfg.Retention.Interval != 30*time.Minute {
 		t.Errorf("Retention.Interval: got %v", cfg.Retention.Interval)
@@ -279,6 +285,19 @@ func TestValidate_LegacyAPIKeyProtectsNonLoopback(t *testing.T) {
 	cfg.API.APIKey = "secret"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("legacy api_key should map to Reef bearer config: %v", err)
+	}
+}
+
+func TestValidate_ProtectedMetricsRequiresBearer(t *testing.T) {
+	cfg := Default()
+	cfg.API.MetricsPublic = false
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected protected metrics without bearer auth to be rejected")
+	}
+
+	cfg.API.APIKey = "scraper-secret"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("protected metrics with bearer auth: %v", err)
 	}
 }
 

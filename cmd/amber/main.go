@@ -19,7 +19,6 @@ import (
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
-	"github.com/yaop-labs/reef/bearer"
 	"github.com/yaop-labs/reef/grpcreef"
 	"github.com/yaop-labs/reef/tlsconf"
 )
@@ -52,7 +51,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure http reef tls: %w", err)
 	}
-	httpAuth, err := bearer.Require(authCfg, bearer.ExemptPaths("/health", "/readyz", "/metrics"))
+	httpAuth, err := newHTTPAuth(cfg.API)
 	if err != nil {
 		return fmt.Errorf("configure http reef auth: %w", err)
 	}
@@ -161,6 +160,7 @@ func run() error {
 	selfobs.RegisterCounterFunc("amber_wal_corrupt_records_total", "Malformed WAL records observed during replay.", func() float64 {
 		return float64(stack.LogManager.WALCorruptRecords() + stack.SpanManager.WALCorruptRecords())
 	})
+	registerCheckpointMetrics(stack.Status, time.Now)
 
 	if stack.MetricStore != nil {
 		selfobs.RegisterGaugeFunc("amber_metrics_store_blocks", "Sealed metric blocks tracked by the manifest.", func() float64 {

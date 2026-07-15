@@ -29,6 +29,8 @@ ingest:
 api:
   http_addr: ":8080"
   grpc_addr: ":4317"   # OTLP/gRPC (стандартный порт OTel), оставить пустым чтобы отключить
+  # false защищает /metrics тем же Reef bearer token, что и остальные API.
+  metrics_public: true
   read_timeout: 30s
   write_timeout: 30s
   api_key: ""          # Bearer token, пусто = auth выключен
