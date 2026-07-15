@@ -162,6 +162,9 @@ type APIConfig struct {
 	WriteTimeout      time.Duration `yaml:"write_timeout"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
 	MaxRequestBytes   int64         `yaml:"max_request_bytes"`
+	// MetricsPublic leaves GET /metrics outside Reef bearer authentication.
+	// Set false in production when the scraper can present a bearer token.
+	MetricsPublic bool `yaml:"metrics_public"`
 
 	// APIKey is the legacy single-key field, kept for backward compatibility.
 	// If APIKeys is non-empty it wins; otherwise APIKey acts as a single
@@ -238,6 +241,7 @@ func Default() *Config {
 			WriteTimeout:      30 * time.Second,
 			IdleTimeout:       120 * time.Second,
 			MaxRequestBytes:   32 << 20,
+			MetricsPublic:     true,
 		},
 		Debug: DebugConfig{
 			PprofAddr: "localhost:6060",
@@ -349,6 +353,12 @@ func (c *Config) validateAPISecurity() error {
 	}
 	if _, err := c.API.ResolvedBearerConfig().Validate(); err != nil {
 		return fmt.Errorf("api.security.auth: %w", err)
+	}
+	if !c.API.MetricsPublic {
+		auth := c.API.ResolvedBearerConfig()
+		if auth == nil || len(auth.Bearer) == 0 {
+			return fmt.Errorf("api.metrics_public=false requires bearer authentication")
+		}
 	}
 	secured := c.API.reefSecurityConfigured()
 	if c.API.Security.Insecure && secured {
