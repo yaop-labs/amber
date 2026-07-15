@@ -49,6 +49,15 @@ func TestRunRequiresFlags(t *testing.T) {
 	if err := run(context.Background(), []string{"s3-download", "-snapshot", "somewhere", "-bucket", "backups"}, &stdout, &stderr); err == nil {
 		t.Fatal("s3-download accepted missing checkpoint")
 	}
+	if err := run(context.Background(), []string{"drill", "-bucket", "backups", "-checkpoint", "checkpoint"}, &stdout, &stderr); err == nil {
+		t.Fatal("drill accepted missing work directory")
+	}
+	if err := run(context.Background(), []string{"drill", "-bucket", "backups", "-checkpoint", "checkpoint", "-work-dir", "work"}, &stdout, &stderr); err == nil {
+		t.Fatal("drill accepted missing database identity")
+	}
+	if err := run(context.Background(), []string{"drill", "-bucket", "backups", "-checkpoint", "checkpoint", "-work-dir", "work", "-database-id", "database", "-timeout", "0s"}, &stdout, &stderr); err == nil {
+		t.Fatal("drill accepted a non-positive timeout")
+	}
 }
 
 func runCommand(t *testing.T, args ...string) commandResult {
