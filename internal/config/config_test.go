@@ -35,12 +35,26 @@ func TestDefault(t *testing.T) {
 }
 
 func TestLoad_FileNotFound(t *testing.T) {
-	cfg, err := Load("/nonexistent/config.yaml")
+	if _, err := Load("/nonexistent/config.yaml"); err == nil {
+		t.Fatal("Load should reject an explicitly missing file")
+	}
+	cfg, err := LoadOptional("/nonexistent/config.yaml")
 	if err != nil {
-		t.Fatalf("Load should return default on missing file: %v", err)
+		t.Fatalf("LoadOptional should return defaults on missing file: %v", err)
 	}
 	if cfg.Storage.DataDir != "./data" {
 		t.Errorf("expected default DataDir, got %q", cfg.Storage.DataDir)
+	}
+}
+
+func TestLoad_UnknownFieldRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("storage:\n  data_dir: ./data\n  datta_dir: typo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected unknown YAML field to be rejected")
 	}
 }
 
@@ -66,11 +80,18 @@ api:
   grpc_addr: ":4318"
   metrics_public: false
   api_key: scraper-secret
+  security:
+    insecure: true
+    danger_allow_bearer_over_plaintext: true
 log:
   level: debug
   format: json
 retention:
   interval: 30m
+  journal:
+    max_age: 336h
+    max_bytes: 1073741824
+    max_segments: 20
   logs:
     local_max_age: 24h
     max_age: 168h
@@ -118,6 +139,9 @@ runtime:
 	}
 	if cfg.Retention.Interval != 30*time.Minute {
 		t.Errorf("Retention.Interval: got %v", cfg.Retention.Interval)
+	}
+	if cfg.Retention.Journal.MaxAge != 336*time.Hour || cfg.Retention.Journal.MaxBytes != 1<<30 || cfg.Retention.Journal.MaxSegments != 20 {
+		t.Errorf("Journal retention: got %+v", cfg.Retention.Journal)
 	}
 	if cfg.Retention.Logs.LocalMaxAge != 24*time.Hour {
 		t.Errorf("Logs.LocalMaxAge: got %v", cfg.Retention.Logs.LocalMaxAge)
@@ -221,6 +245,29 @@ func TestValidate_NegativeMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestValidate_RetentionLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "interval", mutate: func(cfg *Config) { cfg.Retention.Interval = -time.Second }},
+		{name: "logs local age", mutate: func(cfg *Config) { cfg.Retention.Logs.LocalMaxAge = -time.Second }},
+		{name: "spans max bytes", mutate: func(cfg *Config) { cfg.Retention.Spans.MaxBytes = -1 }},
+		{name: "journal max age", mutate: func(cfg *Config) { cfg.Retention.Journal.MaxAge = -time.Second }},
+		{name: "journal max bytes", mutate: func(cfg *Config) { cfg.Retention.Journal.MaxBytes = -1 }},
+		{name: "journal max segments", mutate: func(cfg *Config) { cfg.Retention.Journal.MaxSegments = -1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Default()
+			tt.mutate(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("negative retention value accepted")
+			}
+		})
+	}
+}
+
 func TestValidate_IndexBootstrapWorkers(t *testing.T) {
 	cfg := Default()
 	cfg.Runtime.IndexBootstrapWorkers = 0
@@ -283,6 +330,8 @@ func TestValidate_LegacyAPIKeyProtectsNonLoopback(t *testing.T) {
 	cfg := Default()
 	cfg.API.HTTPAddr = ":8080"
 	cfg.API.APIKey = "secret"
+	cfg.API.Security.Insecure = true
+	cfg.API.Security.DangerAllowBearerOverPlaintext = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("legacy api_key should map to Reef bearer config: %v", err)
 	}
@@ -296,6 +345,7 @@ func TestValidate_ProtectedMetricsRequiresBearer(t *testing.T) {
 	}
 
 	cfg.API.APIKey = "scraper-secret"
+	cfg.API.Security.DangerAllowBearerOverPlaintext = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("protected metrics with bearer auth: %v", err)
 	}

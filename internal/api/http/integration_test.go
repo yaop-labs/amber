@@ -497,8 +497,8 @@ func TestRoutes_OTLPAcceptsGzipWithoutBypassingDurableResponse(t *testing.T) {
 	limitedReq.Header.Set("Content-Encoding", "gzip")
 	limitedRec := httptest.NewRecorder()
 	limited.ServeHTTP(limitedRec, limitedReq)
-	if limitedRec.Code != http.StatusBadRequest {
-		t.Fatalf("decompressed limit status = %d, want 400", limitedRec.Code)
+	if limitedRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("decompressed limit status = %d, want 413", limitedRec.Code)
 	}
 }
 

@@ -18,7 +18,7 @@ func (h *OTLPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "read body failed")
+		writeBodyReadError(w, err)
 		return
 	}
 

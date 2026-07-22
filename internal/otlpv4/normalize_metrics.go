@@ -23,6 +23,12 @@ func NormalizedMetricSampleNative(sample memodel.Sample) (Envelope, error) {
 	return normalizedMetricSample(sample, FidelityNormalizedNative)
 }
 
+// NormalizedMetricSampleV3 projects one scalar sample retained by Amber
+// v0.3.0 with explicit legacy fidelity.
+func NormalizedMetricSampleV3(sample memodel.Sample) (Envelope, error) {
+	return normalizedMetricSample(sample, FidelityNormalizedV3)
+}
+
 func normalizedMetricSample(sample memodel.Sample, fidelity Fidelity) (Envelope, error) {
 	context, err := splitMetricLabels(sample.Labels)
 	if err != nil {
@@ -56,6 +62,12 @@ func normalizedMetricSample(sample memodel.Sample, fidelity Fidelity) (Envelope,
 // NormalizedMetricSketchNative projects one native histogram tick.
 func NormalizedMetricSketchNative(sample engine.SketchSample) (Envelope, error) {
 	return normalizedMetricSketch(sample, FidelityNormalizedNative)
+}
+
+// NormalizedMetricSketchV3 projects one histogram tick retained by Amber
+// v0.3.0 with explicit legacy fidelity.
+func NormalizedMetricSketchV3(sample engine.SketchSample) (Envelope, error) {
+	return normalizedMetricSketch(sample, FidelityNormalizedV3)
 }
 
 func normalizedMetricSketch(sample engine.SketchSample, fidelity Fidelity) (Envelope, error) {

@@ -36,6 +36,7 @@ api:
   api_key: ""          # Bearer token, пусто = auth выключен
   security:
     insecure: true     # required for plaintext unauthenticated non-loopback dev listeners
+    danger_allow_bearer_over_plaintext: false # explicit danger opt-in when TLS is off
     tls:
       enabled: false
       cert_file: ""
@@ -49,7 +50,16 @@ log:
   format: text
 
 retention:
-  interval: 1h           # интервал проверки (общий для logs и spans)
+  interval: 1h           # интервал проверки (journal, logs и spans)
+
+  # Physical retention of the canonical OTLP replay journal. This is the raw
+  # payload/compliance boundary and uses the time Amber accepted each record,
+  # not timestamps inside telemetry. It is not S3-tiered. Zero disables a
+  # limit; with all three zero the journal grows until a disk/admission limit.
+  journal:
+    max_age: 0s          # пример: 720h (30 дней)
+    max_bytes: 0
+    max_segments: 0
 
   # Per-stream retention. Каждая секция имеет два tier'а:
   #   local_*  — снимает файл с локального диска, объект в S3 остаётся.

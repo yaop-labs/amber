@@ -73,3 +73,17 @@ func TestReadyHandler(t *testing.T) {
 		t.Fatalf("ready: code=%d, want 200", rec.Code)
 	}
 }
+
+func TestHealthzHandler_IsCanonicalLivenessProbe(t *testing.T) {
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, RoutesDeps{IsReady: func() bool { return false }}, RoutesConfig{})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz code=%d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != "ok\n" {
+		t.Fatalf("healthz body=%q, want %q", got, "ok\\n")
+	}
+}

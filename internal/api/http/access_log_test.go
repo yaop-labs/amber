@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yaop-labs/amber/internal/config"
+	"github.com/yaop-labs/reef/bearer"
 )
 
 // TestAccessLogMiddleware_RecordsKeyName threads the full auth + access-log
@@ -71,6 +72,20 @@ func TestAccessLogMiddleware_AnonymousWhenAuthDisabled(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, `api_key_name=""`) {
 		t.Errorf("expected empty api_key_name field in: %s", out)
+	}
+}
+
+func TestAccessLogMiddleware_RecordsReefPrincipal(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	handler := AccessLogMiddleware(log, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	req = req.WithContext(bearer.ContextWithPrincipal(req.Context(), "collector"))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(buf.String(), `api_key_name=collector`) {
+		t.Fatalf("access log did not record Reef principal: %s", buf.String())
 	}
 }
 

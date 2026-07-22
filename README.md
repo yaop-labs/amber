@@ -292,7 +292,36 @@ See [config.example.yaml](config.example.yaml) for all options. Key settings:
 | `api.http_addr` | `:8080` | HTTP listen address |
 | `api.grpc_addr` | `:4317` | gRPC listen address (OTLP) |
 | `api.api_key` | _(empty)_ | Bearer token (empty = auth disabled) |
-| `retention.max_age` | `0s` | Max segment age (0 = disabled) |
+| `retention.logs.max_age` | `0s` | Terminal log projection age (0 = disabled) |
+| `retention.spans.max_age` | `0s` | Terminal span projection age (0 = disabled) |
+| `retention.journal.max_age` | `0s` | Physical raw replay age from Amber acceptance time (0 = disabled) |
+
+### Replay journal retention
+
+Amber keeps accepted OTLP payloads in the canonical `otlp_v4` replay journal
+in addition to the query projections. Configure `retention.journal` to bound
+that physical raw copy by age, bytes, or sealed-segment count:
+
+```yaml
+retention:
+  interval: 1h
+  journal:
+    max_age: 720h
+    max_bytes: 0
+    max_segments: 0
+```
+
+Journal age uses the time Amber accepted a record, not timestamps carried by
+the telemetry. Backfilled or clock-skewed events therefore receive the same raw
+retention window as live data. Pruning is crash-retryable and operates on
+sealed segments; when an active segment is wholly expired it is rotated before
+deletion. Backups and offline replay see only the retained journal.
+
+`retention.logs` and `retention.spans` bound the query projections; the journal
+policy is the physical raw-payload/compliance boundary shared by all signals.
+If raw payloads must disappear no later than a fixed deadline, configure the
+journal deadline explicitly. With all journal limits at zero, raw replay is
+unbounded and disk capacity must be managed externally.
 
 ## License
 

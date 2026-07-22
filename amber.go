@@ -110,7 +110,17 @@ type Metrics struct {
 type Retention struct {
 	Logs     StreamRetention
 	Spans    StreamRetention
+	Journal  JournalRetention
 	Interval time.Duration
+}
+
+// JournalRetention bounds the physical canonical OTLP replay journal. MaxAge
+// uses Amber acceptance time, so old backfilled events are not deleted on
+// arrival. All limits are terminal; zero disables the corresponding limit.
+type JournalRetention struct {
+	MaxAge      time.Duration
+	MaxBytes    int64
+	MaxSegments int
 }
 
 // StreamRetention is the retention policy for one signal stream.
@@ -228,6 +238,9 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 		},
 		Retention: runtime.RetentionOptions{
 			Interval: o.Retention.Interval,
+			Journal: runtime.JournalRetentionOptions{
+				MaxAge: o.Retention.Journal.MaxAge, MaxBytes: o.Retention.Journal.MaxBytes, MaxSegments: o.Retention.Journal.MaxSegments,
+			},
 			Logs: runtime.StreamRetentionOptions{
 				LocalMaxAge: o.Retention.Logs.LocalMaxAge, LocalMaxBytes: o.Retention.Logs.LocalMaxBytes,
 				MaxAge: o.Retention.Logs.MaxAge, MaxTotalBytes: o.Retention.Logs.MaxBytes, MaxSegments: o.Retention.Logs.MaxSegments,

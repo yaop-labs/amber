@@ -2,13 +2,15 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/edge"
 	"github.com/yaop-labs/reef/tlsconf"
 	"gopkg.in/yaml.v3"
 )
@@ -63,9 +65,19 @@ type DebugConfig struct {
 
 // RetentionConfig groups the per-stream retention policies.
 type RetentionConfig struct {
-	Logs     StreamRetentionConfig `yaml:"logs"`
-	Spans    StreamRetentionConfig `yaml:"spans"`
-	Interval time.Duration         `yaml:"interval"`
+	Logs     StreamRetentionConfig  `yaml:"logs"`
+	Spans    StreamRetentionConfig  `yaml:"spans"`
+	Journal  JournalRetentionConfig `yaml:"journal"`
+	Interval time.Duration          `yaml:"interval"`
+}
+
+// JournalRetentionConfig bounds the physical canonical replay journal. Age is
+// measured from Amber acceptance time. All limits are terminal and local-only;
+// the journal is included in backups but is not tiered through segment S3.
+type JournalRetentionConfig struct {
+	MaxAge      time.Duration `yaml:"max_age"`
+	MaxBytes    int64         `yaml:"max_bytes"`
+	MaxSegments int           `yaml:"max_segments"`
 }
 
 // StreamRetentionConfig configures local and global retention for one stream.
@@ -149,9 +161,10 @@ type NamedAPIKey struct {
 // surfaces. Empty TLS/auth is permitted only for local dev or explicit insecure
 // mode; partial TLS/auth blocks fail validation through Reef.
 type APISecurityConfig struct {
-	TLS      tlsconf.ServerConfig `yaml:"tls"`
-	Auth     bearer.ServerConfig  `yaml:"auth"`
-	Insecure bool                 `yaml:"insecure"`
+	TLS                            tlsconf.ServerConfig `yaml:"tls"`
+	Auth                           bearer.ServerConfig  `yaml:"auth"`
+	Insecure                       bool                 `yaml:"insecure"`
+	DangerAllowBearerOverPlaintext bool                 `yaml:"danger_allow_bearer_over_plaintext"`
 }
 
 // APIConfig configures the HTTP and gRPC listeners and API keys.
@@ -202,11 +215,6 @@ func (c APIConfig) ResolvedBearerConfig() *bearer.ServerConfig {
 		out.Bearer = append(out.Bearer, bearer.Key{Name: k.Name, Token: k.Key})
 	}
 	return out
-}
-
-func (c APIConfig) reefSecurityConfigured() bool {
-	auth := c.ResolvedBearerConfig()
-	return c.Security.TLS.Enabled || (auth != nil && len(auth.Bearer) > 0)
 }
 
 // LogConfig configures the server's own logging (level, format).
@@ -261,19 +269,20 @@ func Default() *Config {
 	}
 }
 
-// Load reads, parses, and validates the YAML config at path, applying defaults.
+// Load reads, parses, and validates the YAML config at path, applying defaults
+// for fields omitted from the document. A missing path is an error; callers
+// that intentionally want the built-in defaults can use LoadOptional.
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
 	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return cfg, nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
@@ -286,6 +295,15 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadOptional is Load with an explicitly documented default-file policy.
+// It is intended for the standalone binary's conventional config.yaml path.
+func LoadOptional(path string) (*Config, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return Default(), nil
+	}
+	return Load(path)
 }
 
 // detectLegacyRetention rejects the old flat retention keys.
@@ -344,6 +362,43 @@ func (c *Config) Validate() error {
 	if c.Ingest.MaxServices < 0 {
 		return fmt.Errorf("ingest.max_services must be positive when set")
 	}
+	if c.Retention.Interval <= 0 {
+		return fmt.Errorf("retention.interval must be positive")
+	}
+	if err := validateStreamRetention("retention.logs", c.Retention.Logs); err != nil {
+		return err
+	}
+	if err := validateStreamRetention("retention.spans", c.Retention.Spans); err != nil {
+		return err
+	}
+	if c.Retention.Journal.MaxAge < 0 {
+		return fmt.Errorf("retention.journal.max_age must be positive when set")
+	}
+	if c.Retention.Journal.MaxBytes < 0 {
+		return fmt.Errorf("retention.journal.max_bytes must be positive when set")
+	}
+	if c.Retention.Journal.MaxSegments < 0 {
+		return fmt.Errorf("retention.journal.max_segments must be positive when set")
+	}
+	return nil
+}
+
+func validateStreamRetention(name string, value StreamRetentionConfig) error {
+	if value.LocalMaxAge < 0 {
+		return fmt.Errorf("%s.local_max_age must be positive when set", name)
+	}
+	if value.LocalMaxBytes < 0 {
+		return fmt.Errorf("%s.local_max_bytes must be positive when set", name)
+	}
+	if value.MaxAge < 0 {
+		return fmt.Errorf("%s.max_age must be positive when set", name)
+	}
+	if value.MaxBytes < 0 {
+		return fmt.Errorf("%s.max_bytes must be positive when set", name)
+	}
+	if value.MaxSegments < 0 {
+		return fmt.Errorf("%s.max_segments must be positive when set", name)
+	}
 	return nil
 }
 
@@ -360,45 +415,33 @@ func (c *Config) validateAPISecurity() error {
 			return fmt.Errorf("api.metrics_public=false requires bearer authentication")
 		}
 	}
-	secured := c.API.reefSecurityConfigured()
-	if c.API.Security.Insecure && secured {
-		return fmt.Errorf("api.security.insecure cannot be true when TLS or auth is configured")
-	}
-	if !secured && !c.API.Security.Insecure && apiExposesNonLoopback(c.API.HTTPAddr, c.API.GRPCAddr) {
-		return fmt.Errorf("api.security.insecure must be true for plaintext unauthenticated non-loopback listeners")
+	for kind, bind := range map[string]string{"http": c.API.HTTPAddr, "grpc": c.API.GRPCAddr} {
+		if bind == "" {
+			continue
+		}
+		if err := edge.CheckServer(edge.ServerConfig{
+			Bind:                           reefPolicyBind(bind),
+			TLS:                            &c.API.Security.TLS,
+			Auth:                           c.API.ResolvedBearerConfig(),
+			Insecure:                       c.API.Security.Insecure,
+			DangerAllowBearerOverPlaintext: c.API.Security.DangerAllowBearerOverPlaintext,
+		}); err != nil {
+			return fmt.Errorf("api.security.%s: %w", kind, err)
+		}
 	}
 	return nil
 }
 
-func apiExposesNonLoopback(addrs ...string) bool {
-	for _, addr := range addrs {
-		if addr == "" {
-			continue
-		}
-		if exposesNonLoopback(addr) {
-			return true
-		}
+// reefPolicyBind treats the conventional localhost name as loopback for the
+// security policy. The actual listener still uses the configured address.
+func reefPolicyBind(bind string) string {
+	if strings.HasPrefix(bind, "localhost:") {
+		return "127.0.0.1:" + strings.TrimPrefix(bind, "localhost:")
 	}
-	return false
-}
-
-func exposesNonLoopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
+	if bind == "localhost" {
+		return "127.0.0.1"
 	}
-	host = strings.Trim(host, "[]")
-	if host == "" {
-		return true
-	}
-	if strings.EqualFold(host, "localhost") {
-		return false
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return true
-	}
-	return !ip.IsLoopback()
+	return bind
 }
 
 func validateIngestLane(name string, lane IngestLaneConfig) error {

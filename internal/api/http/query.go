@@ -169,8 +169,8 @@ func parseLogQuery(r *http.Request) (*query.LogQuery, error) {
 	}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid 'limit': %w", err)
+		if err != nil || n <= 0 || n > 1000 {
+			return nil, fmt.Errorf("invalid 'limit': must be between 1 and 1000")
 		}
 		lq.Limit = n
 	}

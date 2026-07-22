@@ -80,15 +80,25 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	limit := 20
 	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 1000 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 1000")
+			return
 		}
+		limit = n
 	}
 	offset := 0
 	if v := q.Get("offset"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			offset = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1_000_000 {
+			writeError(w, http.StatusBadRequest, "offset must be between 0 and 1000000")
+			return
 		}
+		offset = n
+	}
+	if offset > 1_000_000-limit {
+		writeError(w, http.StatusBadRequest, "offset plus limit is too large")
+		return
 	}
 
 	// Covering .cidx projections answer service-filtered summaries without

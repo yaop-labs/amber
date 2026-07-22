@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/yaop-labs/reef/bearer"
 )
 
 // AccessLogMiddleware emits one structured log line per request once the
@@ -32,6 +34,9 @@ func AccessLogMiddleware(log *slog.Logger, next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 
 		keyName, _ := APIKeyNameFromContext(r.Context())
+		if keyName == "" {
+			keyName, _ = bearer.PrincipalFromContext(r.Context())
+		}
 		log.Info("http request",
 			"api_key_name", keyName,
 			"method", r.Method,

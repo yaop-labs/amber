@@ -113,7 +113,7 @@ func (h *OTLPHandler) spanIngestUnavailable() bool {
 func (h *OTLPHandler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "read body failed")
+		writeBodyReadError(w, err)
 		return
 	}
 
@@ -191,7 +191,7 @@ func (h *OTLPHandler) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (h *OTLPHandler) handleTraces(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "read body failed")
+		writeBodyReadError(w, err)
 		return
 	}
 
