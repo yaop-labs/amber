@@ -14,6 +14,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/edge"
+	"github.com/yaop-labs/reef/reefclient"
+	"github.com/yaop-labs/reef/tlsconf"
 )
 
 // DefaultAddr is the base URL used when none is configured.
@@ -24,6 +29,8 @@ type Client struct {
 	baseURL string
 	apiKey  string
 	http    *http.Client
+	close   func() error
+	initErr error
 }
 
 // Option configures a Client.
@@ -38,6 +45,37 @@ func WithAPIKey(key string) Option {
 // WithHTTPClient overrides the underlying *http.Client (timeouts, transport).
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) { c.http = h }
+}
+
+// WithEdgeConfig enables Reef-managed TLS, bearer credentials and origin
+// binding for the client. Construction errors are returned by the first
+// request because New remains backwards-compatible and non-throwing.
+func WithEdgeConfig(cfg EdgeConfig) Option {
+	return func(c *Client) {
+		edgeClient, _, err := reefclient.NewEdgeTransport(edge.ClientConfig{
+			Target:                         c.baseURL,
+			TLS:                            &cfg.TLS,
+			Auth:                           &cfg.Auth,
+			Insecure:                       cfg.Insecure,
+			DangerAllowBearerOverPlaintext: cfg.DangerAllowBearerOverPlaintext,
+			ReloadInterval:                 cfg.ReloadInterval,
+		}, nil)
+		if err != nil {
+			c.initErr = err
+			return
+		}
+		c.http = &http.Client{Transport: edgeClient, Timeout: 30 * time.Second}
+		c.close = edgeClient.Close
+	}
+}
+
+// EdgeConfig is the YAML-neutral client security surface used by amberctl.
+type EdgeConfig struct {
+	TLS                            tlsconf.ClientConfig
+	Auth                           bearer.ClientConfig
+	Insecure                       bool
+	DangerAllowBearerOverPlaintext bool
+	ReloadInterval                 time.Duration
 }
 
 // New returns a Client for addr (e.g. "http://localhost:8080"). A trailing
@@ -273,6 +311,9 @@ func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 }
 
 func (c *Client) get(ctx context.Context, path string, query url.Values, out any) error {
+	if c.initErr != nil {
+		return fmt.Errorf("client: configure Reef edge: %w", c.initErr)
+	}
 	u := c.baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -298,6 +339,14 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 		return fmt.Errorf("client: decode %s: %w", path, err)
 	}
 	return nil
+}
+
+// Close stops managed credential reload and closes idle transport connections.
+func (c *Client) Close() error {
+	if c == nil || c.close == nil {
+		return nil
+	}
+	return c.close()
 }
 
 // decodeError turns a non-200 response into a readable message. The server

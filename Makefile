@@ -1,11 +1,32 @@
-.PHONY: build test bench bench-mixed lint fmt tidy clean run docker docker-run hooks
+.PHONY: build test bench bench-mixed lint fmt tidy clean run docker docker-run hooks release release-check release-smoke
 
 BINARY := amber
 BUILD_FLAGS := -ldflags="-s -w"
+VERSION ?= 0.4.0-dev
+DIST_DIR ?= dist/$(VERSION)
 
 build:
 	go build $(BUILD_FLAGS) -o $(BINARY) ./cmd/amber
 	go build $(BUILD_FLAGS) -o amberctl ./cmd/amberctl
+
+release:
+	 rm -rf "$(DIST_DIR)"
+	 mkdir -p "$(DIST_DIR)"
+	 go build $(BUILD_FLAGS) -o "$(DIST_DIR)/amber" ./cmd/amber
+	 go build $(BUILD_FLAGS) -o "$(DIST_DIR)/amberctl" ./cmd/amberctl
+	 go build $(BUILD_FLAGS) -o "$(DIST_DIR)/amber-backup" ./cmd/amber-backup
+	 go build $(BUILD_FLAGS) -o "$(DIST_DIR)/amber-migrate" ./cmd/amber-migrate
+	 (cd "$(DIST_DIR)" && sha256sum amber amberctl amber-backup amber-migrate > SHA256SUMS)
+
+release-check:
+	 go test ./cmd/amber ./cmd/amberctl ./cmd/amber-backup ./cmd/amber-migrate ./internal/config ./internal/api/http ./internal/backup ./internal/gyreadapter -count=1
+	 go vet ./cmd/amber ./cmd/amberctl ./cmd/amber-backup ./cmd/amber-migrate ./internal/config ./internal/api/http ./internal/backup ./internal/gyreadapter
+
+release-smoke: release
+	 (cd "$(DIST_DIR)" && sha256sum -c SHA256SUMS)
+	 "$(DIST_DIR)/amberctl" help >/dev/null
+	 ! "$(DIST_DIR)/amber-backup" >/dev/null 2>&1
+	 ! "$(DIST_DIR)/amber-migrate" >/dev/null 2>&1
 
 run: build
 	./$(BINARY) config.example.yaml

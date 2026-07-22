@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/client"
+	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/tlsconf"
 )
 
 const usageText = `amberctl — command-line client for an amber instance
@@ -34,6 +36,9 @@ commands:
 common flags (all commands):
   --addr      amber address (env AMBER_ADDR, default http://localhost:8080)
   --api-key   bearer token (env AMBER_API_KEY)
+  --token-file bearer token file (env AMBER_TOKEN_FILE)
+  --tls-ca/--tls-cert/--tls-key  client TLS/mTLS files
+  --insecure  allow plaintext; --danger-allow-bearer-over-plaintext for bearer over plaintext
   --json      emit JSON
   --ndjson    emit newline-delimited JSON (logs/traces)
 
@@ -70,23 +75,46 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 
 // commonFlags holds the connection/output options every command shares.
 type commonFlags struct {
-	addr   string
-	apiKey string
-	json   bool
-	ndjson bool
+	addr       string
+	apiKey     string
+	tokenFile  string
+	caFile     string
+	certFile   string
+	keyFile    string
+	serverName string
+	insecure   bool
+	danger     bool
+	json       bool
+	ndjson     bool
 }
 
 func registerCommon(fs *flag.FlagSet) *commonFlags {
 	cf := &commonFlags{}
 	fs.StringVar(&cf.addr, "addr", envOr("AMBER_ADDR", client.DefaultAddr), "amber server address")
 	fs.StringVar(&cf.apiKey, "api-key", os.Getenv("AMBER_API_KEY"), "bearer API key")
+	fs.StringVar(&cf.tokenFile, "token-file", os.Getenv("AMBER_TOKEN_FILE"), "bearer token file")
+	fs.StringVar(&cf.caFile, "tls-ca", os.Getenv("AMBER_TLS_CA"), "custom CA file")
+	fs.StringVar(&cf.certFile, "tls-cert", os.Getenv("AMBER_TLS_CERT"), "client certificate file")
+	fs.StringVar(&cf.keyFile, "tls-key", os.Getenv("AMBER_TLS_KEY"), "client private key file")
+	fs.StringVar(&cf.serverName, "tls-server-name", os.Getenv("AMBER_TLS_SERVER_NAME"), "TLS server name override")
+	fs.BoolVar(&cf.insecure, "insecure", os.Getenv("AMBER_INSECURE") == "1", "allow plaintext transport")
+	fs.BoolVar(&cf.danger, "danger-allow-bearer-over-plaintext", os.Getenv("AMBER_DANGER_ALLOW_BEARER_OVER_PLAINTEXT") == "1", "allow bearer credentials over plaintext")
 	fs.BoolVar(&cf.json, "json", false, "emit JSON")
 	fs.BoolVar(&cf.ndjson, "ndjson", false, "emit newline-delimited JSON")
 	return cf
 }
 
 func (cf *commonFlags) newClient() *client.Client {
-	return client.New(cf.addr, client.WithAPIKey(cf.apiKey))
+	localDev := strings.HasPrefix(strings.ToLower(cf.addr), "http://localhost") && cf.apiKey == "" && cf.tokenFile == ""
+	return client.New(cf.addr,
+		client.WithAPIKey(cf.apiKey),
+		client.WithEdgeConfig(client.EdgeConfig{
+			TLS:                            tlsconf.ClientConfig{Enabled: cf.caFile != "" || cf.certFile != "" || cf.keyFile != "", CAFile: cf.caFile, CertFile: cf.certFile, KeyFile: cf.keyFile, ServerName: cf.serverName},
+			Auth:                           bearer.ClientConfig{Token: cf.apiKey, TokenFile: cf.tokenFile},
+			Insecure:                       localDev || cf.insecure,
+			DangerAllowBearerOverPlaintext: cf.danger,
+		}),
+	)
 }
 
 func envOr(key, def string) string {

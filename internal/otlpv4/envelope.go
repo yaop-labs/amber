@@ -51,8 +51,9 @@ type Fidelity uint8
 
 const (
 	FidelityOTLP Fidelity = 1
-	// Value 2 is intentionally unsupported so the existing native AOT4 wire
-	// value remains stable after removal of the pre-production migration path.
+	// FidelityNormalizedV3 marks a deterministic, lossy OTLP projection of
+	// records retained by Amber v0.3.0. It is not the original accepted OTLP.
+	FidelityNormalizedV3     Fidelity = 2
 	FidelityNormalizedNative Fidelity = 3
 )
 
@@ -210,7 +211,7 @@ func validateSignal(signal Signal) error {
 }
 
 func validateFidelity(fidelity Fidelity) error {
-	if fidelity != FidelityOTLP && fidelity != FidelityNormalizedNative {
+	if fidelity != FidelityOTLP && fidelity != FidelityNormalizedV3 && fidelity != FidelityNormalizedNative {
 		return fmt.Errorf("otlpv4: unsupported fidelity %d", fidelity)
 	}
 	return nil

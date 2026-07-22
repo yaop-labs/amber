@@ -18,6 +18,13 @@ func NormalizedLogNative(entry model.LogEntry) (Envelope, error) {
 	return normalizedLog(entry, FidelityNormalizedNative)
 }
 
+// NormalizedLogV3 projects a log retained by Amber v0.3.0 into canonical
+// OTLP. The resulting fidelity explicitly records that the original OTLP is
+// unavailable.
+func NormalizedLogV3(entry model.LogEntry) (Envelope, error) {
+	return normalizedLog(entry, FidelityNormalizedV3)
+}
+
 func normalizedLog(entry model.LogEntry, fidelity Fidelity) (Envelope, error) {
 	severity, err := normalizedSeverity(entry.Level)
 	if err != nil {
@@ -48,6 +55,12 @@ func normalizedLog(entry model.LogEntry, fidelity Fidelity) (Envelope, error) {
 // NormalizedSpanNative projects a native Amber span into canonical OTLP.
 func NormalizedSpanNative(entry model.SpanEntry) (Envelope, error) {
 	return normalizedSpan(entry, FidelityNormalizedNative)
+}
+
+// NormalizedSpanV3 projects a span retained by Amber v0.3.0 into canonical
+// OTLP with explicit legacy fidelity.
+func NormalizedSpanV3(entry model.SpanEntry) (Envelope, error) {
+	return normalizedSpan(entry, FidelityNormalizedV3)
 }
 
 func normalizedSpan(entry model.SpanEntry, fidelity Fidelity) (Envelope, error) {

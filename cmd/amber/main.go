@@ -16,11 +16,15 @@ import (
 	ambergrpc "github.com/yaop-labs/amber/internal/api/grpc"
 	amberhttp "github.com/yaop-labs/amber/internal/api/http"
 	"github.com/yaop-labs/amber/internal/config"
+	"github.com/yaop-labs/amber/internal/gyreadapter"
 	mestore "github.com/yaop-labs/amber/internal/metricsengine/store"
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
+	"github.com/yaop-labs/gyre"
+	"github.com/yaop-labs/reef/edge"
 	"github.com/yaop-labs/reef/grpcreef"
-	"github.com/yaop-labs/reef/tlsconf"
+	"google.golang.org/grpc/health"
+	grpc_health_v1 "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func main() {
@@ -36,7 +40,7 @@ func run() error {
 		cfgPath = os.Args[1]
 	}
 
-	cfg, err := config.Load(cfgPath)
+	cfg, err := config.LoadOptional(cfgPath)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -47,15 +51,14 @@ func run() error {
 		"http_addr", cfg.API.HTTPAddr,
 	)
 	authCfg := cfg.API.ResolvedBearerConfig()
-	httpTLS, err := tlsconf.Server(&cfg.API.Security.TLS)
+	httpEdge, err := newHTTPEdge(cfg.API)
 	if err != nil {
-		return fmt.Errorf("configure http reef tls: %w", err)
+		return fmt.Errorf("configure http reef edge: %w", err)
 	}
-	httpAuth, err := newHTTPAuth(cfg.API)
-	if err != nil {
-		return fmt.Errorf("configure http reef auth: %w", err)
+	for _, warning := range httpEdge.Warnings {
+		log.Warn("amber http reef edge warning", "warning", warning)
 	}
-	tlsconf.WarnIfPlaintext(log, "amber-http", httpTLS != nil)
+	defer func() { _ = httpEdge.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -113,6 +116,9 @@ func run() error {
 		},
 		Retention: runtime.RetentionOptions{
 			Interval: cfg.Retention.Interval,
+			Journal: runtime.JournalRetentionOptions{
+				MaxAge: cfg.Retention.Journal.MaxAge, MaxBytes: cfg.Retention.Journal.MaxBytes, MaxSegments: cfg.Retention.Journal.MaxSegments,
+			},
 			Logs: runtime.StreamRetentionOptions{
 				LocalMaxAge: cfg.Retention.Logs.LocalMaxAge, LocalMaxBytes: cfg.Retention.Logs.LocalMaxBytes,
 				MaxAge: cfg.Retention.Logs.MaxAge, MaxTotalBytes: cfg.Retention.Logs.MaxBytes, MaxSegments: cfg.Retention.Logs.MaxSegments,
@@ -126,6 +132,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	var opsRuntime gyre.Runtime
+	if err := opsRuntime.Add(gyreadapter.NewStackComponent(stack)); err != nil {
+		_ = stack.Close(context.Background())
+		return fmt.Errorf("register amber storage component: %w", err)
+	}
+	var grpcComponent *gyreadapter.GRPCComponent
+	var pprofComponent *gyreadapter.HTTPComponent
 
 	selfobs.RegisterGaugeFunc("amber_ingest_queue_length", "Items currently buffered in the ingest queue.", func() float64 {
 		return float64(stack.Batcher.QueueLen())
@@ -218,22 +231,23 @@ func run() error {
 	}
 
 	if cfg.API.GRPCAddr != "" {
-		grpcOpts, err := grpcreef.ServerOptions(&cfg.API.Security.TLS, authCfg)
+		grpcEdge, err := grpcreef.NewServerEdge(edge.ServerConfig{
+			Bind:                           policyBind(cfg.API.GRPCAddr),
+			TLS:                            &cfg.API.Security.TLS,
+			Auth:                           authCfg,
+			Insecure:                       cfg.API.Security.Insecure,
+			DangerAllowBearerOverPlaintext: cfg.API.Security.DangerAllowBearerOverPlaintext,
+		})
 		if err != nil {
-			return fmt.Errorf("configure grpc reef: %w", err)
+			return fmt.Errorf("configure grpc reef edge: %w", err)
 		}
-		tlsconf.WarnIfPlaintext(log, "amber-grpc", cfg.API.Security.TLS.Enabled)
-		grpcServer := ambergrpc.NewServerWithJournal(stack.Batcher, stack.MetricStore, stack.OTLPJournal, int(cfg.API.MaxRequestBytes), log, grpcOpts...)
-		go func() {
-			log.Info("grpc server listening", "addr", cfg.API.GRPCAddr)
-			if err := ambergrpc.ListenAndServe(grpcServer, cfg.API.GRPCAddr); err != nil {
-				log.Error("grpc server error", "err", err)
-			}
-		}()
-		go func() {
-			<-ctx.Done()
-			grpcServer.GracefulStop()
-		}()
+		defer func() { _ = grpcEdge.Close() }()
+		grpcServer := ambergrpc.NewServerWithJournal(stack.Batcher, stack.MetricStore, stack.OTLPJournal, int(cfg.API.MaxRequestBytes), log, grpcEdge.Options...)
+		healthServer := health.NewServer()
+		grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+		healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+		grpcComponent = gyreadapter.NewGRPCComponent(cfg.API.GRPCAddr, grpcServer)
+		go monitorGRPCHealth(ctx, healthServer, &opsRuntime)
 	}
 
 	if cfg.Debug.Pprof {
@@ -255,22 +269,12 @@ func run() error {
 			Handler:           pprofMux,
 			ReadHeaderTimeout: 5 * time.Second,
 		}
-		go func() {
-			log.Info("pprof listening", "addr", pprofAddr)
-			if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Error("pprof server error", "err", err)
-			}
-		}()
-		go func() {
-			<-ctx.Done()
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = pprofServer.Shutdown(shutdownCtx)
-		}()
+		pprofComponent = gyreadapter.NewHTTPComponent(pprofAddr, pprofServer, nil)
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", selfobs.Handler())
+	mux.Handle("/status", gyre.RuntimeHTTPHandler(&opsRuntime))
 	amberhttp.RegisterRoutes(mux, amberhttp.RoutesDeps{
 		Batcher:     stack.Batcher,
 		Executor:    stack.Executor,
@@ -278,44 +282,48 @@ func run() error {
 		LogSparse:   stack.LogSparse,
 		MetricStore: stack.MetricStore,
 		OTLPJournal: stack.OTLPJournal,
-		IsReady:     stack.IsReady,
-		Status:      stack.Status,
-		Logger:      log,
+		IsReady: func() bool {
+			return opsRuntime.Ready(context.Background()) == nil
+		},
+		Status: stack.Status,
+		Logger: log,
 	}, amberhttp.RoutesConfig{
 		MaxRequestBytes: cfg.API.MaxRequestBytes,
 	})
 
 	httpServer := &http.Server{
 		Addr:              cfg.API.HTTPAddr,
-		Handler:           httpAuth(mux),
+		Handler:           httpEdge.Middleware(mux),
 		ReadTimeout:       cfg.API.ReadTimeout,
 		ReadHeaderTimeout: cfg.API.ReadHeaderTimeout,
 		WriteTimeout:      cfg.API.WriteTimeout,
 		IdleTimeout:       cfg.API.IdleTimeout,
-		TLSConfig:         httpTLS,
+		TLSConfig:         httpEdge.TLSConfig,
 	}
-	go func() {
-		log.Info("http server listening", "addr", httpServer.Addr)
-		var err error
-		if httpTLS != nil {
-			err = httpServer.ListenAndServeTLS("", "")
-		} else {
-			err = httpServer.ListenAndServe()
+	httpComponent := gyreadapter.NewHTTPComponent(cfg.API.HTTPAddr, httpServer, httpEdge.TLSConfig)
+	if grpcComponent != nil {
+		if err := opsRuntime.AddWithDependencies(grpcComponent, "amber-storage"); err != nil {
+			_ = stack.Close(context.Background())
+			return fmt.Errorf("register amber grpc component: %w", err)
 		}
-		if err != nil && err != http.ErrServerClosed {
-			log.Error("http server error", "err", err)
+	}
+	if err := opsRuntime.AddWithDependencies(httpComponent, "amber-storage"); err != nil {
+		_ = stack.Close(context.Background())
+		return fmt.Errorf("register amber http component: %w", err)
+	}
+	if pprofComponent != nil {
+		if err := opsRuntime.Add(pprofComponent); err != nil {
+			_ = stack.Close(context.Background())
+			return fmt.Errorf("register amber pprof component: %w", err)
 		}
-	}()
+	}
+	if err := opsRuntime.Start(ctx); err != nil {
+		_ = stack.Close(context.Background())
+		return fmt.Errorf("start amber operational runtime: %w", err)
+	}
 
 	<-ctx.Done()
 	log.Info("shutdown signal received")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Error("http server shutdown error", "err", err)
-	}
 
 	batcherTimeout := cfg.Ingest.ShutdownTimeout
 	if batcherTimeout <= 0 {
@@ -323,8 +331,8 @@ func run() error {
 	}
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), batcherTimeout)
 	defer closeCancel()
-	if err := stack.Close(closeCtx); err != nil {
-		log.Error("stack close error", "err", err)
+	if err := opsRuntime.Close(closeCtx); err != nil {
+		log.Error("operational runtime close error", "err", err)
 	}
 
 	log.Info("amber stopped")
@@ -350,4 +358,26 @@ func setupLogger(cfg config.LogConfig) *slog.Logger {
 		h = slog.NewTextHandler(os.Stdout, opts)
 	}
 	return slog.New(h)
+}
+
+func monitorGRPCHealth(ctx context.Context, server *health.Server, runtime *gyre.Runtime) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	set := func(serving bool) {
+		status := grpc_health_v1.HealthCheckResponse_NOT_SERVING
+		if serving {
+			status = grpc_health_v1.HealthCheckResponse_SERVING
+		}
+		server.SetServingStatus("", status)
+		server.SetServingStatus("amber", status)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			set(false)
+			return
+		case <-ticker.C:
+			set(runtime.Ready(context.Background()) == nil)
+		}
+	}
 }

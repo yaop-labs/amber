@@ -134,3 +134,86 @@ jobs:
           go-version: "1.26"
           cache: true
       - run: go test ./... -race -count=1 -timeout=10m
+
+  release-smoke:
+    name: Release artifacts and clean-host smoke
+    runs-on: ubuntu-latest
+    needs: [test, s3-integration]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build release artifacts
+        run: make release VERSION=0.4.0-ci
+      - name: Verify checksums and CLI surfaces
+        run: make release-smoke VERSION=0.4.0-ci
+      - name: Clean-host server smoke
+        run: |
+          work=$(mktemp -d)
+          cp config.example.yaml "$work/config.yaml"
+          sed -i "s#data_dir: ./data#data_dir: $work/data#" "$work/config.yaml"
+          ./dist/0.4.0-ci/amber "$work/config.yaml" >"$work/amber.log" 2>&1 &
+          pid=$!
+          cleanup() { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" || true; }
+          trap cleanup EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:8080/healthz | grep -Fx 'ok'
+          curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/status >/dev/null
+          ./dist/0.4.0-ci/amberctl stats --addr http://127.0.0.1:8080 >/dev/null
+      - name: Secure amberctl TLS and token-file smoke
+        run: |
+          work=$(mktemp -d)
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+            -keyout "$work/server.key" -out "$work/server.crt" >/dev/null 2>&1
+          printf 'ci-secret-token\n' >"$work/token"
+          cp config.example.yaml "$work/config.yaml"
+          sed -i \
+            -e "s#http_addr: \"\?[^\" ]*\"\?#http_addr: 127.0.0.1:18080#" \
+            -e 's#grpc_addr: .*#grpc_addr: ""#' \
+            -e 's#insecure: true#insecure: false#' \
+            -e "s#enabled: false#enabled: true#" \
+            -e "s#cert_file: \"\"#cert_file: $work/server.crt#" \
+            -e "s#key_file: \"\"#key_file: $work/server.key#" \
+            -e "s#bearer: \[\]#bearer: [{name: ci, token_file: $work/token}]#" \
+            -e "s#data_dir: ./data#data_dir: $work/data#" \
+            "$work/config.yaml"
+          ./dist/0.4.0-ci/amber "$work/config.yaml" >"$work/amber.log" 2>&1 &
+          pid=$!
+          cleanup() { kill -TERM "$pid" 2>/dev/null || true; wait "$pid" || true; }
+          trap cleanup EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --cacert "$work/server.crt" \
+              https://127.0.0.1:18080/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --cacert "$work/server.crt" \
+            https://127.0.0.1:18080/healthz >/dev/null
+          ./dist/0.4.0-ci/amberctl stats \
+            --addr https://127.0.0.1:18080 --token-file "$work/token" \
+            --tls-ca "$work/server.crt" >/dev/null
+
+  benchmark:
+    name: Query benchmark baseline
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Run release benchmark subset
+        run: go test ./benchmarks/ -bench='BenchmarkQuery_FullScan_(1k|10k|100k)$' -benchtime=1s -run='^$' -timeout=10m | tee benchmark-output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amber-benchmark-${{ github.sha }}
+          path: benchmark-output.txt

@@ -57,6 +57,10 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 			"status": health, "ready": status.Ready, "degraded": status.Degraded, "reasons": status.Reasons,
 		})
 	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
 
 	mux.Handle("GET /readyz", ReadyHandler(deps.IsReady))
 

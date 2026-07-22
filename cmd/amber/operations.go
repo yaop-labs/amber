@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/yaop-labs/amber/internal/runtime"
 	"github.com/yaop-labs/amber/internal/selfobs"
 	"github.com/yaop-labs/reef/bearer"
+	"github.com/yaop-labs/reef/edge"
 )
 
 func newHTTPAuth(cfg config.APIConfig) (func(http.Handler) http.Handler, error) {
@@ -23,6 +25,30 @@ func newHTTPAuth(cfg config.APIConfig) (func(http.Handler) http.Handler, error) 
 	return bearer.Require(cfg.ResolvedBearerConfig(), bearer.ExemptPaths(exempt...))
 }
 
+func newHTTPEdge(cfg config.APIConfig) (*edge.HTTPServer, error) {
+	exempt := []string{"/health", "/healthz", "/readyz"}
+	if cfg.MetricsPublic {
+		exempt = append(exempt, "/metrics")
+	}
+	return edge.NewHTTPServer(edge.ServerConfig{
+		Bind:                           policyBind(cfg.HTTPAddr),
+		TLS:                            &cfg.Security.TLS,
+		Auth:                           cfg.ResolvedBearerConfig(),
+		Insecure:                       cfg.Security.Insecure,
+		DangerAllowBearerOverPlaintext: cfg.Security.DangerAllowBearerOverPlaintext,
+	}, bearer.ExemptPaths(exempt...))
+}
+
+func policyBind(bind string) string {
+	if strings.HasPrefix(bind, "localhost:") {
+		return "127.0.0.1:" + strings.TrimPrefix(bind, "localhost:")
+	}
+	if bind == "localhost" {
+		return "127.0.0.1"
+	}
+	return bind
+}
+
 type checkpointMetrics struct {
 	backupTimestamp  float64
 	backupAge        float64
@@ -31,16 +57,23 @@ type checkpointMetrics struct {
 }
 
 type otlpReplayMetrics struct {
-	enabled         float64
-	statsError      float64
-	sealedSegments  float64
-	activeSegment   float64
-	activeRecords   float64
-	totalRecords    float64
-	segmentBytes    float64
-	walBytes        float64
-	storageBytes    float64
-	walRepairEvents float64
+	enabled                  float64
+	statsError               float64
+	sealedSegments           float64
+	activeSegment            float64
+	activeRecords            float64
+	totalRecords             float64
+	segmentBytes             float64
+	walBytes                 float64
+	storageBytes             float64
+	walRepairEvents          float64
+	retentionRuns            float64
+	retentionFailures        float64
+	retentionDeletedSegments float64
+	retentionDeletedRecords  float64
+	retentionDeletedBytes    float64
+	retentionLastSuccess     float64
+	retentionOldestRetained  float64
 }
 
 func readCheckpointMetrics(status runtime.Status, now time.Time) checkpointMetrics {
@@ -110,6 +143,13 @@ func registerOTLPReplayMetrics(journal *otlpv4.Journal) func() otlpReplayMetrics
 		cached.walBytes = float64(stats.WALBytes)
 		cached.storageBytes = float64(stats.SegmentBytes + stats.WALBytes)
 		cached.walRepairEvents = float64(stats.WALCorruptRecords)
+		cached.retentionRuns = float64(stats.Retention.Runs)
+		cached.retentionFailures = float64(stats.Retention.Failures)
+		cached.retentionDeletedSegments = float64(stats.Retention.DeletedSegments)
+		cached.retentionDeletedRecords = float64(stats.Retention.DeletedRecords)
+		cached.retentionDeletedBytes = float64(stats.Retention.DeletedBytes)
+		cached.retentionLastSuccess = unixSecondsOrZero(stats.Retention.LastSuccessAt)
+		cached.retentionOldestRetained = unixSecondsOrZero(stats.Retention.OldestRetainedAt)
 		return cached
 	}
 	registerGauge := func(name, help string, value func(otlpReplayMetrics) float64) {
@@ -125,11 +165,25 @@ func registerOTLPReplayMetrics(journal *otlpv4.Journal) func() otlpReplayMetrics
 	registerGauge("amber_otlp_replay_wal_bytes", "Physical bytes occupied by the active OTLP replay WAL.", func(metrics otlpReplayMetrics) float64 { return metrics.walBytes })
 	registerGauge("amber_otlp_replay_storage_bytes", "Physical bytes occupied by OTLP replay segments and WAL, excluding small metadata files.", func(metrics otlpReplayMetrics) float64 { return metrics.storageBytes })
 	selfobs.RegisterCounterFunc("amber_otlp_replay_wal_repair_events_total", "Malformed OTLP replay WAL tails repaired during the current process start.", func() float64 { return read().walRepairEvents })
+	selfobs.RegisterCounterFunc("amber_otlp_replay_retention_runs_total", "OTLP replay journal retention attempts in the current process.", func() float64 { return read().retentionRuns })
+	selfobs.RegisterCounterFunc("amber_otlp_replay_retention_failures_total", "Failed OTLP replay journal retention attempts in the current process.", func() float64 { return read().retentionFailures })
+	selfobs.RegisterCounterFunc("amber_otlp_replay_retention_deleted_segments_total", "OTLP replay journal segments physically deleted by retention in the current process.", func() float64 { return read().retentionDeletedSegments })
+	selfobs.RegisterCounterFunc("amber_otlp_replay_retention_deleted_records_total", "OTLP replay envelopes physically deleted by retention in the current process.", func() float64 { return read().retentionDeletedRecords })
+	selfobs.RegisterCounterFunc("amber_otlp_replay_retention_deleted_bytes_total", "OTLP replay segment bytes physically deleted by retention in the current process.", func() float64 { return read().retentionDeletedBytes })
+	registerGauge("amber_otlp_replay_retention_last_success_timestamp_seconds", "Unix timestamp of the last successful OTLP replay retention attempt, or 0 before the first success.", func(metrics otlpReplayMetrics) float64 { return metrics.retentionLastSuccess })
+	registerGauge("amber_otlp_replay_oldest_retained_timestamp_seconds", "Acceptance timestamp of the oldest retained OTLP replay record, or 0 when empty.", func(metrics otlpReplayMetrics) float64 { return metrics.retentionOldestRetained })
 	return read
 }
 
 func unixSeconds(value time.Time) float64 {
 	return float64(value.UnixNano()) / float64(time.Second)
+}
+
+func unixSecondsOrZero(value time.Time) float64 {
+	if value.IsZero() {
+		return 0
+	}
+	return unixSeconds(value)
 }
 
 func nonNegativeAge(now, value time.Time) float64 {

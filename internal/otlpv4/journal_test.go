@@ -2,11 +2,14 @@ package otlpv4
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 	"google.golang.org/protobuf/proto"
 )
@@ -307,5 +310,295 @@ func TestReplayHonorsCancellation(t *testing.T) {
 	cancel()
 	if err := Replay(ctx, root, func(Envelope) error { return nil }); err == nil {
 		t.Fatal("Replay() error = nil for canceled context")
+	}
+}
+
+func TestJournalPruneByAgeSurvivesRestartAndReplay(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := journal.Append(envelope, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(envelope, now.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := journal.Prune(now, RetentionPolicy{MaxAge: time.Hour})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if result.DeletedSegments != 1 || result.DeletedRecords != 1 || result.DeletedBytes == 0 {
+		t.Fatalf("prune result = %+v, want one deleted record and segment", result)
+	}
+	stats, err := journal.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalRecords != 1 || stats.Retention.Runs != 1 || stats.Retention.Failures != 0 || stats.Retention.DeletedRecords != 1 || stats.Retention.LastSuccessAt.IsZero() {
+		t.Fatalf("stats after prune = %+v", stats)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	if err := Replay(context.Background(), root, func(Envelope) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("replayed %d envelopes after prune, want 1", count)
+	}
+}
+
+func TestJournalPruneRotatesExpiredActiveSegment(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 100, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := journal.Append(envelope, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := journal.Prune(now, RetentionPolicy{MaxAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedSegments != 1 || result.DeletedRecords != 1 {
+		t.Fatalf("prune result = %+v, want expired active segment deleted", result)
+	}
+	stats, err := journal.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalRecords != 0 || stats.SealedSegments != 0 || !stats.ActiveSegment {
+		t.Fatalf("stats after active prune = %+v", stats)
+	}
+}
+
+func TestJournalPruneUsesAcceptanceTimeForNativeEntries(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	entry := model.LogEntry{
+		ID:        model.MustNewEntryID(),
+		Timestamp: time.Unix(1, 0),
+		Level:     model.LevelInfo,
+		Service:   "backfill",
+		Body:      "old event accepted now",
+	}
+	if err := journal.AppendNormalizedLogs([]model.LogEntry{entry}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := journal.Prune(time.Now().UTC(), RetentionPolicy{MaxAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedSegments != 0 {
+		t.Fatalf("native backfill expired from event time: %+v", result)
+	}
+}
+
+func TestJournalPruneEnforcesSegmentLimitAndRejectsInvalidPolicy(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if err := journal.Append(envelope, time.Unix(int64(i+1), 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := journal.Prune(time.Now().UTC(), RetentionPolicy{MaxSegments: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedSegments != 2 || result.DeletedRecords != 2 {
+		t.Fatalf("segment-limit result = %+v", result)
+	}
+	if _, err := journal.Prune(time.Now().UTC(), RetentionPolicy{MaxBytes: -1}); err == nil {
+		t.Fatal("negative max bytes accepted")
+	}
+	stats, err := journal.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Retention.Runs != 2 || stats.Retention.Failures != 1 {
+		t.Fatalf("retention failure stats = %+v", stats.Retention)
+	}
+}
+
+func TestJournalPruneResumesDeletePendingWithDisabledPolicy(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(envelope, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	metaPath := filepath.Join(root, DirectoryName, "meta.json")
+	payload, err := os.ReadFile(metaPath) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta storage.StoreMeta
+	if err := json.Unmarshal(payload, &meta); err != nil {
+		t.Fatal(err)
+	}
+	for i := range meta.Segments {
+		if meta.Segments[i].Sealed {
+			meta.Segments[i].DeletePending = true
+			break
+		}
+	}
+	payload, err = json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenJournal(root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := reopened.Prune(time.Now().UTC(), RetentionPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedSegments != 1 || result.DeletedRecords != 1 {
+		t.Fatalf("pending prune result = %+v", result)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	if err := Replay(context.Background(), root, func(Envelope) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("replayed %d pending-deleted records, want 0", count)
+	}
+}
+
+func TestJournalConcurrentPruneIsSerialized(t *testing.T) {
+	root := t.TempDir()
+	journal, err := OpenJournal(root, storage.RotationPolicy{MaxRecords: 1, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	envelope, err := New(SignalLogs, FidelityOTLP, richLogsRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		if err := journal.Append(envelope, time.Unix(int64(i+1), 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, pruneErr := journal.Prune(time.Now().UTC(), RetentionPolicy{MaxSegments: 1})
+			errs <- pruneErr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for pruneErr := range errs {
+		if pruneErr != nil {
+			t.Fatal(pruneErr)
+		}
+	}
+	stats, err := journal.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalRecords != 1 || stats.Retention.Runs != 4 || stats.Retention.Failures != 0 || stats.Retention.DeletedRecords != 7 {
+		t.Fatalf("stats after concurrent prune = %+v", stats)
+	}
+}
+
+func TestSelectRetentionSegmentsCombinesAgeCountAndBytes(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	segments := []storage.SegmentMeta{
+		{ID: 1, Sealed: true, MinTS: now.Add(-5 * time.Hour).UnixNano(), MaxTS: now.Add(-4 * time.Hour).UnixNano(), SizeBytes: 10},
+		{ID: 2, Sealed: true, MinTS: now.Add(-3 * time.Hour).UnixNano(), MaxTS: now.Add(-2 * time.Hour).UnixNano(), SizeBytes: 20},
+		{ID: 3, Sealed: true, MinTS: now.Add(-time.Hour).UnixNano(), MaxTS: now.Add(-time.Hour).UnixNano(), SizeBytes: 30},
+		{ID: 4, Sealed: true, DeletePending: true, MinTS: now.UnixNano(), MaxTS: now.UnixNano(), SizeBytes: 40},
+	}
+	selected := selectRetentionSegments(segments, now, RetentionPolicy{
+		MaxAge:      3 * time.Hour,
+		MaxBytes:    30,
+		MaxSegments: 2,
+	})
+	if len(selected) != 3 || selected[0].ID != 1 || selected[1].ID != 2 || selected[2].ID != 4 {
+		t.Fatalf("selected = %+v, want ids 1,2,4", selected)
 	}
 }

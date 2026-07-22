@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/backup"
 	"github.com/yaop-labs/amber/internal/dbmeta"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/otlpv4"
@@ -161,6 +162,16 @@ func TestNewSetsMemoryLimit(t *testing.T) {
 
 	if got := debug.SetMemoryLimit(-1); got != limit {
 		t.Fatalf("memory limit = %d, want %d", got, limit)
+	}
+}
+
+func TestNewRejectsNegativeJournalRetention(t *testing.T) {
+	_, err := New(context.Background(), Options{
+		DataDir:   t.TempDir(),
+		Retention: RetentionOptions{Journal: JournalRetentionOptions{MaxBytes: -1}},
+	})
+	if err == nil {
+		t.Fatal("negative journal retention accepted")
 	}
 }
 
@@ -454,6 +465,89 @@ func TestRuntimeReportsOTLPJournalWALRepair(t *testing.T) {
 	status := reopened.Status()
 	if status.WALRepairEvents != 1 || !statusHasReason(status, "otlp_v4_wal_tail_repaired", 1) {
 		t.Fatalf("status after OTLP WAL repair = %+v", status)
+	}
+}
+
+func TestRuntimeJournalRetentionSurvivesRestartReplayAndBackup(t *testing.T) {
+	root := t.TempDir()
+	stack, err := New(context.Background(), Options{
+		DataDir: root,
+		Storage: StorageOptions{SegmentMaxRecords: 1, SegmentMaxBytes: 1 << 20},
+		Ingest:  IngestOptions{BatchSize: 1, BatchTimeout: time.Hour, QueueSize: 16},
+		Metrics: MetricsOptions{Disabled: true},
+		Retention: RetentionOptions{
+			Interval: 10 * time.Millisecond,
+			Journal:  JournalRetentionOptions{MaxSegments: 1},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		entry := model.LogEntry{
+			ID:        model.MustNewEntryID(),
+			Timestamp: time.Now().Add(time.Duration(i) * time.Nanosecond),
+			Level:     model.LevelInfo,
+			Service:   "journal-retention",
+			Body:      "entry",
+		}
+		if err := stack.Batcher.SendLog(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flushBatcher(t, stack)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		stats, statsErr := stack.OTLPJournal.Stats()
+		if statsErr != nil {
+			t.Fatal(statsErr)
+		}
+		if stats.TotalRecords == 1 && stats.Retention.DeletedRecords == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("journal retention did not converge: %+v", stats)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := stack.Close(closeCtx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+
+	assertReplayCount := func(dataRoot string, want int) {
+		t.Helper()
+		count := 0
+		if err := otlpv4.Replay(context.Background(), dataRoot, func(otlpv4.Envelope) error {
+			count++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if count != want {
+			t.Fatalf("Replay(%s) count = %d, want %d", dataRoot, count, want)
+		}
+	}
+	assertReplayCount(root, 1)
+
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := backup.Create(context.Background(), root, snapshot); err != nil {
+		t.Fatalf("backup after journal retention: %v", err)
+	}
+	assertReplayCount(filepath.Join(snapshot, backup.DataDirectoryName), 1)
+
+	reopened, err := New(context.Background(), Options{DataDir: root, Metrics: MetricsOptions{Disabled: true}})
+	if err != nil {
+		t.Fatalf("reopen retained root: %v", err)
+	}
+	closeCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := reopened.Close(closeCtx); err != nil {
+		t.Fatal(err)
 	}
 }
 

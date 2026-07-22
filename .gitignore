@@ -37,6 +37,9 @@ go.work.sum
 
 graphify-out/
 
+# Locally generated release binaries and checksums
+dist/
+
 # Local-only docs (specs, architecture, handoffs) — not for public repo
 docs/
 

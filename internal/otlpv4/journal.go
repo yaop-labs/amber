@@ -40,6 +40,10 @@ type Journal struct {
 	manager   *storage.SegmentManager
 	closeOnce sync.Once
 	closeErr  error
+
+	retentionMu    sync.RWMutex
+	retentionStats RetentionStats
+	pruneMu        sync.Mutex
 }
 
 // Stats is a cheap operational snapshot of the canonical replay journal.
@@ -51,6 +55,36 @@ type Stats struct {
 	SegmentBytes      int64
 	WALBytes          int64
 	WALCorruptRecords uint64
+	Retention         RetentionStats
+}
+
+// RetentionPolicy bounds the physical canonical replay journal. Age is
+// measured from the time Amber accepted a journal record, not from timestamps
+// inside the telemetry payload. A zero field disables that limit.
+type RetentionPolicy struct {
+	MaxAge      time.Duration
+	MaxBytes    int64
+	MaxSegments int
+}
+
+// RetentionStats is the cumulative operational state of journal pruning.
+// OldestRetainedAt is zero when no retained journal record exists.
+type RetentionStats struct {
+	Runs             uint64
+	Failures         uint64
+	DeletedSegments  uint64
+	DeletedRecords   uint64
+	DeletedBytes     uint64
+	LastSuccessAt    time.Time
+	OldestRetainedAt time.Time
+}
+
+// RetentionResult describes one completed prune attempt.
+type RetentionResult struct {
+	DeletedSegments  uint64
+	DeletedRecords   uint64
+	DeletedBytes     uint64
+	OldestRetainedAt time.Time
 }
 
 type formatManifest struct {
@@ -101,6 +135,7 @@ func (j *Journal) AppendRequest(signal Signal, request proto.Message, acceptedAt
 
 // AppendNormalizedLogs records native logs as one envelope per database entry.
 func (j *Journal) AppendNormalizedLogs(entries []model.LogEntry) error {
+	acceptedAt := time.Now().UnixNano()
 	items := make([]storage.BatchItem, 0, len(entries))
 	for _, entry := range entries {
 		envelope, err := NormalizedLogNative(entry)
@@ -111,7 +146,7 @@ func (j *Journal) AppendNormalizedLogs(entries []model.LogEntry) error {
 		if err != nil {
 			return err
 		}
-		items = append(items, storage.BatchItem{Data: record, TS: entry.Timestamp.UnixNano()})
+		items = append(items, storage.BatchItem{Data: record, TS: acceptedAt})
 	}
 	if err := j.manager.WriteBatch(items); err != nil {
 		return fmt.Errorf("otlpv4: append normalized logs: %w", err)
@@ -121,6 +156,7 @@ func (j *Journal) AppendNormalizedLogs(entries []model.LogEntry) error {
 
 // AppendNormalizedSpans records native spans as one envelope per database entry.
 func (j *Journal) AppendNormalizedSpans(entries []model.SpanEntry) error {
+	acceptedAt := time.Now().UnixNano()
 	items := make([]storage.BatchItem, 0, len(entries))
 	for _, entry := range entries {
 		envelope, err := NormalizedSpanNative(entry)
@@ -131,7 +167,7 @@ func (j *Journal) AppendNormalizedSpans(entries []model.SpanEntry) error {
 		if err != nil {
 			return err
 		}
-		items = append(items, storage.BatchItem{Data: record, TS: entry.StartTime.UnixNano()})
+		items = append(items, storage.BatchItem{Data: record, TS: acceptedAt})
 	}
 	if err := j.manager.WriteBatch(items); err != nil {
 		return fmt.Errorf("otlpv4: append normalized spans: %w", err)
@@ -141,6 +177,7 @@ func (j *Journal) AppendNormalizedSpans(entries []model.SpanEntry) error {
 
 // AppendNormalizedMetricSamples records native scalar samples.
 func (j *Journal) AppendNormalizedMetricSamples(samples []memodel.Sample) error {
+	acceptedAt := time.Now().UnixNano()
 	items := make([]storage.BatchItem, 0, len(samples))
 	for _, sample := range samples {
 		envelope, err := NormalizedMetricSampleNative(sample)
@@ -151,7 +188,7 @@ func (j *Journal) AppendNormalizedMetricSamples(samples []memodel.Sample) error 
 		if err != nil {
 			return err
 		}
-		items = append(items, storage.BatchItem{Data: record, TS: sample.Timestamp * int64(time.Millisecond)})
+		items = append(items, storage.BatchItem{Data: record, TS: acceptedAt})
 	}
 	if err := j.manager.WriteBatch(items); err != nil {
 		return fmt.Errorf("otlpv4: append normalized metric samples: %w", err)
@@ -174,6 +211,7 @@ func (j *Journal) AppendNormalizedMetricFloat(labels memodel.LabelSet, typ memod
 
 // AppendNormalizedMetricSketches records native histogram ticks.
 func (j *Journal) AppendNormalizedMetricSketches(samples []engine.SketchSample) error {
+	acceptedAt := time.Now().UnixNano()
 	items := make([]storage.BatchItem, 0, len(samples))
 	for _, sample := range samples {
 		envelope, err := NormalizedMetricSketchNative(sample)
@@ -184,7 +222,7 @@ func (j *Journal) AppendNormalizedMetricSketches(samples []engine.SketchSample) 
 		if err != nil {
 			return err
 		}
-		items = append(items, storage.BatchItem{Data: record, TS: sample.Timestamp * int64(time.Millisecond)})
+		items = append(items, storage.BatchItem{Data: record, TS: acceptedAt})
 	}
 	if err := j.manager.WriteBatch(items); err != nil {
 		return fmt.Errorf("otlpv4: append normalized metric sketches: %w", err)
@@ -198,6 +236,9 @@ func (j *Journal) Stats() (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("otlpv4: journal stats: %w", err)
 	}
+	j.retentionMu.RLock()
+	retentionStats := j.retentionStats
+	j.retentionMu.RUnlock()
 	return Stats{
 		SealedSegments:    stats.SealedSegments,
 		ActiveSegment:     stats.ActiveSegment,
@@ -206,7 +247,191 @@ func (j *Journal) Stats() (Stats, error) {
 		SegmentBytes:      stats.SegmentBytes,
 		WALBytes:          stats.WALBytes,
 		WALCorruptRecords: stats.WALCorruptRecords,
+		Retention:         retentionStats,
 	}, nil
+}
+
+// Prune removes sealed journal segments selected by policy. Deletion is
+// crash-retryable: the segment is first marked DeletePending in the durable
+// manifest, then its files are removed, and finally the manifest entry is
+// dropped. The active segment is rotated only when it must become eligible for
+// an age, byte, or segment limit.
+func (j *Journal) Prune(now time.Time, policy RetentionPolicy) (result RetentionResult, err error) {
+	j.pruneMu.Lock()
+	defer j.pruneMu.Unlock()
+	defer func() { j.recordRetention(result, err) }()
+	if now.IsZero() {
+		return result, errors.New("otlpv4: retention time is required")
+	}
+	if policy.MaxAge < 0 {
+		return result, errors.New("otlpv4: retention max age cannot be negative")
+	}
+	if policy.MaxBytes < 0 {
+		return result, errors.New("otlpv4: retention max bytes cannot be negative")
+	}
+	if policy.MaxSegments < 0 {
+		return result, errors.New("otlpv4: retention max segments cannot be negative")
+	}
+
+	if rotate, rotateErr := j.shouldRotateForRetention(now, policy); rotateErr != nil {
+		return result, rotateErr
+	} else if rotate {
+		if rotateErr := j.manager.Rotate(); rotateErr != nil {
+			return result, fmt.Errorf("otlpv4: rotate journal for retention: %w", rotateErr)
+		}
+	}
+
+	candidates := selectRetentionSegments(j.manager.SegmentsForRetention(), now, policy)
+	var pruneErr error
+	for _, segment := range candidates {
+		if deleteErr := j.deleteSegment(segment); deleteErr != nil {
+			pruneErr = errors.Join(pruneErr, deleteErr)
+			continue
+		}
+		result.DeletedSegments++
+		result.DeletedRecords += segment.RecordCount
+		if segment.SizeBytes > 0 {
+			result.DeletedBytes += uint64(segment.SizeBytes)
+		}
+	}
+	result.OldestRetainedAt = j.oldestRetainedAt()
+	return result, pruneErr
+}
+
+func (j *Journal) shouldRotateForRetention(now time.Time, policy RetentionPolicy) (bool, error) {
+	active, ok := j.manager.ActiveSegmentMeta()
+	if !ok || active.RecordCount == 0 {
+		return false, nil
+	}
+	if policy.MaxAge > 0 && active.MaxTS < now.Add(-policy.MaxAge).UnixNano() {
+		return true, nil
+	}
+	sealed := j.manager.SegmentsForRetention()
+	if policy.MaxSegments > 0 && len(sealed)+1 > policy.MaxSegments {
+		return true, nil
+	}
+	if policy.MaxBytes > 0 {
+		stats, err := j.manager.Stats()
+		if err != nil {
+			return false, fmt.Errorf("otlpv4: read journal stats for retention: %w", err)
+		}
+		if stats.SegmentBytes+stats.WALBytes > policy.MaxBytes {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func selectRetentionSegments(segments []storage.SegmentMeta, now time.Time, policy RetentionPolicy) []storage.SegmentMeta {
+	selected := make(map[uint32]storage.SegmentMeta)
+	for _, segment := range segments {
+		if segment.DeletePending {
+			selected[segment.ID] = segment
+		}
+	}
+	if policy.MaxAge > 0 {
+		cutoff := now.Add(-policy.MaxAge).UnixNano()
+		for _, segment := range segments {
+			if segment.MaxTS < cutoff {
+				selected[segment.ID] = segment
+			}
+		}
+	}
+
+	remaining := make([]storage.SegmentMeta, 0, len(segments))
+	for _, segment := range segments {
+		if _, found := selected[segment.ID]; !found {
+			remaining = append(remaining, segment)
+		}
+	}
+	sort.SliceStable(remaining, func(i, k int) bool {
+		if remaining[i].MaxTS == remaining[k].MaxTS {
+			return remaining[i].ID < remaining[k].ID
+		}
+		return remaining[i].MaxTS < remaining[k].MaxTS
+	})
+
+	if policy.MaxSegments > 0 && len(remaining) > policy.MaxSegments {
+		excess := len(remaining) - policy.MaxSegments
+		for _, segment := range remaining[:excess] {
+			selected[segment.ID] = segment
+		}
+		remaining = remaining[excess:]
+	}
+	if policy.MaxBytes > 0 {
+		var total int64
+		for _, segment := range remaining {
+			total += segment.SizeBytes
+		}
+		for _, segment := range remaining {
+			if total <= policy.MaxBytes {
+				break
+			}
+			selected[segment.ID] = segment
+			total -= segment.SizeBytes
+		}
+	}
+
+	out := make([]storage.SegmentMeta, 0, len(selected))
+	for _, segment := range segments {
+		if candidate, found := selected[segment.ID]; found {
+			out = append(out, candidate)
+		}
+	}
+	sort.SliceStable(out, func(i, k int) bool { return out[i].ID < out[k].ID })
+	return out
+}
+
+func (j *Journal) deleteSegment(segment storage.SegmentMeta) error {
+	if err := j.manager.BeginDeleteSegment(segment.ID); err != nil {
+		return fmt.Errorf("otlpv4: mark journal segment %d for deletion: %w", segment.ID, err)
+	}
+	if err := j.manager.DeleteSegmentFiles(segment); err != nil {
+		return fmt.Errorf("otlpv4: delete journal segment %d files: %w", segment.ID, err)
+	}
+	if err := j.manager.RemoveSegment(segment.ID); err != nil {
+		return fmt.Errorf("otlpv4: remove journal segment %d metadata: %w", segment.ID, err)
+	}
+	return nil
+}
+
+func (j *Journal) oldestRetainedAt() time.Time {
+	var (
+		oldest int64
+		have   bool
+	)
+	for _, segment := range j.manager.SegmentsForRetention() {
+		if segment.DeletePending || segment.RecordCount == 0 {
+			continue
+		}
+		if !have || segment.MinTS < oldest {
+			oldest = segment.MinTS
+			have = true
+		}
+	}
+	if active, ok := j.manager.ActiveSegmentMeta(); ok && active.RecordCount > 0 && (!have || active.MinTS < oldest) {
+		oldest = active.MinTS
+		have = true
+	}
+	if !have {
+		return time.Time{}
+	}
+	return time.Unix(0, oldest).UTC()
+}
+
+func (j *Journal) recordRetention(result RetentionResult, err error) {
+	j.retentionMu.Lock()
+	defer j.retentionMu.Unlock()
+	j.retentionStats.Runs++
+	j.retentionStats.DeletedSegments += result.DeletedSegments
+	j.retentionStats.DeletedRecords += result.DeletedRecords
+	j.retentionStats.DeletedBytes += result.DeletedBytes
+	if err != nil {
+		j.retentionStats.Failures++
+		return
+	}
+	j.retentionStats.OldestRetainedAt = result.OldestRetainedAt
+	j.retentionStats.LastSuccessAt = time.Now().UTC()
 }
 
 // Close seals the current journal segment and closes its WAL.

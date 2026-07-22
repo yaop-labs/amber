@@ -67,7 +67,16 @@ type Options struct {
 type RetentionOptions struct {
 	Logs     StreamRetentionOptions
 	Spans    StreamRetentionOptions
+	Journal  JournalRetentionOptions
 	Interval time.Duration
+}
+
+// JournalRetentionOptions bounds the physical canonical OTLP replay journal.
+// Unlike query projections it has no local/S3 tier: deletion is terminal.
+type JournalRetentionOptions struct {
+	MaxAge      time.Duration
+	MaxBytes    int64
+	MaxSegments int
 }
 
 // StreamRetentionOptions is the retention policy for one segment stream.
@@ -124,6 +133,36 @@ func (o StreamRetentionOptions) policy() retention.Policy {
 		LocalMaxAge: o.LocalMaxAge, LocalMaxBytes: o.LocalMaxBytes,
 		MaxAge: o.MaxAge, MaxTotalBytes: o.MaxTotalBytes, MaxSegments: o.MaxSegments,
 	}
+}
+
+func (o JournalRetentionOptions) enabled() bool {
+	return o.MaxAge > 0 || o.MaxBytes > 0 || o.MaxSegments > 0
+}
+
+func (o JournalRetentionOptions) policy() otlpv4.RetentionPolicy {
+	return otlpv4.RetentionPolicy{MaxAge: o.MaxAge, MaxBytes: o.MaxBytes, MaxSegments: o.MaxSegments}
+}
+
+func (o RetentionOptions) validate() error {
+	if o.Interval < 0 {
+		return errors.New("runtime: retention interval must be positive when set")
+	}
+	validateStream := func(name string, value StreamRetentionOptions) error {
+		if value.LocalMaxAge < 0 || value.LocalMaxBytes < 0 || value.MaxAge < 0 || value.MaxTotalBytes < 0 || value.MaxSegments < 0 {
+			return fmt.Errorf("runtime: %s retention limits must be positive when set", name)
+		}
+		return nil
+	}
+	if err := validateStream("logs", o.Logs); err != nil {
+		return err
+	}
+	if err := validateStream("spans", o.Spans); err != nil {
+		return err
+	}
+	if o.Journal.MaxAge < 0 || o.Journal.MaxBytes < 0 || o.Journal.MaxSegments < 0 {
+		return errors.New("runtime: journal retention limits must be positive when set")
+	}
+	return nil
 }
 
 // MetricsOptions configures the embedded metrics store.
@@ -343,6 +382,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	}
 	if opts.IndexBootstrapWorkers < 0 {
 		return nil, errors.New("runtime: IndexBootstrapWorkers must be positive when set")
+	}
+	if err := opts.Retention.validate(); err != nil {
+		return nil, err
 	}
 	cfg := opts.withDefaults()
 	if cfg.Storage.S3Bucket == "" && (cfg.Retention.Logs.hasLocalTier() || cfg.Retention.Spans.hasLocalTier()) {
@@ -610,6 +652,21 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		s.walRepairEvents += stats.WALCorruptRecords
 		s.markDegradedN("otlp_v4_wal_tail_repaired", stats.WALCorruptRecords)
 	}
+	if _, pruneErr := otlpJournal.Prune(time.Now().UTC(), cfg.Retention.Journal.policy()); pruneErr != nil {
+		_ = otlpJournal.Close()
+		if metricStore != nil {
+			_ = metricStore.Close()
+		}
+		if logUp != nil {
+			logUp.Stop()
+		}
+		if spanUp != nil {
+			spanUp.Stop()
+		}
+		_ = logManager.Close()
+		_ = spanManager.Close()
+		return nil, fmt.Errorf("runtime: initial OTLP v4 journal retention: %w", pruneErr)
+	}
 	batcher.SetReplaySink(otlpJournal)
 	if metricStore != nil {
 		metricStore.SetReplaySink(otlpJournal)
@@ -665,7 +722,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 }
 
 func (s *Stack) startRetention(parent context.Context, opts RetentionOptions, remoteEnabled bool, log *slog.Logger) {
-	if !opts.Logs.enabled() && !opts.Spans.enabled() {
+	if !opts.Logs.enabled() && !opts.Spans.enabled() && !opts.Journal.enabled() {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -695,6 +752,40 @@ func (s *Stack) startRetention(parent context.Context, opts RetentionOptions, re
 
 	start("logs", opts.Logs, s.LogManager, s.LogSparse, s.LogDir, s.Executor.InvalidateLogSegment)
 	start("spans", opts.Spans, s.SpanManager, s.SpanSparse, s.SpanDir, s.Executor.InvalidateSpanSegment)
+
+	if opts.Journal.enabled() {
+		s.retentionWG.Go(func() {
+			select {
+			case <-s.bootstrapDone:
+			case <-ctx.Done():
+				return
+			}
+			run := func() {
+				result, err := s.OTLPJournal.Prune(time.Now().UTC(), opts.Journal.policy())
+				if err != nil {
+					log.Error("OTLP journal retention failed", "err", err)
+					return
+				}
+				if result.DeletedSegments > 0 {
+					log.Info("OTLP journal retention deleted segments",
+						"segments", result.DeletedSegments,
+						"records", result.DeletedRecords,
+						"bytes", result.DeletedBytes,
+					)
+				}
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					run()
+				}
+			}
+		})
+	}
 }
 
 // Close first stops ingest admission and drains both lane barriers, then shuts

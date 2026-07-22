@@ -5,12 +5,22 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
 
 	"github.com/yaop-labs/amber/internal/config"
 )
+
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, "read body failed")
+}
 
 // apiKeyCtxKey identifies the matched API key name in request context.
 // Private type to avoid cross-package context collisions.

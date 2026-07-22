@@ -35,7 +35,9 @@ func CountQueryable(ctx context.Context, target TargetConfig) (uint64, error) {
 // IDs and benchmark seq identities are unique. total_hits is intentionally not
 // used: it is a lower bound once top-k pruning starts.
 func amberCount(ctx context.Context, client *http.Client, target TargetConfig) (uint64, error) {
-	const pageSize = 10_000
+	// Keep the recovery probe within Amber's public query budget. Pagination
+	// makes the count independent of the page size.
+	const pageSize = 1_000
 	type attr struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`

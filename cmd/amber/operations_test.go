@@ -121,13 +121,21 @@ func TestRegisterOTLPReplayMetrics(t *testing.T) {
 	if err := journal.AppendRequest(otlpv4.SignalLogs, &collectorlogs.ExportLogsServiceRequest{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if err := journal.AppendRequest(otlpv4.SignalLogs, &collectorlogs.ExportLogsServiceRequest{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.Prune(time.Now().UTC(), otlpv4.RetentionPolicy{MaxSegments: 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	read := registerOTLPReplayMetrics(journal)
 	metrics := read()
 	if metrics.enabled != 1 || metrics.statsError != 0 || metrics.sealedSegments != 1 ||
 		metrics.activeSegment != 1 || metrics.activeRecords != 0 || metrics.totalRecords != 1 ||
 		metrics.segmentBytes <= 0 || metrics.walBytes != 0 || metrics.storageBytes != metrics.segmentBytes ||
-		metrics.walRepairEvents != 0 {
+		metrics.walRepairEvents != 0 || metrics.retentionRuns != 1 || metrics.retentionFailures != 0 ||
+		metrics.retentionDeletedSegments != 1 || metrics.retentionDeletedRecords != 1 || metrics.retentionDeletedBytes <= 0 ||
+		metrics.retentionLastSuccess <= 0 || metrics.retentionOldestRetained <= 0 {
 		t.Fatalf("OTLP replay metrics = %+v", metrics)
 	}
 
@@ -136,16 +144,23 @@ func TestRegisterOTLPReplayMetrics(t *testing.T) {
 		values[sample.Name] = sample.Value
 	}
 	want := map[string]float64{
-		"amber_otlp_replay_enabled":                 metrics.enabled,
-		"amber_otlp_replay_stats_error":             metrics.statsError,
-		"amber_otlp_replay_sealed_segments":         metrics.sealedSegments,
-		"amber_otlp_replay_active_segment":          metrics.activeSegment,
-		"amber_otlp_replay_active_records":          metrics.activeRecords,
-		"amber_otlp_replay_records":                 metrics.totalRecords,
-		"amber_otlp_replay_segment_bytes":           metrics.segmentBytes,
-		"amber_otlp_replay_wal_bytes":               metrics.walBytes,
-		"amber_otlp_replay_storage_bytes":           metrics.storageBytes,
-		"amber_otlp_replay_wal_repair_events_total": metrics.walRepairEvents,
+		"amber_otlp_replay_enabled":                                  metrics.enabled,
+		"amber_otlp_replay_stats_error":                              metrics.statsError,
+		"amber_otlp_replay_sealed_segments":                          metrics.sealedSegments,
+		"amber_otlp_replay_active_segment":                           metrics.activeSegment,
+		"amber_otlp_replay_active_records":                           metrics.activeRecords,
+		"amber_otlp_replay_records":                                  metrics.totalRecords,
+		"amber_otlp_replay_segment_bytes":                            metrics.segmentBytes,
+		"amber_otlp_replay_wal_bytes":                                metrics.walBytes,
+		"amber_otlp_replay_storage_bytes":                            metrics.storageBytes,
+		"amber_otlp_replay_wal_repair_events_total":                  metrics.walRepairEvents,
+		"amber_otlp_replay_retention_runs_total":                     metrics.retentionRuns,
+		"amber_otlp_replay_retention_failures_total":                 metrics.retentionFailures,
+		"amber_otlp_replay_retention_deleted_segments_total":         metrics.retentionDeletedSegments,
+		"amber_otlp_replay_retention_deleted_records_total":          metrics.retentionDeletedRecords,
+		"amber_otlp_replay_retention_deleted_bytes_total":            metrics.retentionDeletedBytes,
+		"amber_otlp_replay_retention_last_success_timestamp_seconds": metrics.retentionLastSuccess,
+		"amber_otlp_replay_oldest_retained_timestamp_seconds":        metrics.retentionOldestRetained,
 	}
 	for name, expected := range want {
 		if got, ok := values[name]; !ok || got != expected {

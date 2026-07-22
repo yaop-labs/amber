@@ -335,6 +335,11 @@ func (h *MetricsRateRangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "to must be >= from")
 		return
 	}
+	stepMillis := step.Milliseconds()
+	if stepMillis <= 0 || (toMillis-fromMillis)/stepMillis > 10000 {
+		writeError(w, http.StatusBadRequest, "range produces too many steps (maximum 10000)")
+		return
+	}
 
 	by := strings.TrimSpace(q.Get("by"))
 	matchers := []metricsengine.Matcher{metricsengine.MetricName(metric)}
