@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master, dev]
+    tags: ["v*"]
   pull_request:
     branches: [master, dev]
 
@@ -213,7 +214,46 @@ jobs:
           cache: true
       - name: Run release benchmark subset
         run: go test ./benchmarks/ -bench='BenchmarkQuery_FullScan_(1k|10k|100k)$' -benchtime=1s -run='^$' -timeout=10m | tee benchmark-output.txt
+      - name: Run mixed-query RSS smoke campaign
+        env:
+          AMBER_MIXED: "1"
+          AMBER_MIXED_SECS: "2"
+          AMBER_BENCH_SERIES: "1000"
+          AMBER_BENCH_TICKS: "30"
+          AMBER_BENCH_FLUSH: "5"
+        run: go test ./internal/metricsengine/store/ -run '^TestMixedWorkloadRSS$' -v -count=1 -timeout=10m | tee -a benchmark-output.txt
       - uses: actions/upload-artifact@v4
         with:
           name: amber-benchmark-${{ github.sha }}
           path: benchmark-output.txt
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [test, s3-integration, release-smoke, benchmark]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build and verify release artifacts
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          make release VERSION="$version"
+          (cd "dist/$version" && sha256sum -c SHA256SUMS)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/$version/amber" \
+            "dist/$version/amberctl" \
+            "dist/$version/amber-backup" \
+            "dist/$version/amber-migrate" \
+            "dist/$version/SHA256SUMS" \
+            --verify-tag --generate-notes --title "Amber $GITHUB_REF_NAME"

@@ -22,6 +22,7 @@ type logsServer struct {
 	collectorlogs.UnimplementedLogsServiceServer
 	batcher sender
 	journal *otlpv4.Journal
+	admit   func() error
 	log     *slog.Logger
 }
 
@@ -29,6 +30,11 @@ type logsServer struct {
 // records and waits for their lane durability barrier. A successful response
 // is a durable handoff; temporary admission/storage failures are retryable.
 func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsServiceRequest) (*collectorlogs.ExportLogsServiceResponse, error) {
+	if s.admit != nil {
+		if err := s.admit(); err != nil {
+			return nil, status.Error(codes.Unavailable, "ingest stopped by resource admission policy; retry request")
+		}
+	}
 	if s.batcher.IsLogBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
 	}
@@ -97,11 +103,17 @@ type tracesServer struct {
 	collectortrace.UnimplementedTraceServiceServer
 	batcher sender
 	journal *otlpv4.Journal
+	admit   func() error
 	log     *slog.Logger
 }
 
 // Export implements the OTLP traces collector service, mirroring logsServer.Export.
 func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTraceServiceRequest) (*collectortrace.ExportTraceServiceResponse, error) {
+	if s.admit != nil {
+		if err := s.admit(); err != nil {
+			return nil, status.Error(codes.Unavailable, "ingest stopped by resource admission policy; retry request")
+		}
+	}
 	if s.batcher.IsSpanBreakerOpen() {
 		return nil, status.Error(codes.Unavailable, "ingest temporarily unavailable")
 	}

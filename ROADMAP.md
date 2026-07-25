@@ -20,7 +20,7 @@ Roadmap основана на [`REVIEW.md`](REVIEW.md) от 2026-07-22. Она �
 deployment на линии v0.3 и туда требуется backport критического security или
 data-integrity исправления. Иначе работа сразу идёт в `v0.4.0`.
 
-## Current baseline — v0.3.0 + unreleased work
+## Current baseline — v0.4.0 release candidate
 
 Уже реализовано после тега:
 
@@ -36,13 +36,33 @@ data-integrity исправления. Иначе работа сразу идё
   staging, digest verification и `FidelityNormalizedV3` marker;
 - runtime/backup/replay self-observability.
 
-Эту работу нельзя просто назвать `v0.4.0`: upgrade path, server lifecycle и
-полный Reef/Gyre operational contract пока не замкнуты.
+Исходное ревью не разрешало назвать эту работу `v0.4.0`, пока upgrade path,
+server lifecycle и Reef/Gyre operational contract не были замкнуты. Эти
+условия закрыты release-hardening batch от 2026-07-25.
 
 ## v0.4.0 — operational contract
 
 Цель: Amber можно безопасно запустить, обновить, ограничить по ресурсам,
 остановить и восстановить как single-node source of truth.
+
+Статус 2026-07-25: **локальные acceptance gates пройдены**. В дополнение к
+исходному batch:
+
+- non-empty v0.3 fixture с logs/traces/metrics проходит copy-on-write migration,
+  query verification и доказывает неизменность rollback root;
+- synchronous disk admission использует warning/stop free-byte watermarks,
+  красит readiness/status и fail-closed возвращает retryable OTLP ошибки до
+  открытия stores/ENOSPC;
+- fault injection фиксирует at-least-once dual-write contract: сбой journal
+  после projection возвращает retryable error, повтор может создать duplicate,
+  а успешная попытка попадает в canonical replay journal;
+- Reef v0.3 и Gyre v0.6 управляют HTTP/gRPC/storage lifecycle, aggregate health
+  и bounded reverse shutdown;
+- strict config/example, query/HTTP bounds, offline upgrade/rollback,
+  checksummed artifacts, clean-host smoke и benchmark/RSS evidence включены в
+  release gates;
+- tag workflow запускает race, MinIO restore, secure artifact smoke и
+  benchmark jobs, после чего публикует четыре бинарника и checksums.
 
 ### Workstream A — data lifecycle and upgrade
 

@@ -31,6 +31,7 @@ type OTLPHandler struct {
 	batcher        *ingest.Batcher
 	metricStore    *metricsengine.Store // nil when metrics are disabled
 	journal        *otlpv4.Journal
+	admitIngest    func() error
 	log            *slog.Logger
 	maxRequestSize int64
 }
@@ -48,6 +49,12 @@ func (h *OTLPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
+	}
+	if h.admitIngest != nil {
+		if err := h.admitIngest(); err != nil {
+			writeOTLPError(w, r, http.StatusServiceUnavailable, 14, "ingest stopped by resource admission policy; retry request")
+			return
+		}
 	}
 	closeCompression, err := h.prepareRequestBody(w, r)
 	if err != nil {

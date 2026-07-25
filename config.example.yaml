@@ -1,16 +1,31 @@
 storage:
   data_dir: ./data
-  segment_max_records: 1000000
+  segment_max_records: 100000
   # Считает несжатый serialized payload; проверяется после batch и не является
   # точным лимитом физического размера файла.
-  segment_max_bytes: 536870912
-  index_cache_size: 32
+  segment_max_bytes: 134217728
+  # Amber rejects ingest before ENOSPC and marks readiness false at stop.
+  # Warning keeps ingest open but marks runtime status degraded.
+  disk_warning_free_bytes: 2147483648
+  disk_stop_free_bytes: 1073741824
+  index_cache_size: 0
+  s3:
+    bucket: ""
+    prefix: ""
+    region: ""
+    endpoint: ""
+    reconcile_on_start: false
 
 ingest:
   batch_size: 1000
   batch_timeout: 100ms
   queue_size: 100000
   breaker_threshold: 10
+  shutdown_timeout: 30s
+  max_attrs_per_entry: 64
+  max_attr_value_bytes: 4096
+  max_attr_keys_per_service: 1024
+  max_services: 10000
 
   # Optional per-signal overrides. Zero/omitted values inherit from ingest.*.
   # Use these when one signal needs tighter isolation without changing the
@@ -32,8 +47,12 @@ api:
   # false защищает /metrics тем же Reef bearer token, что и остальные API.
   metrics_public: true
   read_timeout: 30s
+  read_header_timeout: 5s
   write_timeout: 30s
+  idle_timeout: 120s
+  max_request_bytes: 33554432
   api_key: ""          # Bearer token, пусто = auth выключен
+  api_keys: []         # legacy named tokens; api.security.auth is preferred
   security:
     insecure: true     # required for plaintext unauthenticated non-loopback dev listeners
     danger_allow_bearer_over_plaintext: false # explicit danger opt-in when TLS is off
@@ -82,10 +101,23 @@ retention:
     max_segments: 0
 
 metrics:
+  enabled: true
+  dir: ""
+  flush_interval: 0s
+  max_buffered_samples: 0
+  max_active_series: 0
+  max_labels_per_series: 0
+  retention: 24h
+  compaction_min_blocks: 0
+  dogfood_interval: 0s
   # Общий байт-бюджет двух блочных кэшей метрик-движка (декодированные
   # директории + resident-индексы). 0 = вывести из runtime.memory_limit/2,
   # если лимит задан; иначе — дефолты движка (320+384 MiB).
   cache_budget: 0       # пример: 419430400 (400 MiB)
+
+debug:
+  pprof: false
+  pprof_addr: localhost:6060
 
 runtime:
   # Максимум одновременных rebuild sealed indexes при старте. Один worker

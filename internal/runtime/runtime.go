@@ -20,6 +20,7 @@ import (
 
 	"github.com/yaop-labs/amber/internal/bootstrap"
 	"github.com/yaop-labs/amber/internal/dbmeta"
+	"github.com/yaop-labs/amber/internal/diskguard"
 	"github.com/yaop-labs/amber/internal/fslock"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
@@ -98,6 +99,7 @@ type Status struct {
 	DatabaseID           string                   `json:"database_id"`
 	WALRepairEvents      uint64                   `json:"wal_repair_events"`
 	IndexBootstrapErrors uint64                   `json:"index_bootstrap_errors"`
+	Disk                 diskguard.Snapshot       `json:"disk"`
 	LastSuccessfulBackup *BackupCheckpointStatus  `json:"last_successful_backup,omitempty"`
 	LastVerifiedRestore  *RestoreCheckpointStatus `json:"last_verified_restore,omitempty"`
 	Reasons              []StatusReason           `json:"reasons,omitempty"`
@@ -188,8 +190,10 @@ type MetricsOptions struct {
 
 // StorageOptions configures segment rotation and the optional S3 tier.
 type StorageOptions struct {
-	SegmentMaxRecords uint64
-	SegmentMaxBytes   int64
+	SegmentMaxRecords    uint64
+	SegmentMaxBytes      int64
+	DiskWarningFreeBytes int64
+	DiskStopFreeBytes    int64
 	// S3Bucket enables S3-compatible storage for sealed segments.
 	S3Bucket   string
 	S3Prefix   string
@@ -228,6 +232,8 @@ type CardinalityOptions struct {
 const (
 	defaultSegmentMaxRecords uint64 = 100_000
 	defaultSegmentMaxBytes   int64  = 128 << 20
+	defaultDiskWarningBytes  int64  = 2 << 30
+	defaultDiskStopBytes     int64  = 1 << 30
 
 	defaultBatchSize             = 1000
 	defaultBatchTimeout          = 100 * time.Millisecond
@@ -243,6 +249,12 @@ func (o Options) withDefaults() Options {
 	}
 	if out.Storage.SegmentMaxBytes == 0 {
 		out.Storage.SegmentMaxBytes = defaultSegmentMaxBytes
+	}
+	if out.Storage.DiskWarningFreeBytes == 0 {
+		out.Storage.DiskWarningFreeBytes = defaultDiskWarningBytes
+	}
+	if out.Storage.DiskStopFreeBytes == 0 {
+		out.Storage.DiskStopFreeBytes = defaultDiskStopBytes
 	}
 	if out.Ingest.BatchSize == 0 {
 		out.Ingest.BatchSize = defaultBatchSize
@@ -281,6 +293,7 @@ type Stack struct {
 	Executor    *query.Executor
 	Batcher     *ingest.Batcher
 	OTLPJournal *otlpv4.Journal
+	DiskGuard   *diskguard.Guard
 
 	// MetricStore is nil when metrics are disabled.
 	MetricStore *metricsengine.Store
@@ -315,8 +328,21 @@ type Stack struct {
 	closeErr  error
 }
 
-// IsReady reports whether bootstrap finished loading sealed indexes.
-func (s *Stack) IsReady() bool { return s.ready.Load() }
+// IsReady reports whether bootstrap finished and disk admission is open.
+func (s *Stack) IsReady() bool {
+	if !s.ready.Load() {
+		return false
+	}
+	return s.DiskGuard == nil || !s.DiskGuard.Sample().Stopped
+}
+
+// AdmitIngest checks the current disk-space stop watermark.
+func (s *Stack) AdmitIngest() error {
+	if s.DiskGuard == nil {
+		return nil
+	}
+	return s.DiskGuard.Admit()
+}
 
 // Status returns a consistent operational snapshot.
 func (s *Stack) Status() Status {
@@ -330,6 +356,18 @@ func (s *Stack) Status() Status {
 	indexBootstrapErrors := s.indexBootstrapErrors
 	s.statusMu.RUnlock()
 
+	var disk diskguard.Snapshot
+	if s.DiskGuard != nil {
+		disk = s.DiskGuard.Sample()
+		switch {
+		case disk.ProbeError != "":
+			reasonCounts["disk_probe_failure"]++
+		case disk.Stopped:
+			reasonCounts["disk_stop_watermark"]++
+		case disk.Warning:
+			reasonCounts["disk_warning_watermark"]++
+		}
+	}
 	if s.MetricStore != nil && s.MetricStore.LastBackgroundError() != nil {
 		reasonCounts["metrics_background_error"]++
 	}
@@ -340,12 +378,13 @@ func (s *Stack) Status() Status {
 	}
 	sort.Slice(reasons, func(i, j int) bool { return reasons[i].Code < reasons[j].Code })
 	status := Status{
-		Ready:                s.ready.Load() && !closing,
+		Ready:                s.ready.Load() && !closing && !disk.Stopped,
 		Degraded:             len(reasons) > 0,
 		Closing:              closing,
 		DatabaseID:           s.Identity.ID,
 		WALRepairEvents:      walRepairEvents,
 		IndexBootstrapErrors: indexBootstrapErrors,
+		Disk:                 disk,
 		Reasons:              reasons,
 	}
 	if checkpoint := s.backupState.LastSuccessful; checkpoint != nil {
@@ -387,6 +426,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		return nil, err
 	}
 	cfg := opts.withDefaults()
+	if cfg.Storage.DiskStopFreeBytes <= 0 || cfg.Storage.DiskWarningFreeBytes < cfg.Storage.DiskStopFreeBytes {
+		return nil, errors.New("runtime: invalid disk free-space watermarks")
+	}
 	if cfg.Storage.S3Bucket == "" && (cfg.Retention.Logs.hasLocalTier() || cfg.Retention.Spans.hasLocalTier()) {
 		return nil, errors.New("runtime: local retention tier requires S3 storage")
 	}
@@ -408,6 +450,16 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			_ = dirLock.Release()
 		}
 	}()
+	diskAdmission, err := diskguard.New(cfg.DataDir, diskguard.Config{
+		WarningFreeBytes: cfg.Storage.DiskWarningFreeBytes,
+		StopFreeBytes:    cfg.Storage.DiskStopFreeBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("runtime: configure disk admission: %w", err)
+	}
+	if err := diskAdmission.Admit(); err != nil {
+		return nil, fmt.Errorf("runtime: initial disk admission: %w", err)
+	}
 	if err := validateOTLPV4Root(cfg.DataDir); err != nil {
 		return nil, err
 	}
@@ -518,6 +570,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		backupState: backupState,
 		ready:       ready, closeDone: make(chan struct{}), bootstrapDone: make(chan struct{}),
 		degradedReasons: make(map[string]uint64),
+		DiskGuard:       diskAdmission,
 	}
 	if backupStateErr != nil {
 		s.markDegraded("backup_state_corrupt")

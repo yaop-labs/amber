@@ -16,6 +16,9 @@ func TestDefault(t *testing.T) {
 	if cfg.Storage.SegmentMaxRecords != 100_000 {
 		t.Errorf("SegmentMaxRecords: got %d, want 100000", cfg.Storage.SegmentMaxRecords)
 	}
+	if cfg.Storage.DiskWarningFreeBytes != 2<<30 || cfg.Storage.DiskStopFreeBytes != 1<<30 {
+		t.Errorf("disk watermarks: warning=%d stop=%d", cfg.Storage.DiskWarningFreeBytes, cfg.Storage.DiskStopFreeBytes)
+	}
 	if cfg.Ingest.BatchSize != 1000 {
 		t.Errorf("BatchSize: got %d, want 1000", cfg.Ingest.BatchSize)
 	}
@@ -55,6 +58,21 @@ func TestLoad_UnknownFieldRejected(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected unknown YAML field to be rejected")
+	}
+}
+
+func TestExampleConfigIsStrictlyLoadable(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatalf("load config.example.yaml: %v", err)
+	}
+	if cfg.Storage.SegmentMaxRecords != Default().Storage.SegmentMaxRecords {
+		t.Fatalf("example segment_max_records = %d, default = %d",
+			cfg.Storage.SegmentMaxRecords, Default().Storage.SegmentMaxRecords)
+	}
+	if cfg.Storage.DiskWarningFreeBytes != Default().Storage.DiskWarningFreeBytes ||
+		cfg.Storage.DiskStopFreeBytes != Default().Storage.DiskStopFreeBytes {
+		t.Fatalf("example disk watermarks differ from defaults")
 	}
 }
 
@@ -205,6 +223,20 @@ func TestValidate_MissingDataDir(t *testing.T) {
 	cfg.Storage.DataDir = ""
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for empty data_dir")
+	}
+}
+
+func TestValidate_DiskWatermarks(t *testing.T) {
+	cfg := Default()
+	cfg.Storage.DiskStopFreeBytes = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("zero stop watermark accepted")
+	}
+
+	cfg = Default()
+	cfg.Storage.DiskWarningFreeBytes = cfg.Storage.DiskStopFreeBytes - 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("warning watermark below stop watermark accepted")
 	}
 }
 

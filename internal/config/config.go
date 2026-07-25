@@ -123,9 +123,13 @@ type StorageConfig struct {
 	DataDir           string `yaml:"data_dir"`
 	SegmentMaxRecords uint64 `yaml:"segment_max_records"`
 	// SegmentMaxBytes counts uncompressed record payload and is checked after a batch.
-	SegmentMaxBytes int64    `yaml:"segment_max_bytes"`
-	IndexCacheSize  int      `yaml:"index_cache_size"`
-	S3              S3Config `yaml:"s3"`
+	SegmentMaxBytes int64 `yaml:"segment_max_bytes"`
+	// DiskWarningFreeBytes degrades status while ingest remains available.
+	// DiskStopFreeBytes rejects ingest before the filesystem reaches ENOSPC.
+	DiskWarningFreeBytes int64    `yaml:"disk_warning_free_bytes"`
+	DiskStopFreeBytes    int64    `yaml:"disk_stop_free_bytes"`
+	IndexCacheSize       int      `yaml:"index_cache_size"`
+	S3                   S3Config `yaml:"s3"`
 }
 
 // IngestConfig configures the batcher and its per-lane overrides.
@@ -227,9 +231,11 @@ type LogConfig struct {
 func Default() *Config {
 	return &Config{
 		Storage: StorageConfig{
-			DataDir:           "./data",
-			SegmentMaxRecords: 100_000,
-			SegmentMaxBytes:   128 << 20,
+			DataDir:              "./data",
+			SegmentMaxRecords:    100_000,
+			SegmentMaxBytes:      128 << 20,
+			DiskWarningFreeBytes: 2 << 30,
+			DiskStopFreeBytes:    1 << 30,
 		},
 		Ingest: IngestConfig{
 			BatchSize:             1000,
@@ -331,6 +337,12 @@ func detectLegacyRetention(data []byte) error {
 func (c *Config) Validate() error {
 	if c.Storage.DataDir == "" {
 		return fmt.Errorf("storage.data_dir is required")
+	}
+	if c.Storage.DiskStopFreeBytes <= 0 {
+		return fmt.Errorf("storage.disk_stop_free_bytes must be positive")
+	}
+	if c.Storage.DiskWarningFreeBytes < c.Storage.DiskStopFreeBytes {
+		return fmt.Errorf("storage.disk_warning_free_bytes must be greater than or equal to storage.disk_stop_free_bytes")
 	}
 	if c.Ingest.BatchSize <= 0 {
 		return fmt.Errorf("ingest.batch_size must be positive")

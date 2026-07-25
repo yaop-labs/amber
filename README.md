@@ -252,13 +252,28 @@ if err := db.Flush(ctx); err != nil { /* ctx expired */ }
 ```
 
 `Flush` returns once every `Log`/`Span` call that completed before it was
-invoked has been written to the WAL and synced (or counted as dropped —
-write failures surface via the ingest circuit breaker and the
-`ingest_dropped_total` self-metric, not via `Flush`). `db.Close()` drains the
-queue the same way on shutdown.
+invoked has been written to the WAL and synced. Covered serialization,
+storage, or sync failures are returned by `Flush` and also feed the ingest
+circuit breaker. `db.Close()` drains the queue the same way on shutdown.
 
 The HTTP ingest API has the same model and makes it explicit with status
 `202 Accepted`.
+
+### OTLP durability and retry contract
+
+An OTLP HTTP/gRPC success means the accepted subset is durable in both the
+query projection and the AOT4 replay journal. Amber uses at-least-once
+delivery: the projection is synced first, then the accepted original OTLP
+subset is appended and synced to the journal.
+
+If the second write fails, Amber returns retryable HTTP `503` / gRPC
+`Unavailable`. The projection may already contain the first attempt, so the
+required exporter retry can create a duplicate. Amber 0.4 does not promise
+exactly-once ingest or perform online deduplication. The successful retry is
+present in the canonical journal and journal replay is the reconciliation
+source for rebuilding projections. Exporters must retry retryable responses;
+consumers that require exactly-once results must deduplicate using their own
+stable event identity.
 
 ## Metrics value model (alpha)
 
@@ -284,13 +299,16 @@ See [config.example.yaml](config.example.yaml) for all options. Key settings:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `storage.data_dir` | `./data` | Data directory |
-| `storage.segment_max_records` | `1000000` | Records per segment before rotation |
-| `storage.index_cache_size` | `32` | Max sealed index readers kept in memory |
+| `storage.segment_max_records` | `100000` | Records per segment before rotation |
+| `storage.segment_max_bytes` | `134217728` | Uncompressed payload bytes before rotation |
+| `storage.disk_warning_free_bytes` | `2147483648` | Degrade status below this free-space watermark |
+| `storage.disk_stop_free_bytes` | `1073741824` | Reject ingest and fail readiness below this watermark |
+| `storage.index_cache_size` | `0` | Max sealed index readers; 0 uses the executor default |
 | `ingest.batch_size` | `1000` | WAL batch size |
 | `ingest.batch_timeout` | `100ms` | Max wait before flushing batch |
 | `ingest.queue_size` | `100000` | Buffered ingest queue length |
-| `api.http_addr` | `:8080` | HTTP listen address |
-| `api.grpc_addr` | `:4317` | gRPC listen address (OTLP) |
+| `api.http_addr` | `localhost:8080` | HTTP listen address |
+| `api.grpc_addr` | _(empty)_ | gRPC listen address (OTLP); empty disables it |
 | `api.api_key` | _(empty)_ | Bearer token (empty = auth disabled) |
 | `retention.logs.max_age` | `0s` | Terminal log projection age (0 = disabled) |
 | `retention.spans.max_age` | `0s` | Terminal span projection age (0 = disabled) |
@@ -321,7 +339,8 @@ deletion. Backups and offline replay see only the retained journal.
 policy is the physical raw-payload/compliance boundary shared by all signals.
 If raw payloads must disappear no later than a fixed deadline, configure the
 journal deadline explicitly. With all journal limits at zero, raw replay is
-unbounded and disk capacity must be managed externally.
+unbounded. Disk admission still stops new writes before ENOSPC, but operators
+must configure journal retention or provision capacity to resume ingest.
 
 ## License
 

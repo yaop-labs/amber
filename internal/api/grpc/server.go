@@ -34,23 +34,29 @@ type sender interface {
 // embedded metric store; a nil store leaves MetricsService unregistered so
 // metric clients receive Unimplemented (metrics disabled).
 func NewServer(batcher sender, metricStore *metricsengine.Store, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
-	return newServer(batcher, metricStore, nil, maxRecvBytes, log, opts...)
+	return newServer(batcher, metricStore, nil, nil, maxRecvBytes, log, opts...)
 }
 
 // NewServerWithJournal is NewServer with lossless accepted-OTLP recording.
 func NewServerWithJournal(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
-	return newServer(batcher, metricStore, journal, maxRecvBytes, log, opts...)
+	return newServer(batcher, metricStore, journal, nil, maxRecvBytes, log, opts...)
 }
 
-func newServer(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
+// NewServerWithJournalAndAdmission adds a fail-closed resource admission
+// decision shared by all three OTLP services.
+func NewServerWithJournalAndAdmission(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, admit func() error, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
+	return newServer(batcher, metricStore, journal, admit, maxRecvBytes, log, opts...)
+}
+
+func newServer(batcher sender, metricStore *metricsengine.Store, journal *otlpv4.Journal, admit func() error, maxRecvBytes int, log *slog.Logger, opts ...grpc.ServerOption) *grpc.Server {
 	if maxRecvBytes > 0 {
 		opts = append(opts, grpc.MaxRecvMsgSize(maxRecvBytes))
 	}
 	s := grpc.NewServer(opts...)
-	collectorlogs.RegisterLogsServiceServer(s, &logsServer{batcher: batcher, journal: journal, log: log})
-	collectortrace.RegisterTraceServiceServer(s, &tracesServer{batcher: batcher, journal: journal, log: log})
+	collectorlogs.RegisterLogsServiceServer(s, &logsServer{batcher: batcher, journal: journal, admit: admit, log: log})
+	collectortrace.RegisterTraceServiceServer(s, &tracesServer{batcher: batcher, journal: journal, admit: admit, log: log})
 	if metricStore != nil {
-		collectormetrics.RegisterMetricsServiceServer(s, &metricsServer{store: metricStore, journal: journal, log: log})
+		collectormetrics.RegisterMetricsServiceServer(s, &metricsServer{store: metricStore, journal: journal, admit: admit, log: log})
 	}
 	return s
 }
