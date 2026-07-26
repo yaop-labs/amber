@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func tempSegmentPath(t *testing.T) string {
@@ -464,6 +466,52 @@ func TestSegment_Compression_ReducesSize(t *testing.T) {
 		t.Errorf("expected compression: fileSize=%d, rawSize=%d", fileSize, rawSize)
 	}
 	t.Logf("raw=%d bytes, compressed=%d bytes, ratio=%.2fx", rawSize, fileSize, float64(rawSize)/float64(fileSize))
+}
+
+func TestSegmentEncoder_BlockWindowPreservesCompression(t *testing.T) {
+	var source bytes.Buffer
+	for i := 0; source.Len() < DefaultBlockSize; i++ {
+		fmt.Fprintf(&source,
+			"ts=%016d service=api-gateway host=node-%03d method=GET route=/api/v1/items status=200 body=request-complete\n",
+			i, i%128,
+		)
+	}
+	block := source.Bytes()[:DefaultBlockSize]
+
+	defaultEncoder, err := zstd.NewWriter(
+		nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderConcurrency(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segmentEncoder, err := newSegmentEncoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultCompressed := defaultEncoder.EncodeAll(block, nil)
+	segmentCompressed := segmentEncoder.EncodeAll(block, nil)
+
+	// A block-sized window can differ by a few frame bytes, but it must not
+	// materially reduce compression on one full representative block.
+	maxSize := len(defaultCompressed) + max(64, len(defaultCompressed)/100)
+	if len(segmentCompressed) > maxSize {
+		t.Fatalf("block-window compressed size = %d, default = %d", len(segmentCompressed), len(defaultCompressed))
+	}
+
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+	decoded, err := decoder.DecodeAll(segmentCompressed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, block) {
+		t.Fatal("block-window compression round trip differs")
+	}
 }
 
 func statFile(path string) (int64, error) {

@@ -77,6 +77,39 @@ func BenchmarkWriteBatch_10(b *testing.B)   { benchRunWriteBatch(b, 10) }
 func BenchmarkWriteBatch_100(b *testing.B)  { benchRunWriteBatch(b, 100) }
 func BenchmarkWriteBatch_1000(b *testing.B) { benchRunWriteBatch(b, 1000) }
 
+// BenchmarkWriteBatchFlush_256 mirrors one OTLP durability response: append a
+// collector-sized batch, then force its partial segment block to be compressed
+// and visible before acknowledging the request.
+func BenchmarkWriteBatchFlush_256(b *testing.B) {
+	const batchSize = 256
+	dir := b.TempDir()
+	policy := RotationPolicy{MaxRecords: 1_000_000_000, MaxBytes: 64 << 30}
+	mgr, err := OpenSegmentManager(dir, policy)
+	if err != nil {
+		b.Fatalf("OpenSegmentManager: %v", err)
+	}
+	defer mgr.Close()
+	batch := benchSetupBatch(b, batchSize)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		if err := mgr.WriteBatch(batch); err != nil {
+			b.Fatalf("WriteBatch: %v", err)
+		}
+		if err := mgr.Flush(); err != nil {
+			b.Fatalf("Flush: %v", err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.N)*batchSize/b.Elapsed().Seconds(), "records/sec")
+	stats, err := mgr.Stats()
+	if err != nil {
+		b.Fatalf("Stats: %v", err)
+	}
+	b.ReportMetric(float64(stats.SegmentBytes)/float64(b.N*batchSize), "segment_B/record")
+}
+
 // prepareSealedSegment writes recordCount records to a fresh segment, rotates
 // (which writes the footer), and returns the on-disk path.
 func prepareSealedSegment(b *testing.B, recordCount int) string {

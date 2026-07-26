@@ -50,6 +50,22 @@ var (
 // blockPoolMaxSize caps buffers returned to scanUncompressedPool.
 const blockPoolMaxSize = 2 * DefaultBlockSize
 
+// newSegmentEncoder returns the encoder owned by one SegmentWriter.
+// SegmentWriter serializes flushBlock under its mutex, and zstd EncodeAll uses
+// only one engine per call. The library default allocates GOMAXPROCS engines
+// for concurrent EncodeAll callers, which only multiplies tables and history
+// buffers here without adding compression parallelism. The window matches the
+// normal uncompressed block target, so one engine doesn't retain a default
+// multi-megabyte history that cannot improve compression across block frames.
+func newSegmentEncoder() (*zstd.Encoder, error) {
+	return zstd.NewWriter(
+		nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithWindowSize(DefaultBlockSize),
+	)
+}
+
 var (
 	ErrSegmentCorrupted = errors.New("segment: corrupted file")
 	ErrSegmentBadMagic  = errors.New("segment: bad magic bytes")
@@ -130,7 +146,7 @@ func OpenSegmentWriter(path string) (*SegmentWriter, error) {
 		return nil, fmt.Errorf("segment: create %s: %w", path, err)
 	}
 
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	enc, err := newSegmentEncoder()
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("segment: create zstd encoder: %w", err)
