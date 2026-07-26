@@ -127,11 +127,17 @@ func (j *Journal) Append(envelope Envelope, acceptedAt time.Time) error {
 // AppendRequest wraps and appends one accepted original OTLP request. It
 // marshals request synchronously and does not retain or mutate the message.
 func (j *Journal) AppendRequest(signal Signal, request proto.Message, acceptedAt time.Time) error {
-	envelope, err := New(signal, FidelityOTLP, request)
+	if acceptedAt.IsZero() {
+		return errors.New("otlpv4: accepted time is required")
+	}
+	record, err := marshalRequest(signal, FidelityOTLP, request)
 	if err != nil {
 		return err
 	}
-	return j.Append(envelope, acceptedAt)
+	if err := j.manager.Write(record, acceptedAt.UnixNano()); err != nil {
+		return fmt.Errorf("otlpv4: append journal: %w", err)
+	}
+	return nil
 }
 
 // AppendNormalizedLogs records native logs as one envelope per database entry.
