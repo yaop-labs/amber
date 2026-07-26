@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
@@ -52,6 +53,47 @@ func TestLogsExportReturnsUnavailableOnRetryableRejection(t *testing.T) {
 	}}}
 	if _, err := s.Export(context.Background(), req); status.Code(err) != codes.Unavailable {
 		t.Fatalf("code = %v, want Unavailable (err %v)", status.Code(err), err)
+	}
+}
+
+func TestOTLPServicesDiskAdmissionFailsClosed(t *testing.T) {
+	admit := func() error { return errors.New("low disk") }
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "logs",
+			call: func() error {
+				_, err := (&logsServer{batcher: fakeSender{}, admit: admit, log: log}).Export(
+					context.Background(), &collectorlogs.ExportLogsServiceRequest{})
+				return err
+			},
+		},
+		{
+			name: "traces",
+			call: func() error {
+				_, err := (&tracesServer{batcher: fakeSender{}, admit: admit, log: log}).Export(
+					context.Background(), &collectortrace.ExportTraceServiceRequest{})
+				return err
+			},
+		},
+		{
+			name: "metrics",
+			call: func() error {
+				_, err := (&metricsServer{admit: admit, log: log}).Export(
+					context.Background(), &collectormetrics.ExportMetricsServiceRequest{})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); status.Code(err) != codes.Unavailable {
+				t.Fatalf("code = %v, want Unavailable (err %v)", status.Code(err), err)
+			}
+		})
 	}
 }
 

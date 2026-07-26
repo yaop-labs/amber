@@ -12,6 +12,7 @@ import (
 
 	"github.com/yaop-labs/amber/internal/backup"
 	"github.com/yaop-labs/amber/internal/dbmeta"
+	"github.com/yaop-labs/amber/internal/diskguard"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
@@ -172,6 +173,25 @@ func TestNewRejectsNegativeJournalRetention(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("negative journal retention accepted")
+	}
+}
+
+func TestNewStopsBeforeOpeningStoresBelowDiskWatermark(t *testing.T) {
+	dataDir := t.TempDir()
+	_, err := New(context.Background(), Options{
+		DataDir: dataDir,
+		Storage: StorageOptions{
+			DiskWarningFreeBytes: int64(^uint64(0) >> 1),
+			DiskStopFreeBytes:    int64(^uint64(0)>>1) - 1,
+		},
+	})
+	if !errors.Is(err, diskguard.ErrLowSpace) {
+		t.Fatalf("New error = %v, want low-space admission", err)
+	}
+	for _, name := range []string{dbmeta.IdentityFileName, "logs", "spans", "metrics", otlpv4.DirectoryName} {
+		if _, statErr := os.Stat(filepath.Join(dataDir, name)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s created before disk admission: %v", name, statErr)
+		}
 	}
 }
 

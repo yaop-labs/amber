@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,7 @@ type apiHarness struct {
 	spanManager *storage.SegmentManager
 	logSparse   *index.SparseIndex
 	spanSparse  *index.SparseIndex
+	executor    *query.Executor
 	cancel      context.CancelFunc
 	root        string
 	journal     *otlpv4.Journal
@@ -96,6 +98,7 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 		spanManager: spanManager,
 		logSparse:   logSparse,
 		spanSparse:  spanSparse,
+		executor:    exec,
 		cancel:      cancel,
 		root:        dir,
 		journal:     journal,
@@ -406,6 +409,30 @@ func TestRoutes_OTLPJSONResponseAndRetryableFailure(t *testing.T) {
 	}
 }
 
+func TestRoutes_OTLPDiskAdmissionFailsClosedBeforeHandlers(t *testing.T) {
+	handler := NewOTLPHandler(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.admitIngest = func() error { return errors.New("low disk") }
+
+	for _, path := range []string{"/v1/logs", "/v1/traces", "/v1/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(nil))
+			req.Header.Set("Content-Type", "application/x-protobuf")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+			}
+			var rpcStatus statuspb.Status
+			if err := proto.Unmarshal(rec.Body.Bytes(), &rpcStatus); err != nil {
+				t.Fatalf("decode OTLP status: %v", err)
+			}
+			if rpcStatus.Code != int32(codesUnavailable) {
+				t.Fatalf("OTLP status code = %d", rpcStatus.Code)
+			}
+		})
+	}
+}
+
 func TestRoutes_OTLPJournalRetainsOnlyAcceptedRichLog(t *testing.T) {
 	h := setupAPIHarness(t)
 	accepted := &logspb.LogRecord{
@@ -458,6 +485,67 @@ func TestRoutes_OTLPJournalRetainsOnlyAcceptedRichLog(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("journal record count = %d", count)
+	}
+}
+
+func TestOTLPDualWriteFailureIsRetryableAndAtLeastOnce(t *testing.T) {
+	h := setupAPIHarness(t)
+	handler := NewOTLPHandler(h.batcher, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler.journal = h.journal
+
+	req := &collectorlogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+			TimeUnixNano: uint64(time.Now().UnixNano()),
+			Body:         &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "retry-me"}},
+		}}}},
+	}}}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body))
+	firstReq.Header.Set("Content-Type", "application/x-protobuf")
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, firstReq)
+	if first.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d body=%q", first.Code, first.Body.String())
+	}
+
+	journal, err := otlpv4.OpenJournal(h.root, storage.DefaultRotationPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.journal = journal
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body))
+	secondReq.Header.Set("Content-Type", "application/x-protobuf")
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, secondReq)
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry status = %d body=%q", second.Code, second.Body.String())
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logs, err := h.executor.ExecLog(context.Background(), &query.LogQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs.Entries) != 2 {
+		t.Fatalf("projection records = %d, want 2 at-least-once copies", len(logs.Entries))
+	}
+	journalRecords := 0
+	if err := otlpv4.Replay(context.Background(), h.root, func(otlpv4.Envelope) error {
+		journalRecords++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if journalRecords != 1 {
+		t.Fatalf("journal records = %d, want successful retry only", journalRecords)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 	"github.com/yaop-labs/gyre"
 )
 
-const stackVersion = "0.4.0-dev"
+const stackVersion = "0.4.0"
 
 // StackComponent exposes an already-open Amber stack to a Gyre Runtime. The
 // standalone binary constructs the stack before registering components, so

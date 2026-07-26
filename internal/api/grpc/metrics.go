@@ -19,6 +19,7 @@ type metricsServer struct {
 	collectormetrics.UnimplementedMetricsServiceServer
 	store   *metricsengine.Store
 	journal *otlpv4.Journal
+	admit   func() error
 	log     *slog.Logger
 }
 
@@ -26,6 +27,11 @@ type metricsServer struct {
 // points to the embedded metric store via the shared otlpmetrics path,
 // reporting points that did not land through OTLP partial success.
 func (s *metricsServer) Export(ctx context.Context, req *collectormetrics.ExportMetricsServiceRequest) (*collectormetrics.ExportMetricsServiceResponse, error) {
+	if s.admit != nil {
+		if err := s.admit(); err != nil {
+			return nil, status.Error(codes.Unavailable, "ingest stopped by resource admission policy; retry request")
+		}
+	}
 	res, err := otlpmetrics.Ingest(s.store, req, s.log)
 	if s.journal != nil && res.AcceptedRequest != nil {
 		if journalErr := s.journal.AppendRequest(otlpv4.SignalMetrics, res.AcceptedRequest, time.Now()); journalErr != nil {

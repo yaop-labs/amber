@@ -70,13 +70,15 @@ func run() error {
 		IndexBootstrapWorkers: cfg.Runtime.IndexBootstrapWorkers,
 		MemoryLimit:           cfg.Runtime.MemoryLimit,
 		Storage: runtime.StorageOptions{
-			SegmentMaxRecords:  cfg.Storage.SegmentMaxRecords,
-			SegmentMaxBytes:    cfg.Storage.SegmentMaxBytes,
-			S3Bucket:           cfg.Storage.S3.Bucket,
-			S3Prefix:           cfg.Storage.S3.Prefix,
-			S3Region:           cfg.Storage.S3.Region,
-			S3Endpoint:         cfg.Storage.S3.Endpoint,
-			S3ReconcileOnStart: cfg.Storage.S3.ReconcileOnStart,
+			SegmentMaxRecords:    cfg.Storage.SegmentMaxRecords,
+			SegmentMaxBytes:      cfg.Storage.SegmentMaxBytes,
+			DiskWarningFreeBytes: cfg.Storage.DiskWarningFreeBytes,
+			DiskStopFreeBytes:    cfg.Storage.DiskStopFreeBytes,
+			S3Bucket:             cfg.Storage.S3.Bucket,
+			S3Prefix:             cfg.Storage.S3.Prefix,
+			S3Region:             cfg.Storage.S3.Region,
+			S3Endpoint:           cfg.Storage.S3.Endpoint,
+			S3ReconcileOnStart:   cfg.Storage.S3.ReconcileOnStart,
 		},
 		Ingest: runtime.IngestOptions{
 			BatchSize:        cfg.Ingest.BatchSize,
@@ -170,6 +172,30 @@ func run() error {
 	selfobs.RegisterGaugeFunc("amber_segments_total", "Number of segments tracked by a manager.", func() float64 {
 		return float64(stack.LogManager.SegmentCount() + stack.SpanManager.SegmentCount())
 	})
+	selfobs.RegisterGaugeFunc("amber_disk_free_bytes", "Free bytes on the data filesystem used for ingest admission.", func() float64 {
+		return float64(stack.DiskGuard.Sample().FreeBytes)
+	})
+	selfobs.RegisterGaugeFunc("amber_disk_total_bytes", "Total bytes on the data filesystem used for ingest admission.", func() float64 {
+		return float64(stack.DiskGuard.Sample().TotalBytes)
+	})
+	selfobs.RegisterGaugeFunc("amber_disk_warning", "1 when free space is at or below the warning watermark.", func() float64 {
+		if stack.DiskGuard.Sample().Warning {
+			return 1
+		}
+		return 0
+	})
+	selfobs.RegisterGaugeFunc("amber_disk_ingest_stopped", "1 when disk admission rejects ingest.", func() float64 {
+		if stack.DiskGuard.Sample().Stopped {
+			return 1
+		}
+		return 0
+	})
+	selfobs.RegisterCounterFunc("amber_disk_probe_failures_total", "Filesystem free-space probe failures since process start.", func() float64 {
+		return float64(stack.DiskGuard.Stats().ProbeFailures)
+	})
+	selfobs.RegisterCounterFunc("amber_disk_ingest_rejected_total", "Ingest requests rejected by disk admission since process start.", func() float64 {
+		return float64(stack.DiskGuard.Stats().Rejected)
+	})
 	readOTLPReplayMetrics := registerOTLPReplayMetrics(stack.OTLPJournal)
 	selfobs.RegisterCounterFunc("amber_wal_corrupt_records_total", "Malformed WAL records observed during replay.", func() float64 {
 		return float64(stack.LogManager.WALCorruptRecords()+stack.SpanManager.WALCorruptRecords()) + readOTLPReplayMetrics().walRepairEvents
@@ -242,7 +268,7 @@ func run() error {
 			return fmt.Errorf("configure grpc reef edge: %w", err)
 		}
 		defer func() { _ = grpcEdge.Close() }()
-		grpcServer := ambergrpc.NewServerWithJournal(stack.Batcher, stack.MetricStore, stack.OTLPJournal, int(cfg.API.MaxRequestBytes), log, grpcEdge.Options...)
+		grpcServer := ambergrpc.NewServerWithJournalAndAdmission(stack.Batcher, stack.MetricStore, stack.OTLPJournal, stack.AdmitIngest, int(cfg.API.MaxRequestBytes), log, grpcEdge.Options...)
 		healthServer := health.NewServer()
 		grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 		healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
@@ -282,6 +308,7 @@ func run() error {
 		LogSparse:   stack.LogSparse,
 		MetricStore: stack.MetricStore,
 		OTLPJournal: stack.OTLPJournal,
+		AdmitIngest: stack.AdmitIngest,
 		IsReady: func() bool {
 			return opsRuntime.Ready(context.Background()) == nil
 		},

@@ -46,9 +46,20 @@ type Status struct {
 	DatabaseID           string
 	WALRepairEvents      uint64
 	IndexBootstrapErrors uint64
+	Disk                 DiskStatus
 	LastSuccessfulBackup *BackupCheckpointStatus
 	LastVerifiedRestore  *RestoreCheckpointStatus
 	Reasons              []StatusReason
+}
+
+// DiskStatus reports the current data-filesystem admission condition.
+type DiskStatus struct {
+	FreeBytes  int64
+	TotalBytes int64
+	Warning    bool
+	Stopped    bool
+	ProbeError string
+	CheckedAt  time.Time
 }
 
 type BackupCheckpointStatus struct {
@@ -137,14 +148,18 @@ type Options struct {
 	SegmentMaxRecords uint64
 	// SegmentMaxBytes counts uncompressed serialized payload and may be
 	// exceeded by one batch; it is not a physical file-size cap.
-	SegmentMaxBytes  int64
-	BatchSize        int
-	BatchTimeout     time.Duration
-	QueueSize        int
-	BreakerThreshold int
-	LogIngest        IngestLane
-	SpanIngest       IngestLane
-	IndexCacheSize   int
+	SegmentMaxBytes int64
+	// DiskWarningFreeBytes degrades status while ingest remains available.
+	// DiskStopFreeBytes rejects ingest before ENOSPC. Zero uses runtime defaults.
+	DiskWarningFreeBytes int64
+	DiskStopFreeBytes    int64
+	BatchSize            int
+	BatchTimeout         time.Duration
+	QueueSize            int
+	BreakerThreshold     int
+	LogIngest            IngestLane
+	SpanIngest           IngestLane
+	IndexCacheSize       int
 	// IndexBootstrapWorkers bounds concurrent startup sidecar builds.
 	// Zero uses the conservative default of one.
 	IndexBootstrapWorkers int
@@ -194,13 +209,15 @@ func Open(dataDir string, opts *Options) (*DB, error) {
 		IndexBootstrapWorkers: o.IndexBootstrapWorkers,
 		MemoryLimit:           o.MemoryLimit,
 		Storage: runtime.StorageOptions{
-			SegmentMaxRecords:  o.SegmentMaxRecords,
-			SegmentMaxBytes:    o.SegmentMaxBytes,
-			S3Bucket:           o.S3.Bucket,
-			S3Prefix:           o.S3.Prefix,
-			S3Region:           o.S3.Region,
-			S3Endpoint:         o.S3.Endpoint,
-			S3ReconcileOnStart: o.S3.ReconcileOnStart,
+			SegmentMaxRecords:    o.SegmentMaxRecords,
+			SegmentMaxBytes:      o.SegmentMaxBytes,
+			DiskWarningFreeBytes: o.DiskWarningFreeBytes,
+			DiskStopFreeBytes:    o.DiskStopFreeBytes,
+			S3Bucket:             o.S3.Bucket,
+			S3Prefix:             o.S3.Prefix,
+			S3Region:             o.S3.Region,
+			S3Endpoint:           o.S3.Endpoint,
+			S3ReconcileOnStart:   o.S3.ReconcileOnStart,
 		},
 		Ingest: runtime.IngestOptions{
 			BatchSize:        o.BatchSize,
@@ -334,6 +351,11 @@ func (db *DB) Status() Status {
 		Ready: s.Ready, Degraded: s.Degraded, Closing: s.Closing,
 		DatabaseID:      s.DatabaseID,
 		WALRepairEvents: s.WALRepairEvents, IndexBootstrapErrors: s.IndexBootstrapErrors,
+		Disk: DiskStatus{
+			FreeBytes: s.Disk.FreeBytes, TotalBytes: s.Disk.TotalBytes,
+			Warning: s.Disk.Warning, Stopped: s.Disk.Stopped,
+			ProbeError: s.Disk.ProbeError, CheckedAt: s.Disk.CheckedAt,
+		},
 		Reasons: make([]StatusReason, len(s.Reasons)),
 	}
 	if s.LastSuccessfulBackup != nil {

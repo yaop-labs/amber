@@ -26,6 +26,8 @@ type RoutesDeps struct {
 	// metric query endpoints.
 	MetricStore *metricsengine.Store
 	OTLPJournal *otlpv4.Journal
+	// AdmitIngest rejects writes under runtime resource pressure.
+	AdmitIngest func() error
 	IsReady     func() bool
 	Status      func() runtime.Status
 	Logger      *slog.Logger
@@ -73,8 +75,20 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	authPost := func(h http.Handler) http.Handler {
 		return APIKeyMiddleware(cfg.APIKeys, access(MaxBytesMiddleware(cfg.MaxRequestBytes, h)))
 	}
+	admitPost := func(h http.Handler) http.Handler {
+		if deps.AdmitIngest == nil {
+			return h
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := deps.AdmitIngest(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, "ingest temporarily unavailable")
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
 
-	mux.Handle("POST /api/v1/logs", authPost(NewIngestHandler(deps.Batcher, deps.Logger)))
+	mux.Handle("POST /api/v1/logs", authPost(admitPost(NewIngestHandler(deps.Batcher, deps.Logger))))
 	mux.Handle("GET /api/v1/logs", auth(NewQueryHandler(deps.Executor, deps.Logger)))
 	mux.Handle("GET /api/v1/traces/", auth(NewTraceHandler(deps.Executor, deps.Logger)))
 	mux.Handle("GET /api/v1/traces", auth(NewTracesHandler(deps.Executor, deps.Logger)))
@@ -82,6 +96,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 
 	otlpH := NewOTLPHandler(deps.Batcher, deps.MetricStore, deps.Logger, cfg.MaxRequestBytes)
 	otlpH.journal = deps.OTLPJournal
+	otlpH.admitIngest = deps.AdmitIngest
 	mux.Handle("POST /v1/logs", authPost(otlpH))
 	mux.Handle("POST /v1/traces", authPost(otlpH))
 	mux.Handle("POST /v1/metrics", authPost(otlpH))

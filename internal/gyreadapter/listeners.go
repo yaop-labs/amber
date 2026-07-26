@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-const listenerVersion = "0.4.0-dev"
+const listenerVersion = "0.4.0"
 
 // HTTPComponent owns one already-materialized HTTP handler and binds its
 // listener synchronously in Start. Serve errors are retained in Status.
