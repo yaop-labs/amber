@@ -160,6 +160,54 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 	return seq, nil
 }
 
+// WriteTS appends one (ts, data) record without allocating a temporary
+// (8-byte LE ts || data) payload. Its on-disk representation is identical to
+// Write called with that concatenated payload.
+func (w *WAL) WriteTS(ts int64, data []byte) (uint64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.failed != nil {
+		return 0, w.failed
+	}
+	if err := validateWALPayloadSize(8 + len(data)); err != nil {
+		return 0, err
+	}
+
+	seq := w.nextSeq.Add(1) - 1
+	length := uint32(8 + len(data))
+
+	var tsBuf [8]byte
+	binary.LittleEndian.PutUint64(tsBuf[:], uint64(ts))
+	var header [walHeaderSize]byte
+	binary.LittleEndian.PutUint32(header[0:4], walMagic)
+	binary.LittleEndian.PutUint32(header[8:12], length)
+	binary.LittleEndian.PutUint64(header[12:20], seq)
+
+	crc := crc32.Update(0, crc32.IEEETable, header[8:20])
+	crc = crc32.Update(crc, crc32.IEEETable, tsBuf[:])
+	crc = crc32.Update(crc, crc32.IEEETable, data)
+	binary.LittleEndian.PutUint32(header[4:8], crc)
+
+	if _, err := w.buf.Write(header[:]); err != nil {
+		return 0, w.failStop(fmt.Errorf("wal: write header: %w", err))
+	}
+	if _, err := w.buf.Write(tsBuf[:]); err != nil {
+		return 0, w.failStop(fmt.Errorf("wal: write ts: %w", err))
+	}
+	if _, err := w.buf.Write(data); err != nil {
+		return 0, w.failStop(fmt.Errorf("wal: write data: %w", err))
+	}
+	if err := w.buf.Flush(); err != nil {
+		return 0, w.failStop(fmt.Errorf("wal: flush: %w", err))
+	}
+	if err := w.file.Sync(); err != nil {
+		return 0, w.failStop(fmt.Errorf("wal: sync: %w", err))
+	}
+
+	return seq, nil
+}
+
 // WriteBatchTS appends (ts, data) records under a single fsync without
 // allocating per-record (ts||data) payloads. CRC is computed incrementally
 // over the two parts. On-disk format is identical to WriteBatch with a

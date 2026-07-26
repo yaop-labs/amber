@@ -116,6 +116,35 @@ func TestWAL_Write_Multiple(t *testing.T) {
 	}
 }
 
+func TestWAL_WriteTS_ReplaysConcatenatedPayload(t *testing.T) {
+	wal, _ := newTestWAL(t)
+	const timestamp = int64(-123456789)
+	data := []byte("hello amber")
+
+	if _, err := wal.WriteTS(timestamp, data); err != nil {
+		t.Fatalf("WriteTS: %v", err)
+	}
+
+	count, err := wal.Replay(func(payload []byte) error {
+		if len(payload) != 8+len(data) {
+			t.Fatalf("payload length = %d, want %d", len(payload), 8+len(data))
+		}
+		if got := int64(binary.LittleEndian.Uint64(payload[:8])); got != timestamp {
+			t.Fatalf("timestamp = %d, want %d", got, timestamp)
+		}
+		if got := string(payload[8:]); got != string(data) {
+			t.Fatalf("data = %q, want %q", got, data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("record count = %d, want 1", count)
+	}
+}
+
 func TestWAL_Write_Empty(t *testing.T) {
 	wal, _ := newTestWAL(t)
 
@@ -172,6 +201,9 @@ func TestWALRejectsPayloadLargerThanReplayLimit(t *testing.T) {
 	// WriteBatchTS adds an 8-byte timestamp to the WAL payload.
 	if _, err := wal.WriteBatchTS([]BatchItem{{Data: make([]byte, MaxWALRecordBytes-7), TS: 1}}); !errors.Is(err, ErrWALRecordTooLarge) {
 		t.Fatalf("WriteBatchTS oversized error = %v, want ErrWALRecordTooLarge", err)
+	}
+	if _, err := wal.WriteTS(1, make([]byte, MaxWALRecordBytes-7)); !errors.Is(err, ErrWALRecordTooLarge) {
+		t.Fatalf("WriteTS oversized error = %v, want ErrWALRecordTooLarge", err)
 	}
 	if size, err := wal.Size(); err != nil || size != 0 {
 		t.Fatalf("WAL size after rejected writes = %d, %v; want 0", size, err)
@@ -466,6 +498,9 @@ func TestWAL_FailStopAfterWriteError(t *testing.T) {
 	}
 	if _, err := wal.WriteBatchTS([]BatchItem{{Data: []byte("z"), TS: 1}}); err == nil {
 		t.Fatal("fail-stopped writer accepted a TS batch")
+	}
+	if _, err := wal.WriteTS(1, []byte("z")); err == nil {
+		t.Fatal("fail-stopped writer accepted a TS write")
 	}
 	if err := wal.Truncate(); err == nil {
 		t.Fatal("fail-stopped writer allowed Truncate")

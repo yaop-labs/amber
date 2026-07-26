@@ -356,10 +356,8 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 		return err
 	}
 
-	payload := makeWALPayload(ts, data)
-
 	walStart := time.Now()
-	seq, err := sm.wal.Write(payload)
+	seq, err := sm.wal.WriteTS(ts, data)
 	selfobs.WALWriteDuration.WithLabelValues("single").Observe(time.Since(walStart).Seconds())
 	selfobs.WALWrites.WithLabelValues("single").Inc()
 	if err != nil {
@@ -1184,20 +1182,6 @@ func (sm *SegmentManager) close() error {
 	}
 	sm.closed = true
 	return errors.Join(errs...)
-}
-
-func makeWALPayload(ts int64, data []byte) []byte {
-	payload := make([]byte, 8+len(data))
-	payload[0] = byte(ts)
-	payload[1] = byte(ts >> 8)
-	payload[2] = byte(ts >> 16)
-	payload[3] = byte(ts >> 24)
-	payload[4] = byte(ts >> 32)
-	payload[5] = byte(ts >> 40)
-	payload[6] = byte(ts >> 48)
-	payload[7] = byte(ts >> 56)
-	copy(payload[8:], data)
-	return payload
 }
 
 // appendSegmentWriter reopens an existing (unsealed) segment for append after
