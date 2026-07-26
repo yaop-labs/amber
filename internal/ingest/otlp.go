@@ -111,6 +111,9 @@ func OTLPSpanToEntry(sp *tracepb.Span, service string) (model.SpanEntry, error) 
 		if kv == nil {
 			continue
 		}
+		if entry.Attrs == nil {
+			entry.Attrs = make([]model.Attr, 0, len(sp.Attributes))
+		}
 		entry.Attrs = append(entry.Attrs, model.Attr{
 			Key:   kv.Key,
 			Value: AnyValueToString(kv.Value),
