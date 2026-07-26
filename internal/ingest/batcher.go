@@ -634,8 +634,13 @@ func (b *Batcher) flush(ctx context.Context) error {
 	}
 	var errs []error
 	for _, done := range []<-chan error{logDone, spanDone} {
-		if err := waitBarrier(ctx, done); err != nil {
-			errs = append(errs, err)
+		select {
+		case err := <-done:
+			if err != nil {
+				errs = append(errs, err)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return errors.Join(errs...)
