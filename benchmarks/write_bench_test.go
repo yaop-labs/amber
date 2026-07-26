@@ -1,10 +1,8 @@
-// Package benchmarks holds in-process Go microbenchmarks for amber's hot paths
-// - ingest handler, batcher, segment/WAL writers, query executor, FTS index,
-// bitmap filter - driven directly against the internal packages. They isolate
-// one component at a time (throughput and allocations per op) and exist to
-// catch regressions in `go test -bench`; they are deliberately separate from
-// the obsbench harness (benchmarks/obsbench), which measures amber end to end
-// over HTTP against Loki/VictoriaLogs/etc. for the published campaign numbers.
+// Package benchmarks holds local Go benchmarks for amber's hot paths: focused
+// component microbenchmarks plus loopback OTLP transport benchmarks that cover
+// the acknowledged write stack. They exist to catch regressions in
+// `go test -bench` and remain separate from benchmarks/obsbench, which compares
+// deployed systems such as Amber, Loki, and VictoriaLogs.
 package benchmarks
 
 import (
