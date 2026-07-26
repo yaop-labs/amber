@@ -18,14 +18,25 @@ import (
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-type item struct {
-	log          *model.LogEntry
-	span         *model.SpanEntry
+type logQueueItem struct {
+	entry        model.LogEntry
 	nativeReplay bool
 	// barrier marks a Flush sentinel: the worker flushes the pending batch,
 	// then reports the lane's sticky outcome. Never carries data.
 	barrier chan error
 }
+
+type spanQueueItem struct {
+	entry        model.SpanEntry
+	nativeReplay bool
+	barrier      chan error
+}
+
+// Queue channels deliberately hold pointers to pooled items. With the default
+// 100k slots per lane, embedding the 144-byte LogEntry and 160-byte SpanEntry
+// values in channel rings would reserve tens of MiB before any telemetry is
+// accepted. Pool ownership still removes the per-send allocation while keeping
+// each ring slot pointer-sized.
 
 // Errors returned by the Send methods when an entry is rejected on the hot path.
 var (
@@ -50,8 +61,10 @@ type Batcher struct {
 	spanBatchSize    int
 	logBatchTimeout  time.Duration
 	spanBatchTimeout time.Duration
-	logQueue         chan item
-	spanQueue        chan item
+	logQueue         chan *logQueueItem
+	spanQueue        chan *spanQueueItem
+	logItemPool      sync.Pool
+	spanItemPool     sync.Pool
 	log              *slog.Logger
 	wg               sync.WaitGroup
 	logBreaker       uint64
@@ -181,7 +194,7 @@ type laneConfig struct {
 func NewBatcher(deps Deps, cfg Config) *Batcher {
 	logCfg := resolveLaneConfig(cfg, cfg.Logs)
 	spanCfg := resolveLaneConfig(cfg, cfg.Spans)
-	return &Batcher{
+	b := &Batcher{
 		logManager:       deps.LogManager,
 		spanManager:      deps.SpanManager,
 		logSparse:        deps.LogSparse,
@@ -191,8 +204,8 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		spanBatchSize:    spanCfg.batchSize,
 		logBatchTimeout:  logCfg.batchTimeout,
 		spanBatchTimeout: spanCfg.batchTimeout,
-		logQueue:         make(chan item, logCfg.queueSize),
-		spanQueue:        make(chan item, spanCfg.queueSize),
+		logQueue:         make(chan *logQueueItem, logCfg.queueSize),
+		spanQueue:        make(chan *spanQueueItem, spanCfg.queueSize),
 		log:              deps.Logger,
 		logBreaker:       logCfg.breakerThreshold,
 		spanBreaker:      spanCfg.breakerThreshold,
@@ -204,6 +217,9 @@ func NewBatcher(deps Deps, cfg Config) *Batcher {
 		logM:             newKindMetrics("log"),
 		spanM:            newKindMetrics("span"),
 	}
+	b.logItemPool.New = func() any { return new(logQueueItem) }
+	b.spanItemPool.New = func() any { return new(spanQueueItem) }
+	return b
 }
 
 // SetReplaySink attaches the native replay sink before Start.
@@ -262,15 +278,15 @@ func (b *Batcher) Start(ctx context.Context) {
 	b.wg.Add(2)
 	go func() {
 		var scratch logBatchScratch
-		b.run(workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, func(ctx context.Context, batch []item) error {
+		runLane(b, workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, func(ctx context.Context, batch []logQueueItem) error {
 			return b.processLogBatchWithScratch(ctx, batch, &scratch)
-		})
+		}, logItemBarrier, b.releaseLogItem)
 	}()
 	go func() {
 		var scratch spanBatchScratch
-		b.run(workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, func(ctx context.Context, batch []item) error {
+		runLane(b, workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, func(ctx context.Context, batch []spanQueueItem) error {
 			return b.processSpanBatchWithScratch(ctx, batch, &scratch)
-		})
+		}, spanItemBarrier, b.releaseSpanItem)
 	}()
 	if ctx.Done() != nil {
 		shutdownCtx := context.WithoutCancel(ctx)
@@ -321,10 +337,12 @@ func (b *Batcher) sendLog(entry model.LogEntry, nativeReplay bool) error {
 		return err
 	}
 	reason, admitted := b.guard.Admit(entry.Service, entry.Attrs, func() bool {
+		it := b.acquireLogItem(entry, nativeReplay)
 		select {
-		case b.logQueue <- item{log: &entry, nativeReplay: nativeReplay}:
+		case b.logQueue <- it:
 			return true
 		default:
+			b.releaseLogItem(it)
 			return false
 		}
 	})
@@ -375,10 +393,12 @@ func (b *Batcher) sendSpan(span model.SpanEntry, nativeReplay bool) error {
 		return err
 	}
 	reason, admitted := b.guard.Admit(span.Service, span.Attrs, func() bool {
+		it := b.acquireSpanItem(span, nativeReplay)
 		select {
-		case b.spanQueue <- item{span: &span, nativeReplay: nativeReplay}:
+		case b.spanQueue <- it:
 			return true
 		default:
+			b.releaseSpanItem(it)
 			return false
 		}
 	})
@@ -428,10 +448,46 @@ var bufPool = sync.Pool{
 	New: func() any { return &bytes.Buffer{} },
 }
 
-func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, batchTimeout time.Duration, process func(context.Context, []item) error) {
+func (b *Batcher) acquireLogItem(entry model.LogEntry, nativeReplay bool) *logQueueItem {
+	it := b.logItemPool.Get().(*logQueueItem)
+	it.entry = entry
+	it.nativeReplay = nativeReplay
+	return it
+}
+
+func (b *Batcher) releaseLogItem(it *logQueueItem) {
+	*it = logQueueItem{}
+	b.logItemPool.Put(it)
+}
+
+func (b *Batcher) acquireSpanItem(entry model.SpanEntry, nativeReplay bool) *spanQueueItem {
+	it := b.spanItemPool.Get().(*spanQueueItem)
+	it.entry = entry
+	it.nativeReplay = nativeReplay
+	return it
+}
+
+func (b *Batcher) releaseSpanItem(it *spanQueueItem) {
+	*it = spanQueueItem{}
+	b.spanItemPool.Put(it)
+}
+
+func logItemBarrier(it *logQueueItem) chan error   { return it.barrier }
+func spanItemBarrier(it *spanQueueItem) chan error { return it.barrier }
+
+func runLane[T any](
+	b *Batcher,
+	ctx context.Context,
+	queue <-chan *T,
+	batchSize int,
+	batchTimeout time.Duration,
+	process func(context.Context, []T) error,
+	barrier func(*T) chan error,
+	release func(*T),
+) {
 	defer b.wg.Done()
 
-	batch := make([]item, 0, batchSize)
+	batch := make([]T, 0, batchSize)
 	var stickyErr error
 	ticker := time.NewTicker(batchTimeout)
 	defer ticker.Stop()
@@ -453,12 +509,14 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 			for {
 				select {
 				case it := <-queue:
-					if it.barrier != nil {
+					if done := barrier(it); done != nil {
+						release(it)
 						flush()
-						it.barrier <- stickyErr
+						done <- stickyErr
 						continue
 					}
-					batch = append(batch, it)
+					batch = append(batch, *it)
+					release(it)
 					if len(batch) >= batchSize {
 						flush()
 					}
@@ -469,12 +527,14 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 			}
 
 		case it := <-queue:
-			if it.barrier != nil {
+			if done := barrier(it); done != nil {
+				release(it)
 				flush()
-				it.barrier <- stickyErr
+				done <- stickyErr
 				continue
 			}
-			batch = append(batch, it)
+			batch = append(batch, *it)
+			release(it)
 			if len(batch) >= batchSize {
 				flush()
 				ticker.Reset(batchTimeout)
@@ -502,21 +562,59 @@ func (b *Batcher) Flush(ctx context.Context) error {
 // FlushLogs and FlushSpans are per-signal durability barriers used by OTLP
 // Export: success means every record admitted by that request's lane is durable
 // and queryable.
-func (b *Batcher) FlushLogs(ctx context.Context) error  { return b.flushOne(ctx, b.logQueue) }
-func (b *Batcher) FlushSpans(ctx context.Context) error { return b.flushOne(ctx, b.spanQueue) }
-
-func (b *Batcher) flushOne(ctx context.Context, queue chan item) error {
+func (b *Batcher) FlushLogs(ctx context.Context) error {
 	b.admitMu.RLock()
 	defer b.admitMu.RUnlock()
 	if !b.accepting {
 		return ErrClosed
 	}
-	done := make(chan error, 1)
-	select {
-	case queue <- item{barrier: done}:
-	case <-ctx.Done():
-		return ctx.Err()
+	done, err := b.enqueueLogBarrier(ctx)
+	if err != nil {
+		return err
 	}
+	return waitBarrier(ctx, done)
+}
+
+func (b *Batcher) FlushSpans(ctx context.Context) error {
+	b.admitMu.RLock()
+	defer b.admitMu.RUnlock()
+	if !b.accepting {
+		return ErrClosed
+	}
+	done, err := b.enqueueSpanBarrier(ctx)
+	if err != nil {
+		return err
+	}
+	return waitBarrier(ctx, done)
+}
+
+func (b *Batcher) enqueueLogBarrier(ctx context.Context) (chan error, error) {
+	done := make(chan error, 1)
+	it := b.logItemPool.Get().(*logQueueItem)
+	it.barrier = done
+	select {
+	case b.logQueue <- it:
+	case <-ctx.Done():
+		b.releaseLogItem(it)
+		return nil, ctx.Err()
+	}
+	return done, nil
+}
+
+func (b *Batcher) enqueueSpanBarrier(ctx context.Context) (chan error, error) {
+	done := make(chan error, 1)
+	it := b.spanItemPool.Get().(*spanQueueItem)
+	it.barrier = done
+	select {
+	case b.spanQueue <- it:
+	case <-ctx.Done():
+		b.releaseSpanItem(it)
+		return nil, ctx.Err()
+	}
+	return done, nil
+}
+
+func waitBarrier(ctx context.Context, done <-chan error) error {
 	select {
 	case err := <-done:
 		return err
@@ -526,26 +624,18 @@ func (b *Batcher) flushOne(ctx context.Context, queue chan item) error {
 }
 
 func (b *Batcher) flush(ctx context.Context) error {
-	lanes := [2]chan item{b.logQueue, b.spanQueue}
-	var dones [2]chan error
-	for i, queue := range lanes {
-		done := make(chan error, 1)
-		select {
-		case queue <- item{barrier: done}:
-			dones[i] = done
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	logDone, err := b.enqueueLogBarrier(ctx)
+	if err != nil {
+		return err
+	}
+	spanDone, err := b.enqueueSpanBarrier(ctx)
+	if err != nil {
+		return err
 	}
 	var errs []error
-	for _, done := range dones {
-		select {
-		case err := <-done:
-			if err != nil {
-				errs = append(errs, err)
-			}
-		case <-ctx.Done():
-			return ctx.Err()
+	for _, done := range []<-chan error{logDone, spanDone} {
+		if err := waitBarrier(ctx, done); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -578,33 +668,12 @@ func (b *Batcher) Close(ctx context.Context) error {
 	}
 }
 
-func (b *Batcher) processBatch(_ context.Context, batch []item) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	var logScratch logBatchScratch
-	logItems, logEntries, replayLogs, logErr := b.prepareLogBatch(batch, &logScratch)
-	defer logScratch.finish()
-	if len(logItems) > 0 {
-		logErr = errors.Join(logErr, b.writeLogBatch(logItems, logEntries, replayLogs))
-	}
-
-	var spanScratch spanBatchScratch
-	spanItems, spanEntries, replaySpans, spanErr := b.prepareSpanBatch(batch, &spanScratch)
-	defer spanScratch.finish()
-	if len(spanItems) > 0 {
-		spanErr = errors.Join(spanErr, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
-	}
-	return errors.Join(logErr, spanErr)
-}
-
-func (b *Batcher) processLogBatch(_ context.Context, batch []item) error {
+func (b *Batcher) processLogBatch(ctx context.Context, batch []logQueueItem) error {
 	var scratch logBatchScratch
-	return b.processLogBatchWithScratch(context.Background(), batch, &scratch)
+	return b.processLogBatchWithScratch(ctx, batch, &scratch)
 }
 
-func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []item, scratch *logBatchScratch) error {
+func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []logQueueItem, scratch *logBatchScratch) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -616,12 +685,12 @@ func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []item, sc
 	return errors.Join(err, b.writeLogBatch(logItems, logEntries, replayLogs))
 }
 
-func (b *Batcher) processSpanBatch(_ context.Context, batch []item) error {
+func (b *Batcher) processSpanBatch(ctx context.Context, batch []spanQueueItem) error {
 	var scratch spanBatchScratch
-	return b.processSpanBatchWithScratch(context.Background(), batch, &scratch)
+	return b.processSpanBatchWithScratch(ctx, batch, &scratch)
 }
 
-func (b *Batcher) processSpanBatchWithScratch(_ context.Context, batch []item, scratch *spanBatchScratch) error {
+func (b *Batcher) processSpanBatchWithScratch(_ context.Context, batch []spanQueueItem, scratch *spanBatchScratch) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -633,19 +702,17 @@ func (b *Batcher) processSpanBatchWithScratch(_ context.Context, batch []item, s
 	return errors.Join(err, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
 }
 
-func (b *Batcher) prepareLogBatch(batch []item, scratch *logBatchScratch) ([]storage.BatchItem, []*model.LogEntry, []model.LogEntry, error) {
+func (b *Batcher) prepareLogBatch(batch []logQueueItem, scratch *logBatchScratch) ([]storage.BatchItem, []*model.LogEntry, []model.LogEntry, error) {
 	payloadSize, sizeErr := logBatchPayloadSize(batch)
 	if sizeErr != nil {
 		return nil, nil, nil, sizeErr
 	}
 	scratch.prepare(len(batch), payloadSize, b.indexer != nil, b.replaySink != nil)
 	var errs []error
-	for _, it := range batch {
-		if it.log == nil {
-			continue
-		}
+	for i := range batch {
+		it := &batch[i]
 		start := len(scratch.payload)
-		payload, writeErr := it.log.AppendTo(scratch.payload)
+		payload, writeErr := it.entry.AppendTo(scratch.payload)
 		if writeErr != nil {
 			b.logM.serializeErr.Inc()
 			b.log.Error("serialize log entry", "err", writeErr)
@@ -656,31 +723,29 @@ func (b *Batcher) prepareLogBatch(batch []item, scratch *logBatchScratch) ([]sto
 
 		scratch.items = append(scratch.items, storage.BatchItem{
 			Data: scratch.payload[start:],
-			TS:   it.log.Timestamp.UnixNano(),
+			TS:   it.entry.Timestamp.UnixNano(),
 		})
 		if b.indexer != nil {
-			scratch.index = append(scratch.index, it.log)
+			scratch.index = append(scratch.index, &it.entry)
 		}
 		if b.replaySink != nil && it.nativeReplay {
-			scratch.replay = append(scratch.replay, *it.log)
+			scratch.replay = append(scratch.replay, it.entry)
 		}
 	}
 	return scratch.items, scratch.index, scratch.replay, errors.Join(errs...)
 }
 
-func (b *Batcher) prepareSpanBatch(batch []item, scratch *spanBatchScratch) ([]storage.BatchItem, []*model.SpanEntry, []model.SpanEntry, error) {
+func (b *Batcher) prepareSpanBatch(batch []spanQueueItem, scratch *spanBatchScratch) ([]storage.BatchItem, []*model.SpanEntry, []model.SpanEntry, error) {
 	payloadSize, sizeErr := spanBatchPayloadSize(batch)
 	if sizeErr != nil {
 		return nil, nil, nil, sizeErr
 	}
 	scratch.prepare(len(batch), payloadSize, b.indexer != nil, b.replaySink != nil)
 	var errs []error
-	for _, it := range batch {
-		if it.span == nil {
-			continue
-		}
+	for i := range batch {
+		it := &batch[i]
 		start := len(scratch.payload)
-		payload, writeErr := it.span.AppendTo(scratch.payload)
+		payload, writeErr := it.entry.AppendTo(scratch.payload)
 		if writeErr != nil {
 			b.spanM.serializeErr.Inc()
 			b.log.Error("serialize span entry", "err", writeErr)
@@ -691,13 +756,13 @@ func (b *Batcher) prepareSpanBatch(batch []item, scratch *spanBatchScratch) ([]s
 
 		scratch.items = append(scratch.items, storage.BatchItem{
 			Data: scratch.payload[start:],
-			TS:   it.span.StartTime.UnixNano(),
+			TS:   it.entry.StartTime.UnixNano(),
 		})
 		if b.indexer != nil {
-			scratch.index = append(scratch.index, it.span)
+			scratch.index = append(scratch.index, &it.entry)
 		}
 		if b.replaySink != nil && it.nativeReplay {
-			scratch.replay = append(scratch.replay, *it.span)
+			scratch.replay = append(scratch.replay, it.entry)
 		}
 	}
 	return scratch.items, scratch.index, scratch.replay, errors.Join(errs...)
