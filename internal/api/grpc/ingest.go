@@ -41,23 +41,33 @@ func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSe
 	var rejected int64
 	var firstErr error
 	var transient error
-	accepted := make(map[*logspb.LogRecord]struct{})
+	var excluded map[*logspb.LogRecord]struct{}
+	acceptedCount := 0
+	allAccepted := true
 	for _, rl := range req.ResourceLogs {
 		if rl == nil {
+			allAccepted = false
 			continue
 		}
 		service, host := ingest.ExtractResource(rl.Resource.GetAttributes())
 		for _, sl := range rl.ScopeLogs {
 			if sl == nil {
+				allAccepted = false
 				continue
 			}
 			for _, lr := range sl.LogRecords {
 				if lr == nil {
+					allAccepted = false
 					rejected++
 					continue
 				}
 				entry, err := ingest.OTLPLogToEntry(lr, service, host)
 				if err != nil {
+					allAccepted = false
+					if excluded == nil {
+						excluded = make(map[*logspb.LogRecord]struct{})
+					}
+					excluded[lr] = struct{}{}
 					s.log.Debug("grpc: skip log record", "err", err)
 					rejected++
 					if firstErr == nil {
@@ -66,6 +76,11 @@ func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSe
 					continue
 				}
 				if err := s.batcher.SendOTLPLog(entry); err != nil {
+					allAccepted = false
+					if excluded == nil {
+						excluded = make(map[*logspb.LogRecord]struct{})
+					}
+					excluded[lr] = struct{}{}
 					s.log.Debug("grpc: send log failed", "err", err)
 					if retryableIngestError(err) {
 						transient = err
@@ -77,7 +92,7 @@ func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSe
 					}
 					continue
 				}
-				accepted[lr] = struct{}{}
+				acceptedCount++
 			}
 		}
 	}
@@ -85,8 +100,12 @@ func (s *logsServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSe
 	if flushErr != nil && transient == nil {
 		transient = flushErr
 	}
-	if flushErr == nil && s.journal != nil && len(accepted) != 0 {
-		if err := s.journal.AppendRequest(otlpv4.SignalLogs, otlpv4.LogsSubset(req, accepted), time.Now()); err != nil {
+	if flushErr == nil && s.journal != nil && acceptedCount != 0 {
+		journalRequest := req
+		if !allAccepted {
+			journalRequest = otlpv4.LogsSubsetExcluding(req, excluded)
+		}
+		if err := s.journal.AppendRequest(otlpv4.SignalLogs, journalRequest, time.Now()); err != nil {
 			transient = err
 		}
 	}
@@ -120,23 +139,33 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 	var rejected int64
 	var firstErr error
 	var transient error
-	accepted := make(map[*tracepb.Span]struct{})
+	var excluded map[*tracepb.Span]struct{}
+	acceptedCount := 0
+	allAccepted := true
 	for _, rs := range req.ResourceSpans {
 		if rs == nil {
+			allAccepted = false
 			continue
 		}
 		service, _ := ingest.ExtractResource(rs.Resource.GetAttributes())
 		for _, ss := range rs.ScopeSpans {
 			if ss == nil {
+				allAccepted = false
 				continue
 			}
 			for _, sp := range ss.Spans {
 				if sp == nil {
+					allAccepted = false
 					rejected++
 					continue
 				}
 				entry, err := ingest.OTLPSpanToEntry(sp, service)
 				if err != nil {
+					allAccepted = false
+					if excluded == nil {
+						excluded = make(map[*tracepb.Span]struct{})
+					}
+					excluded[sp] = struct{}{}
 					s.log.Debug("grpc: skip span", "err", err)
 					rejected++
 					if firstErr == nil {
@@ -145,6 +174,11 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 					continue
 				}
 				if err := s.batcher.SendOTLPSpan(entry); err != nil {
+					allAccepted = false
+					if excluded == nil {
+						excluded = make(map[*tracepb.Span]struct{})
+					}
+					excluded[sp] = struct{}{}
 					s.log.Debug("grpc: send span failed", "err", err)
 					if retryableIngestError(err) {
 						transient = err
@@ -156,7 +190,7 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 					}
 					continue
 				}
-				accepted[sp] = struct{}{}
+				acceptedCount++
 			}
 		}
 	}
@@ -164,8 +198,12 @@ func (s *tracesServer) Export(ctx context.Context, req *collectortrace.ExportTra
 	if flushErr != nil && transient == nil {
 		transient = flushErr
 	}
-	if flushErr == nil && s.journal != nil && len(accepted) != 0 {
-		if err := s.journal.AppendRequest(otlpv4.SignalTraces, otlpv4.TracesSubset(req, accepted), time.Now()); err != nil {
+	if flushErr == nil && s.journal != nil && acceptedCount != 0 {
+		journalRequest := req
+		if !allAccepted {
+			journalRequest = otlpv4.TracesSubsetExcluding(req, excluded)
+		}
+		if err := s.journal.AppendRequest(otlpv4.SignalTraces, journalRequest, time.Now()); err != nil {
 			transient = err
 		}
 	}

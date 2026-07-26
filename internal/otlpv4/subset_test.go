@@ -12,12 +12,27 @@ import (
 
 func TestSignalSubsetsRetainOnlyAcceptedChildren(t *testing.T) {
 	logs := richLogsRequest()
+	unknown := protowire.AppendTag(nil, 127, protowire.VarintType)
+	unknown = protowire.AppendVarint(unknown, 9)
+	logs.ProtoReflect().SetUnknown(unknown)
+	logs.ResourceLogs[0].ProtoReflect().SetUnknown(unknown)
 	rejectedLog := proto.Clone(logs.ResourceLogs[0].ScopeLogs[0].LogRecords[0]).(*logspb.LogRecord)
 	logs.ResourceLogs[0].ScopeLogs[0].LogRecords = append(logs.ResourceLogs[0].ScopeLogs[0].LogRecords, rejectedLog)
 	acceptedLog := logs.ResourceLogs[0].ScopeLogs[0].LogRecords[0]
 	logSubset := LogsSubset(logs, map[*logspb.LogRecord]struct{}{acceptedLog: {}})
 	if got := logSubset.ResourceLogs[0].ScopeLogs[0].LogRecords; len(got) != 1 || !proto.Equal(got[0], acceptedLog) {
 		t.Fatalf("log subset = %v", got)
+	}
+	logSubset = LogsSubsetExcluding(logs, map[*logspb.LogRecord]struct{}{rejectedLog: {}})
+	if got := logSubset.ResourceLogs[0].ScopeLogs[0].LogRecords; len(got) != 1 || !proto.Equal(got[0], acceptedLog) {
+		t.Fatalf("log exclusion subset = %v", got)
+	}
+	if got := len(logs.ResourceLogs[0].ScopeLogs[0].LogRecords); got != 2 {
+		t.Fatalf("log exclusion mutated source records: %d", got)
+	}
+	if string(logSubset.ProtoReflect().GetUnknown()) != string(unknown) ||
+		string(logSubset.ResourceLogs[0].ProtoReflect().GetUnknown()) != string(unknown) {
+		t.Fatal("log exclusion subset lost unknown hierarchy fields")
 	}
 
 	traces := richTracesRequest()
@@ -27,6 +42,13 @@ func TestSignalSubsetsRetainOnlyAcceptedChildren(t *testing.T) {
 	traceSubset := TracesSubset(traces, map[*tracepb.Span]struct{}{acceptedSpan: {}})
 	if got := traceSubset.ResourceSpans[0].ScopeSpans[0].Spans; len(got) != 1 || !proto.Equal(got[0], acceptedSpan) {
 		t.Fatalf("trace subset = %v", got)
+	}
+	traceSubset = TracesSubsetExcluding(traces, map[*tracepb.Span]struct{}{rejectedSpan: {}})
+	if got := traceSubset.ResourceSpans[0].ScopeSpans[0].Spans; len(got) != 1 || !proto.Equal(got[0], acceptedSpan) {
+		t.Fatalf("trace exclusion subset = %v", got)
+	}
+	if got := len(traces.ResourceSpans[0].ScopeSpans[0].Spans); got != 2 {
+		t.Fatalf("trace exclusion mutated source spans: %d", got)
 	}
 }
 

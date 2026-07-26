@@ -124,7 +124,8 @@ func (j *Journal) Append(envelope Envelope, acceptedAt time.Time) error {
 	return nil
 }
 
-// AppendRequest wraps and appends one accepted original OTLP request.
+// AppendRequest wraps and appends one accepted original OTLP request. It
+// marshals request synchronously and does not retain or mutate the message.
 func (j *Journal) AppendRequest(signal Signal, request proto.Message, acceptedAt time.Time) error {
 	envelope, err := New(signal, FidelityOTLP, request)
 	if err != nil {
