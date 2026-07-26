@@ -2,6 +2,7 @@ package model
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,6 +61,17 @@ func TestEncodedSizeMatchesWriteTo(t *testing.T) {
 	if uint64(logBuf.Len()) != wantLog {
 		t.Fatalf("log EncodedSize = %d, WriteTo = %d", wantLog, logBuf.Len())
 	}
+	logPrefix := []byte("prefix")
+	appendedLog, err := logEntry.AppendTo(append([]byte(nil), logPrefix...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(appendedLog[:len(logPrefix)], logPrefix) {
+		t.Fatalf("log AppendTo changed prefix: got %q", appendedLog[:len(logPrefix)])
+	}
+	if !bytes.Equal(appendedLog[len(logPrefix):], logBuf.Bytes()) {
+		t.Fatal("log AppendTo encoding differs from WriteTo")
+	}
 
 	span := SpanEntry{
 		ID: MustNewEntryID(), Service: "api", Operation: "GET /", StartTime: time.Now(), EndTime: time.Now().Add(time.Millisecond),
@@ -75,6 +87,38 @@ func TestEncodedSizeMatchesWriteTo(t *testing.T) {
 	}
 	if uint64(spanBuf.Len()) != wantSpan {
 		t.Fatalf("span EncodedSize = %d, WriteTo = %d", wantSpan, spanBuf.Len())
+	}
+	spanPrefix := []byte("prefix")
+	appendedSpan, err := span.AppendTo(append([]byte(nil), spanPrefix...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(appendedSpan[:len(spanPrefix)], spanPrefix) {
+		t.Fatalf("span AppendTo changed prefix: got %q", appendedSpan[:len(spanPrefix)])
+	}
+	if !bytes.Equal(appendedSpan[len(spanPrefix):], spanBuf.Bytes()) {
+		t.Fatal("span AppendTo encoding differs from WriteTo")
+	}
+}
+
+func TestAppendToLeavesDestinationUnchangedOnValidationError(t *testing.T) {
+	prefix := []byte("keep")
+	logEntry := LogEntry{Service: strings.Repeat("x", maxSmallStringBytes+1)}
+	got, err := logEntry.AppendTo(append([]byte(nil), prefix...))
+	if err == nil {
+		t.Fatal("LogEntry.AppendTo accepted oversized service")
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatalf("LogEntry.AppendTo changed destination on error: got %q", got)
+	}
+
+	span := SpanEntry{Operation: strings.Repeat("x", maxSmallStringBytes+1)}
+	got, err = span.AppendTo(append([]byte(nil), prefix...))
+	if err == nil {
+		t.Fatal("SpanEntry.AppendTo accepted oversized operation")
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatalf("SpanEntry.AppendTo changed destination on error: got %q", got)
 	}
 }
 

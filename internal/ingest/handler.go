@@ -13,6 +13,8 @@ import (
 
 // ActiveIndexer indexes individual entries into the active segment's index.
 type ActiveIndexer interface {
+	// Implementations consume batch slices synchronously and must not retain
+	// the slices or their entry pointers after the method returns.
 	IndexLogEntry(entry model.LogEntry)
 	IndexSpanEntry(span model.SpanEntry)
 	IndexLogEntries(entries []*model.LogEntry)
