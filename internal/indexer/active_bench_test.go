@@ -38,6 +38,25 @@ func benchEntries(n int) []*model.LogEntry {
 	return entries
 }
 
+func benchSpans(n int) []*model.SpanEntry {
+	services := []string{"api-gateway", "auth-service", "payment", "worker", "scheduler"}
+	operations := []string{"GET /users", "POST /orders", "SELECT users", "publish event"}
+	statuses := []model.SpanStatus{model.SpanStatusUnset, model.SpanStatusOK, model.SpanStatusError}
+	now := time.Now()
+	spans := make([]*model.SpanEntry, n)
+	for i := range n {
+		spans[i] = &model.SpanEntry{
+			ID:        model.MustNewEntryID(),
+			Service:   services[i%len(services)],
+			Operation: operations[i%len(operations)],
+			StartTime: now.Add(time.Duration(i) * time.Microsecond),
+			EndTime:   now.Add(time.Duration(i)*time.Microsecond + time.Duration(i%16+1)*time.Millisecond),
+			Status:    statuses[i%len(statuses)],
+		}
+	}
+	return spans
+}
+
 func setupActiveIndex(b *testing.B) *ActiveIndex {
 	b.Helper()
 	dir := b.TempDir()
@@ -57,6 +76,9 @@ func setupActiveIndex(b *testing.B) *ActiveIndex {
 	// throwaway record so an active segment exists.
 	if err := mgr.WriteBatch([]storage.BatchItem{{Data: []byte("seed"), TS: time.Now().UnixNano()}}); err != nil {
 		b.Fatalf("seed WriteBatch: %v", err)
+	}
+	if err := spanMgr.WriteBatch([]storage.BatchItem{{Data: []byte("seed"), TS: time.Now().UnixNano()}}); err != nil {
+		b.Fatalf("seed span WriteBatch: %v", err)
 	}
 	return New(mgr, spanMgr)
 }
@@ -86,6 +108,28 @@ func runIndexLogEntries(b *testing.B, batchSize int) {
 func BenchmarkActiveIndex_IndexLogEntries_100(b *testing.B)   { runIndexLogEntries(b, 100) }
 func BenchmarkActiveIndex_IndexLogEntries_1000(b *testing.B)  { runIndexLogEntries(b, 1000) }
 func BenchmarkActiveIndex_IndexLogEntries_10000(b *testing.B) { runIndexLogEntries(b, 10_000) }
+
+func runIndexSpanEntries(b *testing.B, batchSize int) {
+	a := setupActiveIndex(b)
+	spans := benchSpans(batchSize)
+
+	a.IndexSpanEntries(spans)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		a.mu.Lock()
+		a.span.bitmap = index.NewMultiFieldIndex()
+		a.mu.Unlock()
+		b.StartTimer()
+		a.IndexSpanEntries(spans)
+	}
+	b.ReportMetric(float64(b.N)*float64(batchSize)/b.Elapsed().Seconds(), "entries/sec")
+}
+
+func BenchmarkActiveIndex_IndexSpanEntries_100(b *testing.B)  { runIndexSpanEntries(b, 100) }
+func BenchmarkActiveIndex_IndexSpanEntries_1000(b *testing.B) { runIndexSpanEntries(b, 1000) }
 
 // BenchmarkActiveIndex_IndexLogEntry_Single is the per-call path used by
 // IngestLog (one entry at a time). The processBatch path goes through

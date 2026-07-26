@@ -31,6 +31,17 @@ type ActiveIndex struct {
 	mu   sync.RWMutex
 	log  kindSlot
 	span kindSlot
+
+	logBatchMu       sync.Mutex
+	logLevelGroups   idGroupScratch
+	logServiceGroups idGroupScratch
+	logHostGroups    idGroupScratch
+
+	spanBatchMu         sync.Mutex
+	spanServiceGroups   idGroupScratch
+	spanOperationGroups idGroupScratch
+	spanStatusGroups    idGroupScratch
+	spanDurationGroups  idGroupScratch
 }
 
 // New returns an ActiveIndex over the given log and span segment managers.
@@ -136,39 +147,29 @@ func (a *ActiveIndex) IndexLogEntries(entries []*model.LogEntry) {
 	if len(entries) == 0 {
 		return
 	}
+	a.logBatchMu.Lock()
+	defer a.logBatchMu.Unlock()
+
 	idx := a.activeLog()
 	if idx == nil {
 		return
 	}
 
-	levelGroups := make(map[string][]uint64, 4)
-	serviceGroups := make(map[string][]uint64, 4)
-	hostGroups := make(map[string][]uint64, 8)
-
 	for _, entry := range entries {
 		entryID := model.EntryIDToUint64(entry.ID)
 
-		levelGroups[entry.Level.String()] = append(levelGroups[entry.Level.String()], entryID)
+		a.logLevelGroups.add(entry.Level.String(), entryID)
 		if entry.Service != "" {
-			serviceGroups[entry.Service] = append(serviceGroups[entry.Service], entryID)
+			a.logServiceGroups.add(entry.Service, entryID)
 		}
 		if entry.Host != "" {
-			hostGroups[entry.Host] = append(hostGroups[entry.Host], entryID)
+			a.logHostGroups.add(entry.Host, entryID)
 		}
 	}
 
-	flush := func(field string, groups map[string][]uint64) {
-		if len(groups) == 0 {
-			return
-		}
-		bi := idx.GetOrCreate(field)
-		for value, ids := range groups {
-			bi.AddMany(value, ids)
-		}
-	}
-	flush("level", levelGroups)
-	flush("service", serviceGroups)
-	flush("host", hostGroups)
+	a.logLevelGroups.flush(idx, "level")
+	a.logServiceGroups.flush(idx, "service")
+	a.logHostGroups.flush(idx, "host")
 }
 
 // IndexSpanEntries adds a batch of spans to the active span bitmap in one pass.
@@ -176,52 +177,29 @@ func (a *ActiveIndex) IndexSpanEntries(spans []*model.SpanEntry) {
 	if len(spans) == 0 {
 		return
 	}
+	a.spanBatchMu.Lock()
+	defer a.spanBatchMu.Unlock()
+
 	idx := a.activeSpan()
 	if idx == nil {
 		return
 	}
 
-	serviceGroups := make(map[string][]uint64, 4)
-	operationGroups := make(map[string][]uint64, 8)
-	statusGroups := make(map[string][]uint64, 4)
-	durGroups := make(map[string][]uint64, 16)
-
 	for _, span := range spans {
 		entryID := model.EntryIDToUint64(span.ID)
 
 		if span.Service != "" {
-			serviceGroups[span.Service] = append(serviceGroups[span.Service], entryID)
+			a.spanServiceGroups.add(span.Service, entryID)
 		}
 		if span.Operation != "" {
-			operationGroups[span.Operation] = append(operationGroups[span.Operation], entryID)
+			a.spanOperationGroups.add(span.Operation, entryID)
 		}
-		statusGroups[span.Status.String()] = append(statusGroups[span.Status.String()], entryID)
-		durBucket := index.DurationBucket(span.Duration())
-		durGroups[durBucket] = append(durGroups[durBucket], entryID)
+		a.spanStatusGroups.add(span.Status.String(), entryID)
+		a.spanDurationGroups.add(index.DurationBucket(span.Duration()), entryID)
 	}
 
-	if len(serviceGroups) > 0 {
-		bi := idx.GetOrCreate("service")
-		for value, ids := range serviceGroups {
-			bi.AddMany(value, ids)
-		}
-	}
-	if len(operationGroups) > 0 {
-		bi := idx.GetOrCreate("operation")
-		for value, ids := range operationGroups {
-			bi.AddMany(value, ids)
-		}
-	}
-	if len(statusGroups) > 0 {
-		bi := idx.GetOrCreate("status")
-		for value, ids := range statusGroups {
-			bi.AddMany(value, ids)
-		}
-	}
-	if len(durGroups) > 0 {
-		bi := idx.GetOrCreate(index.DurationBucketField)
-		for value, ids := range durGroups {
-			bi.AddMany(value, ids)
-		}
-	}
+	a.spanServiceGroups.flush(idx, "service")
+	a.spanOperationGroups.flush(idx, "operation")
+	a.spanStatusGroups.flush(idx, "status")
+	a.spanDurationGroups.flush(idx, index.DurationBucketField)
 }
