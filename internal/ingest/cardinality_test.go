@@ -49,6 +49,38 @@ func TestCardinalityGuard_KeysPerService(t *testing.T) {
 	}
 }
 
+func TestCardinalityGuard_DuplicateNewKeysCountOnce(t *testing.T) {
+	g := NewCardinalityGuard(0, 0, 1)
+	attrs := []model.Attr{{Key: "a"}, {Key: "a"}, {Key: "a"}}
+	if reason := g.Check("svc", attrs); reason != "" {
+		t.Fatalf("duplicate key must consume one slot, got %q", reason)
+	}
+	if reason := g.Check("svc", []model.Attr{{Key: "b"}}); reason != "key_cardinality" {
+		t.Fatalf("second distinct key reason = %q, want key_cardinality", reason)
+	}
+}
+
+func TestCardinalityGuard_KnownKeysDoNotAllocate(t *testing.T) {
+	g := NewCardinalityGuard(64, 4096, 1024)
+	attrs := []model.Attr{
+		{Key: "env", Value: "prod"},
+		{Key: "region", Value: "us-east-1"},
+		{Key: "version", Value: "v1.42.0"},
+	}
+	if reason := g.Check("svc", attrs); reason != "" {
+		t.Fatalf("warm guard: %q", reason)
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if reason := g.Check("svc", attrs); reason != "" {
+			panic(reason)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("known-key path allocs = %v, want 0", allocs)
+	}
+}
+
 func TestCardinalityGuard_ZeroLimitsDisabled(t *testing.T) {
 	g := NewCardinalityGuard(0, 0, 0)
 	huge := make([]model.Attr, 1000)
@@ -84,6 +116,20 @@ func TestCardinalityGuard_BoundsTrackedServices(t *testing.T) {
 		t.Fatal(reason)
 	}
 	if reason := g.Check("second", []model.Attr{{Key: "a"}}); reason != "service_cardinality" {
+		t.Fatalf("reason = %q, want service_cardinality", reason)
+	}
+}
+
+func TestCardinalityGuard_ServiceOnlyDoesNotTrackKeys(t *testing.T) {
+	g := NewCardinalityGuard(0, 0, 0, 1)
+	attrs := []model.Attr{{Key: "a"}, {Key: "b"}}
+	if reason := g.Check("first", attrs); reason != "" {
+		t.Fatal(reason)
+	}
+	if keys, ok := g.keysPerService["first"]; !ok || keys != nil {
+		t.Fatalf("service-only guard retained keys: ok=%v keys=%v", ok, keys)
+	}
+	if reason := g.Check("second", attrs); reason != "service_cardinality" {
 		t.Fatalf("reason = %q, want service_cardinality", reason)
 	}
 }

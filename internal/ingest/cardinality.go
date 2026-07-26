@@ -68,19 +68,30 @@ func (g *CardinalityGuard) Admit(service string, attrs []model.Attr, enqueue fun
 			if g.maxServices > 0 && len(g.keysPerService) >= g.maxServices {
 				return "service_cardinality", false
 			}
-			known = make(map[string]struct{}, min(len(attrs), g.maxKeysPerSvc))
 		}
-		newKeys := make([]string, 0, len(attrs))
-		seenNew := make(map[string]struct{}, len(attrs))
+
+		// A service-only guard does not need to retain its attribute keys.
+		if g.maxKeysPerSvc == 0 {
+			if !enqueue() {
+				return "", false
+			}
+			if !ok {
+				g.keysPerService[service] = nil
+			}
+			return "", true
+		}
+		// Most entries use keys already observed for their service. Keep that
+		// common path allocation-free and create the temporary set only when
+		// this entry actually introduces a key.
+		var newKeys map[string]struct{}
 		for _, a := range attrs {
 			if _, seen := known[a.Key]; seen {
 				continue
 			}
-			if _, seen := seenNew[a.Key]; seen {
-				continue
+			if newKeys == nil {
+				newKeys = make(map[string]struct{}, min(len(attrs), g.maxKeysPerSvc))
 			}
-			seenNew[a.Key] = struct{}{}
-			newKeys = append(newKeys, a.Key)
+			newKeys[a.Key] = struct{}{}
 		}
 		if g.maxKeysPerSvc > 0 && len(known)+len(newKeys) > g.maxKeysPerSvc {
 			return "key_cardinality", false
@@ -89,9 +100,12 @@ func (g *CardinalityGuard) Admit(service string, attrs []model.Attr, enqueue fun
 			return "", false
 		}
 		if !ok {
-			g.keysPerService[service] = known
+			// The temporary set is already the complete key set for a new
+			// service, so transfer it directly instead of copying it.
+			g.keysPerService[service] = newKeys
+			return "", true
 		}
-		for _, key := range newKeys {
+		for key := range newKeys {
 			known[key] = struct{}{}
 		}
 		return "", true
