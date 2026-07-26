@@ -90,6 +90,51 @@ func New(signal Signal, fidelity Fidelity, request proto.Message) (Envelope, err
 	return Envelope{signal: signal, fidelity: fidelity, payload: payload}, nil
 }
 
+// marshalRequest writes a request directly into its final envelope buffer.
+// AppendRequest uses this path to avoid allocating a standalone protobuf
+// payload and then copying it into a second allocation in MarshalBinary.
+func marshalRequest(signal Signal, fidelity Fidelity, request proto.Message) ([]byte, error) {
+	if err := validateSignal(signal); err != nil {
+		return nil, err
+	}
+	if err := validateFidelity(fidelity); err != nil {
+		return nil, err
+	}
+	if isNilMessage(request) {
+		return nil, errors.New("otlpv4: nil request")
+	}
+	if !requestMatchesSignal(signal, request) {
+		return nil, fmt.Errorf("otlpv4: signal %s does not match request %T", signal, request)
+	}
+
+	marshalOptions := proto.MarshalOptions{Deterministic: true}
+	payloadSize := marshalOptions.Size(request)
+	if payloadSize > MaxPayloadBytes {
+		return nil, fmt.Errorf("otlpv4: payload is too large: %d bytes", payloadSize)
+	}
+	out := make([]byte, headerSize, headerSize+payloadSize)
+	var err error
+	marshalOptions.UseCachedSize = true
+	out, err = marshalOptions.MarshalAppend(out, request)
+	if err != nil {
+		return nil, fmt.Errorf("otlpv4: marshal %s request: %w", signal, err)
+	}
+	payloadSize = len(out) - headerSize
+	if payloadSize > MaxPayloadBytes {
+		return nil, fmt.Errorf("otlpv4: payload is too large: %d bytes", payloadSize)
+	}
+
+	copy(out[:4], magic)
+	binary.LittleEndian.PutUint16(out[4:6], FormatVersion)
+	out[6] = byte(signal)
+	out[7] = byte(fidelity)
+	binary.LittleEndian.PutUint32(out[8:12], uint32(payloadSize))
+	checksum := crc32.Update(0, crc32.IEEETable, out[:12])
+	checksum = crc32.Update(checksum, crc32.IEEETable, out[headerSize:])
+	binary.LittleEndian.PutUint32(out[12:16], checksum)
+	return out, nil
+}
+
 func (e Envelope) Signal() Signal { return e.signal }
 
 func (e Envelope) Fidelity() Fidelity { return e.fidelity }

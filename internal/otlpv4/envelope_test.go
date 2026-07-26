@@ -61,6 +61,37 @@ func TestEnvelopeSemanticRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMarshalRequestMatchesEnvelopeEncoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		signal  Signal
+		request proto.Message
+	}{
+		{name: "logs", signal: SignalLogs, request: richLogsRequest()},
+		{name: "traces", signal: SignalTraces, request: richTracesRequest()},
+		{name: "metrics", signal: SignalMetrics, request: richMetricsRequest()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			envelope, err := New(test.signal, FidelityOTLP, test.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := envelope.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := marshalRequest(test.signal, FidelityOTLP, test.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatal("direct request encoding differs from Envelope.MarshalBinary")
+			}
+		})
+	}
+}
+
 func TestEnvelopePreservesUnknownProtobufFields(t *testing.T) {
 	request := richLogsRequest()
 	raw, err := proto.Marshal(request)
