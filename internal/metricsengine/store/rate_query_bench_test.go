@@ -221,9 +221,9 @@ func BenchmarkRateByLabelRangeSteps_qm2(b *testing.B) {
 
 // BenchmarkRateByLabelRangeSteps_qm2_campaign mirrors the obsbench qm2-range-rate
 // query exactly: range = half the ingest span, step = (span/2)/20, 1m window
-// (see benchmarks/obsbench/metrics_queries.go ScenarioQM2Range). For the 180-tick
-// fixture that is a ~15m range over ~15 in-window blocks - the query that EOF'd
-// the campaign at 71-101s.
+// (see amber-benchmarks/internal/obsbench/metrics_queries.go ScenarioQM2Range).
+// For the 180-tick fixture that is a ~15m range over ~15 in-window blocks - the
+// query that EOF'd the campaign at 71-101s.
 func BenchmarkRateByLabelRangeSteps_qm2_campaign(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("service", time.Minute)

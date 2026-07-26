@@ -1,7 +1,7 @@
 // Package benchmarks holds local Go benchmarks for amber's hot paths: focused
 // component microbenchmarks plus loopback OTLP transport benchmarks that cover
 // the acknowledged write stack. They exist to catch regressions in
-// `go test -bench` and remain separate from benchmarks/obsbench, which compares
+// `go test -bench` and remain separate from amber-benchmarks, which compares
 // deployed systems such as Amber, Loki, and VictoriaLogs.
 package benchmarks
 
