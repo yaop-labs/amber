@@ -16,6 +16,20 @@ func LogsSubset(req *collectorlogs.ExportLogsServiceRequest, accepted map[*logsp
 	if req == nil || len(accepted) == 0 {
 		return nil
 	}
+	return filterLogs(req, accepted, true)
+}
+
+// LogsSubsetExcluding clones req and removes rejected records. It is intended
+// for the partial-acceptance path, where tracking a small exclusion set avoids
+// building a pointer set containing every successful record.
+func LogsSubsetExcluding(req *collectorlogs.ExportLogsServiceRequest, excluded map[*logspb.LogRecord]struct{}) *collectorlogs.ExportLogsServiceRequest {
+	if req == nil {
+		return nil
+	}
+	return filterLogs(req, excluded, false)
+}
+
+func filterLogs(req *collectorlogs.ExportLogsServiceRequest, selected map[*logspb.LogRecord]struct{}, includeSelected bool) *collectorlogs.ExportLogsServiceRequest {
 	out := proto.Clone(req).(*collectorlogs.ExportLogsServiceRequest)
 	resources := out.ResourceLogs[:0]
 	for resourceIndex, originalResource := range req.ResourceLogs {
@@ -31,7 +45,8 @@ func LogsSubset(req *collectorlogs.ExportLogsServiceRequest, accepted map[*logsp
 			}
 			records := clonedScope.LogRecords[:0]
 			for recordIndex, originalRecord := range originalScope.LogRecords {
-				if _, ok := accepted[originalRecord]; ok {
+				_, isSelected := selected[originalRecord]
+				if originalRecord != nil && isSelected == includeSelected {
 					records = append(records, clonedScope.LogRecords[recordIndex])
 				}
 			}
@@ -54,6 +69,18 @@ func TracesSubset(req *collectortrace.ExportTraceServiceRequest, accepted map[*t
 	if req == nil || len(accepted) == 0 {
 		return nil
 	}
+	return filterTraces(req, accepted, true)
+}
+
+// TracesSubsetExcluding is LogsSubsetExcluding for rejected spans.
+func TracesSubsetExcluding(req *collectortrace.ExportTraceServiceRequest, excluded map[*tracepb.Span]struct{}) *collectortrace.ExportTraceServiceRequest {
+	if req == nil {
+		return nil
+	}
+	return filterTraces(req, excluded, false)
+}
+
+func filterTraces(req *collectortrace.ExportTraceServiceRequest, selected map[*tracepb.Span]struct{}, includeSelected bool) *collectortrace.ExportTraceServiceRequest {
 	out := proto.Clone(req).(*collectortrace.ExportTraceServiceRequest)
 	resources := out.ResourceSpans[:0]
 	for resourceIndex, originalResource := range req.ResourceSpans {
@@ -69,7 +96,8 @@ func TracesSubset(req *collectortrace.ExportTraceServiceRequest, accepted map[*t
 			}
 			spans := clonedScope.Spans[:0]
 			for spanIndex, originalSpan := range originalScope.Spans {
-				if _, ok := accepted[originalSpan]; ok {
+				_, isSelected := selected[originalSpan]
+				if originalSpan != nil && isSelected == includeSelected {
 					spans = append(spans, clonedScope.Spans[spanIndex])
 				}
 			}

@@ -44,14 +44,18 @@ const (
 // BenchmarkOTLPTransport measures the complete acknowledged OTLP write path:
 // loopback transport, protobuf codec, conversion, primary WAL/segment/index
 // durability, accepted-request subset cloning, and canonical journal durability.
-// Each wire request contains one invalid record so the post-run validation can
-// prove that both primary storage and the journal retained only the accepted
-// 256-record subset.
+// AllAccepted captures the common path; Subset adds one invalid wire record so
+// post-run validation can prove that primary storage and the journal retained
+// only the accepted 256-record subset.
 func BenchmarkOTLPTransport(b *testing.B) {
-	b.Run("HTTP/Logs256", benchmarkOTLPHTTPLogs)
-	b.Run("HTTP/Traces256", benchmarkOTLPHTTPTraces)
-	b.Run("gRPC/Logs256", benchmarkOTLPGRPCLogs)
-	b.Run("gRPC/Traces256", benchmarkOTLPGRPCTraces)
+	b.Run("HTTP/Logs256/AllAccepted", func(b *testing.B) { benchmarkOTLPHTTPLogs(b, false) })
+	b.Run("HTTP/Logs256/Subset", func(b *testing.B) { benchmarkOTLPHTTPLogs(b, true) })
+	b.Run("HTTP/Traces256/AllAccepted", func(b *testing.B) { benchmarkOTLPHTTPTraces(b, false) })
+	b.Run("HTTP/Traces256/Subset", func(b *testing.B) { benchmarkOTLPHTTPTraces(b, true) })
+	b.Run("gRPC/Logs256/AllAccepted", func(b *testing.B) { benchmarkOTLPGRPCLogs(b, false) })
+	b.Run("gRPC/Logs256/Subset", func(b *testing.B) { benchmarkOTLPGRPCLogs(b, true) })
+	b.Run("gRPC/Traces256/AllAccepted", func(b *testing.B) { benchmarkOTLPGRPCTraces(b, false) })
+	b.Run("gRPC/Traces256/Subset", func(b *testing.B) { benchmarkOTLPGRPCTraces(b, true) })
 }
 
 type otlpTransportBench struct {
@@ -182,11 +186,12 @@ func (h *otlpTransportBench) grpcConn(b *testing.B) (*gogrpc.ClientConn, *gogrpc
 	return conn, server
 }
 
-func benchmarkOTLPHTTPLogs(b *testing.B) {
+func benchmarkOTLPHTTPLogs(b *testing.B, rejectOne bool) {
 	h := newOTLPTransportBench(b)
 	server, client := h.httpServer(b)
-	request := makeOTLPLogRequest()
+	request := makeOTLPLogRequest(rejectOne)
 	wireBytes := proto.Size(request)
+	wantRejected := rejectionCount(rejectOne)
 
 	b.SetBytes(int64(wireBytes))
 	b.ReportAllocs()
@@ -200,8 +205,8 @@ func benchmarkOTLPHTTPLogs(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if rejected != 1 {
-			b.Fatalf("rejected logs = %d, want 1", rejected)
+		if rejected != wantRejected {
+			b.Fatalf("rejected logs = %d, want %d", rejected, wantRejected)
 		}
 	}
 	b.StopTimer()
@@ -209,11 +214,12 @@ func benchmarkOTLPHTTPLogs(b *testing.B) {
 	h.verify(b, otlpv4.SignalLogs)
 }
 
-func benchmarkOTLPHTTPTraces(b *testing.B) {
+func benchmarkOTLPHTTPTraces(b *testing.B, rejectOne bool) {
 	h := newOTLPTransportBench(b)
 	server, client := h.httpServer(b)
-	request := makeOTLPTraceRequest()
+	request := makeOTLPTraceRequest(rejectOne)
 	wireBytes := proto.Size(request)
+	wantRejected := rejectionCount(rejectOne)
 
 	b.SetBytes(int64(wireBytes))
 	b.ReportAllocs()
@@ -228,8 +234,8 @@ func benchmarkOTLPHTTPTraces(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if rejected != 1 {
-			b.Fatalf("rejected spans = %d, want 1", rejected)
+		if rejected != wantRejected {
+			b.Fatalf("rejected spans = %d, want %d", rejected, wantRejected)
 		}
 	}
 	b.StopTimer()
@@ -237,14 +243,15 @@ func benchmarkOTLPHTTPTraces(b *testing.B) {
 	h.verify(b, otlpv4.SignalTraces)
 }
 
-func benchmarkOTLPGRPCLogs(b *testing.B) {
+func benchmarkOTLPGRPCLogs(b *testing.B, rejectOne bool) {
 	h := newOTLPTransportBench(b)
 	conn, _ := h.grpcConn(b)
 	client := collectorlogs.NewLogsServiceClient(conn)
 	if _, err := client.Export(context.Background(), &collectorlogs.ExportLogsServiceRequest{}); err != nil {
 		b.Fatalf("warm gRPC connection: %v", err)
 	}
-	request := makeOTLPLogRequest()
+	request := makeOTLPLogRequest(rejectOne)
+	wantRejected := rejectionCount(rejectOne)
 
 	b.SetBytes(int64(proto.Size(request)))
 	b.ReportAllocs()
@@ -254,8 +261,8 @@ func benchmarkOTLPGRPCLogs(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if rejected := resp.GetPartialSuccess().GetRejectedLogRecords(); rejected != 1 {
-			b.Fatalf("rejected logs = %d, want 1", rejected)
+		if rejected := resp.GetPartialSuccess().GetRejectedLogRecords(); rejected != wantRejected {
+			b.Fatalf("rejected logs = %d, want %d", rejected, wantRejected)
 		}
 	}
 	b.StopTimer()
@@ -263,14 +270,15 @@ func benchmarkOTLPGRPCLogs(b *testing.B) {
 	h.verify(b, otlpv4.SignalLogs)
 }
 
-func benchmarkOTLPGRPCTraces(b *testing.B) {
+func benchmarkOTLPGRPCTraces(b *testing.B, rejectOne bool) {
 	h := newOTLPTransportBench(b)
 	conn, _ := h.grpcConn(b)
 	client := collectortrace.NewTraceServiceClient(conn)
 	if _, err := client.Export(context.Background(), &collectortrace.ExportTraceServiceRequest{}); err != nil {
 		b.Fatalf("warm gRPC connection: %v", err)
 	}
-	request := makeOTLPTraceRequest()
+	request := makeOTLPTraceRequest(rejectOne)
+	wantRejected := rejectionCount(rejectOne)
 
 	b.SetBytes(int64(proto.Size(request)))
 	b.ReportAllocs()
@@ -281,8 +289,8 @@ func benchmarkOTLPGRPCTraces(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if rejected := resp.GetPartialSuccess().GetRejectedSpans(); rejected != 1 {
-			b.Fatalf("rejected spans = %d, want 1", rejected)
+		if rejected := resp.GetPartialSuccess().GetRejectedSpans(); rejected != wantRejected {
+			b.Fatalf("rejected spans = %d, want %d", rejected, wantRejected)
 		}
 	}
 	b.StopTimer()
@@ -296,6 +304,13 @@ func reportOTLPRecords(b *testing.B) {
 		float64(b.N*otlpBenchAcceptedRecords)/b.Elapsed().Seconds(),
 		"records/sec",
 	)
+}
+
+func rejectionCount(rejectOne bool) int64 {
+	if rejectOne {
+		return 1
+	}
+	return 0
 }
 
 func postOTLPLogs(client *http.Client, endpoint string, body []byte) (int64, error) {
@@ -422,7 +437,7 @@ func (h *otlpTransportBench) verify(b *testing.B, signal otlpv4.Signal) {
 	}
 }
 
-func makeOTLPLogRequest() *collectorlogs.ExportLogsServiceRequest {
+func makeOTLPLogRequest(rejectOne bool) *collectorlogs.ExportLogsServiceRequest {
 	records := make([]*logspb.LogRecord, 0, otlpBenchWireRecords)
 	baseTime := uint64(time.Now().UnixNano())
 	for i := range otlpBenchAcceptedRecords {
@@ -444,11 +459,13 @@ func makeOTLPLogRequest() *collectorlogs.ExportLogsServiceRequest {
 			SpanId:  spanID,
 		})
 	}
-	records = append(records, &logspb.LogRecord{
-		TimeUnixNano: baseTime,
-		Body:         otlpStringValue("invalid trace id"),
-		TraceId:      []byte{1},
-	})
+	if rejectOne {
+		records = append(records, &logspb.LogRecord{
+			TimeUnixNano: baseTime,
+			Body:         otlpStringValue("invalid trace id"),
+			TraceId:      []byte{1},
+		})
+	}
 	return &collectorlogs.ExportLogsServiceRequest{
 		ResourceLogs: []*logspb.ResourceLogs{{
 			Resource: otlpBenchResource(),
@@ -459,7 +476,7 @@ func makeOTLPLogRequest() *collectorlogs.ExportLogsServiceRequest {
 	}
 }
 
-func makeOTLPTraceRequest() *collectortrace.ExportTraceServiceRequest {
+func makeOTLPTraceRequest(rejectOne bool) *collectortrace.ExportTraceServiceRequest {
 	spans := make([]*tracepb.Span, 0, otlpBenchWireRecords)
 	baseTime := uint64(time.Now().UnixNano())
 	for i := range otlpBenchAcceptedRecords {
@@ -482,13 +499,15 @@ func makeOTLPTraceRequest() *collectortrace.ExportTraceServiceRequest {
 			Status: &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
 		})
 	}
-	spans = append(spans, &tracepb.Span{
-		TraceId:           make([]byte, 16),
-		SpanId:            []byte{1},
-		Name:              "invalid span id",
-		StartTimeUnixNano: baseTime,
-		EndTimeUnixNano:   baseTime + 1,
-	})
+	if rejectOne {
+		spans = append(spans, &tracepb.Span{
+			TraceId:           make([]byte, 16),
+			SpanId:            []byte{1},
+			Name:              "invalid span id",
+			StartTimeUnixNano: baseTime,
+			EndTimeUnixNano:   baseTime + 1,
+		})
+	}
 	return &collectortrace.ExportTraceServiceRequest{
 		ResourceSpans: []*tracepb.ResourceSpans{{
 			Resource: otlpBenchResource(),
