@@ -39,6 +39,22 @@ func benchLogEntry() model.LogEntry {
 	}
 }
 
+func benchSpanEntry() model.SpanEntry {
+	return model.SpanEntry{
+		ID:        model.MustNewEntryID(),
+		Service:   "api-gateway",
+		Operation: "GET /api/v1/users",
+		StartTime: time.Now(),
+		EndTime:   time.Now().Add(45 * time.Millisecond),
+		Status:    model.SpanStatusOK,
+		Attrs: []model.Attr{
+			{Key: "env", Value: "prod"},
+			{Key: "region", Value: "us-east-1"},
+			{Key: "version", Value: "v1.42.0"},
+		},
+	}
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
@@ -67,11 +83,28 @@ func newDrainBatcher(b *testing.B, guard *CardinalityGuard, breakerOpen bool) (*
 	// the queue - drain exits when channel closed and drained. Caller must
 	// not SendLog after stop().
 	go func() {
-		for range bt.logQueue {
+		for it := range bt.logQueue {
+			bt.releaseLogItem(it)
 		}
 	}()
 	stop := func() { close(bt.logQueue) }
 	return bt, stop
+}
+
+func newDrainSpanBatcher(b *testing.B) (*Batcher, func()) {
+	b.Helper()
+	bt := NewBatcher(Deps{Logger: discardLogger()}, Config{
+		BatchSize:        1024,
+		BatchTimeout:     time.Second,
+		QueueSize:        4096,
+		BreakerThreshold: 1,
+	})
+	go func() {
+		for it := range bt.spanQueue {
+			bt.releaseSpanItem(it)
+		}
+	}()
+	return bt, func() { close(bt.spanQueue) }
 }
 
 // BenchmarkBatcher_Prelude_NoGuard isolates IsBreakerOpen() - guard is nil, so
@@ -157,6 +190,17 @@ func BenchmarkBatcher_SendLog_BreakerOpen(b *testing.B) {
 	}
 }
 
+func BenchmarkBatcher_SendSpan_NoGuard(b *testing.B) {
+	bt, stop := newDrainSpanBatcher(b)
+	defer stop()
+	entry := benchSpanEntry()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = bt.SendSpan(entry)
+	}
+}
+
 // BenchmarkBatcher_ProcessBatch_e2e drives processBatch directly with a real
 // SegmentManager, sparse index, and ActiveIndex. Measures the steady-state
 // path that the background goroutine runs: serialize -> WriteBatch -> sparse
@@ -202,14 +246,12 @@ func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 	}
 	baseTS := time.Now().UnixNano()
 
-	// One backing array of LogEntry values, pointers held by `batch`. The
-	// timed loop only mutates ID + Timestamp fields - cheap.
-	entries := make([]model.LogEntry, batchSize)
-	batch := make([]item, batchSize)
+	// One backing array of queue items. The timed loop only mutates ID +
+	// Timestamp fields - cheap.
+	batch := make([]logQueueItem, batchSize)
 	template := benchLogEntry()
-	for j := range entries {
-		entries[j] = template
-		batch[j] = item{log: &entries[j]}
+	for j := range batch {
+		batch[j].entry = template
 	}
 
 	b.ResetTimer()
@@ -217,9 +259,9 @@ func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 	var scratch logBatchScratch
 	for i := 0; i < b.N; i++ {
 		base := i * batchSize
-		for j := range entries {
-			entries[j].ID = ids[base+j]
-			entries[j].Timestamp = time.Unix(0, baseTS+int64(base+j))
+		for j := range batch {
+			batch[j].entry.ID = ids[base+j]
+			batch[j].entry.Timestamp = time.Unix(0, baseTS+int64(base+j))
 		}
 		bt.processLogBatchWithScratch(context.Background(), batch, &scratch)
 	}

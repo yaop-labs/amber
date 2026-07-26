@@ -29,7 +29,7 @@ func TestPrepareLogBatchUsesContiguousScratchPayload(t *testing.T) {
 			Attrs:     []model.Attr{{Key: "zone", Value: "a"}},
 		},
 	}
-	batch := []item{{log: &entries[0]}, {log: &entries[1]}}
+	batch := []logQueueItem{{entry: entries[0]}, {entry: entries[1]}}
 
 	var scratch logBatchScratch
 	items, indexEntries, replayEntries, err := b.prepareLogBatch(batch, &scratch)
@@ -91,5 +91,31 @@ func TestBatchScratchDropsOversizedRetainedMemory(t *testing.T) {
 	spanScratch.finish()
 	if spanScratch.payload != nil {
 		t.Fatalf("oversized span payload cap = %d, want dropped", cap(spanScratch.payload))
+	}
+}
+
+func TestQueueItemReleaseClearsEntryReferences(t *testing.T) {
+	b := NewBatcher(Deps{Logger: discardLogger()}, Config{})
+
+	logItem := b.acquireLogItem(model.LogEntry{
+		Service: "api",
+		Body:    "retained body",
+		Attrs:   []model.Attr{{Key: "env", Value: "test"}},
+	}, true)
+	b.releaseLogItem(logItem)
+	if logItem.entry.Service != "" || logItem.entry.Body != "" || logItem.entry.Attrs != nil ||
+		logItem.nativeReplay || logItem.barrier != nil {
+		t.Fatalf("released log item retains data: %+v", logItem)
+	}
+
+	spanItem := b.acquireSpanItem(model.SpanEntry{
+		Service:   "api",
+		Operation: "GET /",
+		Attrs:     []model.Attr{{Key: "env", Value: "test"}},
+	}, true)
+	b.releaseSpanItem(spanItem)
+	if spanItem.entry.Service != "" || spanItem.entry.Operation != "" || spanItem.entry.Attrs != nil ||
+		spanItem.nativeReplay || spanItem.barrier != nil {
+		t.Fatalf("released span item retains data: %+v", spanItem)
 	}
 }

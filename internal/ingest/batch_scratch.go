@@ -106,13 +106,11 @@ func retainBatchSlice[S ~[]E, E any](items S) S {
 	return items[:0]
 }
 
-func logBatchPayloadSize(batch []item) (int, error) {
+func logBatchPayloadSize(batch []logQueueItem) (int, error) {
 	total := 0
-	for _, it := range batch {
-		if it.log == nil {
-			continue
-		}
-		size, err := it.log.EncodedSize()
+	for i := range batch {
+		it := &batch[i]
+		size, err := it.entry.EncodedSize()
 		if err != nil {
 			// prepareLogBatch reports the entry-specific error while encoding.
 			continue
@@ -125,13 +123,11 @@ func logBatchPayloadSize(batch []item) (int, error) {
 	return total, nil
 }
 
-func spanBatchPayloadSize(batch []item) (int, error) {
+func spanBatchPayloadSize(batch []spanQueueItem) (int, error) {
 	total := 0
-	for _, it := range batch {
-		if it.span == nil {
-			continue
-		}
-		size, err := it.span.EncodedSize()
+	for i := range batch {
+		it := &batch[i]
+		size, err := it.entry.EncodedSize()
 		if err != nil {
 			continue
 		}
