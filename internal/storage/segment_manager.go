@@ -394,9 +394,10 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 	return nil
 }
 
-// WriteBatch appends many records under one WAL fsync (group commit). Rotation
-// policy is evaluated after the whole batch, so a segment may overshoot either
-// threshold by at most one admitted batch.
+// WriteBatch appends many records under one WAL fsync (group commit). It
+// consumes items synchronously and doesn't retain the slice or Data buffers.
+// Rotation policy is evaluated after the whole batch, so a segment may
+// overshoot either threshold by at most one admitted batch.
 func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	if len(items) == 0 {
 		return nil

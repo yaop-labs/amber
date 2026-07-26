@@ -214,13 +214,14 @@ func BenchmarkBatcher_ProcessBatch_e2e(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
+	var scratch logBatchScratch
 	for i := 0; i < b.N; i++ {
 		base := i * batchSize
 		for j := range entries {
 			entries[j].ID = ids[base+j]
 			entries[j].Timestamp = time.Unix(0, baseTS+int64(base+j))
 		}
-		bt.processBatch(context.Background(), batch)
+		bt.processLogBatchWithScratch(context.Background(), batch, &scratch)
 	}
 	b.ReportMetric(float64(b.N)*float64(batchSize)/b.Elapsed().Seconds(), "entries/sec")
 	_ = bytes.NewBuffer(nil)

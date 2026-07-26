@@ -144,6 +144,8 @@ type Deps struct {
 
 // ReplaySink records native model entries after their query projection is durable.
 type ReplaySink interface {
+	// Implementations consume entries synchronously and must not retain the
+	// slice or mutate its elements after the method returns.
 	AppendNormalizedLogs([]model.LogEntry) error
 	AppendNormalizedSpans([]model.SpanEntry) error
 }
@@ -258,8 +260,18 @@ func (b *Batcher) Start(ctx context.Context) {
 	workerCtx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
 	b.wg.Add(2)
-	go b.run(workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, b.processLogBatch)
-	go b.run(workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, b.processSpanBatch)
+	go func() {
+		var scratch logBatchScratch
+		b.run(workerCtx, b.logQueue, b.logBatchSize, b.logBatchTimeout, func(ctx context.Context, batch []item) error {
+			return b.processLogBatchWithScratch(ctx, batch, &scratch)
+		})
+	}()
+	go func() {
+		var scratch spanBatchScratch
+		b.run(workerCtx, b.spanQueue, b.spanBatchSize, b.spanBatchTimeout, func(ctx context.Context, batch []item) error {
+			return b.processSpanBatchWithScratch(ctx, batch, &scratch)
+		})
+	}()
 	if ctx.Done() != nil {
 		shutdownCtx := context.WithoutCancel(ctx)
 		go func() {
@@ -431,6 +443,7 @@ func (b *Batcher) run(ctx context.Context, queue <-chan item, batchSize int, bat
 		if err := process(ctx, batch); err != nil {
 			stickyErr = errors.Join(stickyErr, err)
 		}
+		clear(batch)
 		batch = batch[:0]
 	}
 
@@ -570,12 +583,16 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) error {
 		return nil
 	}
 
-	logItems, logEntries, replayLogs, logErr := b.prepareLogBatch(batch)
+	var logScratch logBatchScratch
+	logItems, logEntries, replayLogs, logErr := b.prepareLogBatch(batch, &logScratch)
+	defer logScratch.finish()
 	if len(logItems) > 0 {
 		logErr = errors.Join(logErr, b.writeLogBatch(logItems, logEntries, replayLogs))
 	}
 
-	spanItems, spanEntries, replaySpans, spanErr := b.prepareSpanBatch(batch)
+	var spanScratch spanBatchScratch
+	spanItems, spanEntries, replaySpans, spanErr := b.prepareSpanBatch(batch, &spanScratch)
+	defer spanScratch.finish()
 	if len(spanItems) > 0 {
 		spanErr = errors.Join(spanErr, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
 	}
@@ -583,10 +600,16 @@ func (b *Batcher) processBatch(_ context.Context, batch []item) error {
 }
 
 func (b *Batcher) processLogBatch(_ context.Context, batch []item) error {
+	var scratch logBatchScratch
+	return b.processLogBatchWithScratch(context.Background(), batch, &scratch)
+}
+
+func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []item, scratch *logBatchScratch) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	logItems, logEntries, replayLogs, err := b.prepareLogBatch(batch)
+	logItems, logEntries, replayLogs, err := b.prepareLogBatch(batch, scratch)
+	defer scratch.finish()
 	if len(logItems) == 0 {
 		return err
 	}
@@ -594,88 +617,90 @@ func (b *Batcher) processLogBatch(_ context.Context, batch []item) error {
 }
 
 func (b *Batcher) processSpanBatch(_ context.Context, batch []item) error {
+	var scratch spanBatchScratch
+	return b.processSpanBatchWithScratch(context.Background(), batch, &scratch)
+}
+
+func (b *Batcher) processSpanBatchWithScratch(_ context.Context, batch []item, scratch *spanBatchScratch) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	spanItems, spanEntries, replaySpans, err := b.prepareSpanBatch(batch)
+	spanItems, spanEntries, replaySpans, err := b.prepareSpanBatch(batch, scratch)
+	defer scratch.finish()
 	if len(spanItems) == 0 {
 		return err
 	}
 	return errors.Join(err, b.writeSpanBatch(spanItems, spanEntries, replaySpans))
 }
 
-func (b *Batcher) prepareLogBatch(batch []item) ([]storage.BatchItem, []*model.LogEntry, []model.LogEntry, error) {
-	logItems := make([]storage.BatchItem, 0, len(batch))
-	var logEntries []*model.LogEntry
-	var replayEntries []model.LogEntry
+func (b *Batcher) prepareLogBatch(batch []item, scratch *logBatchScratch) ([]storage.BatchItem, []*model.LogEntry, []model.LogEntry, error) {
+	payloadSize, sizeErr := logBatchPayloadSize(batch)
+	if sizeErr != nil {
+		return nil, nil, nil, sizeErr
+	}
+	scratch.prepare(len(batch), payloadSize, b.indexer != nil, b.replaySink != nil)
 	var errs []error
 	for _, it := range batch {
 		if it.log == nil {
 			continue
 		}
-		buf := bufPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		_, writeErr := it.log.WriteTo(buf)
+		start := len(scratch.payload)
+		payload, writeErr := it.log.AppendTo(scratch.payload)
 		if writeErr != nil {
 			b.logM.serializeErr.Inc()
 			b.log.Error("serialize log entry", "err", writeErr)
-			bufPool.Put(buf)
 			errs = append(errs, fmt.Errorf("serialize log: %w", writeErr))
 			continue
 		}
-		data := make([]byte, buf.Len())
-		copy(data, buf.Bytes())
-		bufPool.Put(buf)
+		scratch.payload = payload
 
-		logItems = append(logItems, storage.BatchItem{Data: data, TS: it.log.Timestamp.UnixNano()})
+		scratch.items = append(scratch.items, storage.BatchItem{
+			Data: scratch.payload[start:],
+			TS:   it.log.Timestamp.UnixNano(),
+		})
 		if b.indexer != nil {
-			if logEntries == nil {
-				logEntries = make([]*model.LogEntry, 0, len(batch))
-			}
-			logEntries = append(logEntries, it.log)
+			scratch.index = append(scratch.index, it.log)
 		}
 		if b.replaySink != nil && it.nativeReplay {
-			replayEntries = append(replayEntries, *it.log)
+			scratch.replay = append(scratch.replay, *it.log)
 		}
 	}
-	return logItems, logEntries, replayEntries, errors.Join(errs...)
+	return scratch.items, scratch.index, scratch.replay, errors.Join(errs...)
 }
 
-func (b *Batcher) prepareSpanBatch(batch []item) ([]storage.BatchItem, []*model.SpanEntry, []model.SpanEntry, error) {
-	spanItems := make([]storage.BatchItem, 0, len(batch))
-	var spanEntries []*model.SpanEntry
-	var replayEntries []model.SpanEntry
+func (b *Batcher) prepareSpanBatch(batch []item, scratch *spanBatchScratch) ([]storage.BatchItem, []*model.SpanEntry, []model.SpanEntry, error) {
+	payloadSize, sizeErr := spanBatchPayloadSize(batch)
+	if sizeErr != nil {
+		return nil, nil, nil, sizeErr
+	}
+	scratch.prepare(len(batch), payloadSize, b.indexer != nil, b.replaySink != nil)
 	var errs []error
 	for _, it := range batch {
 		if it.span == nil {
 			continue
 		}
-		buf := bufPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		_, writeErr := it.span.WriteTo(buf)
+		start := len(scratch.payload)
+		payload, writeErr := it.span.AppendTo(scratch.payload)
 		if writeErr != nil {
 			b.spanM.serializeErr.Inc()
 			b.log.Error("serialize span entry", "err", writeErr)
-			bufPool.Put(buf)
 			errs = append(errs, fmt.Errorf("serialize span: %w", writeErr))
 			continue
 		}
-		data := make([]byte, buf.Len())
-		copy(data, buf.Bytes())
-		bufPool.Put(buf)
+		scratch.payload = payload
 
-		spanItems = append(spanItems, storage.BatchItem{Data: data, TS: it.span.StartTime.UnixNano()})
+		scratch.items = append(scratch.items, storage.BatchItem{
+			Data: scratch.payload[start:],
+			TS:   it.span.StartTime.UnixNano(),
+		})
 		if b.indexer != nil {
-			if spanEntries == nil {
-				spanEntries = make([]*model.SpanEntry, 0, len(batch))
-			}
-			spanEntries = append(spanEntries, it.span)
+			scratch.index = append(scratch.index, it.span)
 		}
 		if b.replaySink != nil && it.nativeReplay {
-			replayEntries = append(replayEntries, *it.span)
+			scratch.replay = append(scratch.replay, *it.span)
 		}
 	}
-	return spanItems, spanEntries, replayEntries, errors.Join(errs...)
+	return scratch.items, scratch.index, scratch.replay, errors.Join(errs...)
 }
 
 func (b *Batcher) writeLogBatch(logItems []storage.BatchItem, logEntries []*model.LogEntry, replayEntries []model.LogEntry) error {
