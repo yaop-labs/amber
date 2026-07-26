@@ -31,6 +31,11 @@ Think "SQLite for observability".
 - **Embedded mode** — use as a Go library without HTTP server
 - **amberctl** — command-line client and interactive terminal UI (logs, traces, span waterfall, live tail)
 
+Cross-system and long-running benchmark campaigns live in
+[yaop-labs/amber-benchmarks](https://github.com/yaop-labs/amber-benchmarks).
+Implementation-level Go microbenchmarks remain in this repository next to the
+code they exercise.
+
 ## Quick Start
 
 ### Binary
