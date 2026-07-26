@@ -673,11 +673,6 @@ func (b *Batcher) Close(ctx context.Context) error {
 	}
 }
 
-func (b *Batcher) processLogBatch(ctx context.Context, batch []logQueueItem) error {
-	var scratch logBatchScratch
-	return b.processLogBatchWithScratch(ctx, batch, &scratch)
-}
-
 func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []logQueueItem, scratch *logBatchScratch) error {
 	if len(batch) == 0 {
 		return nil
@@ -688,11 +683,6 @@ func (b *Batcher) processLogBatchWithScratch(_ context.Context, batch []logQueue
 		return err
 	}
 	return errors.Join(err, b.writeLogBatch(logItems, logEntries, replayLogs))
-}
-
-func (b *Batcher) processSpanBatch(ctx context.Context, batch []spanQueueItem) error {
-	var scratch spanBatchScratch
-	return b.processSpanBatchWithScratch(ctx, batch, &scratch)
 }
 
 func (b *Batcher) processSpanBatchWithScratch(_ context.Context, batch []spanQueueItem, scratch *spanBatchScratch) error {
