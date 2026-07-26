@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"reflect"
 	"testing"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -56,5 +57,53 @@ func TestOTLPLogToEntryUsesSeverityNumberForCustomText(t *testing.T) {
 	}
 	if entry.Level != model.LevelWarn {
 		t.Fatalf("level = %v, want WARN", entry.Level)
+	}
+}
+
+func TestOTLPSpanToEntryPreservesNonNilAttrs(t *testing.T) {
+	span := &tracepb.Span{
+		TraceId: make([]byte, 16),
+		SpanId:  make([]byte, 8),
+		Attributes: []*commonpb.KeyValue{
+			{Key: "env", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "prod"}}},
+			nil,
+			{Key: "attempt", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 3}}},
+		},
+	}
+
+	entry, err := OTLPSpanToEntry(span, "svc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []model.Attr{{Key: "env", Value: "prod"}, {Key: "attempt", Value: "3"}}
+	if !reflect.DeepEqual(entry.Attrs, want) {
+		t.Fatalf("attrs = %#v, want %#v", entry.Attrs, want)
+	}
+}
+
+var benchmarkOTLPSpanEntry model.SpanEntry
+
+func BenchmarkOTLPSpanToEntry(b *testing.B) {
+	span := &tracepb.Span{
+		TraceId:           make([]byte, 16),
+		SpanId:            make([]byte, 8),
+		ParentSpanId:      make([]byte, 8),
+		Name:              "GET /api/v1/users",
+		StartTimeUnixNano: 1,
+		EndTimeUnixNano:   2,
+		Attributes: []*commonpb.KeyValue{
+			{Key: "env", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "prod"}}},
+			{Key: "region", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "us-east-1"}}},
+			{Key: "version", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "v1.42.0"}}},
+		},
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		entry, err := OTLPSpanToEntry(span, "api-gateway")
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchmarkOTLPSpanEntry = entry
 	}
 }
