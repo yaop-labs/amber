@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
-
 	"github.com/yaop-labs/amber/internal/selfobs"
 )
 
@@ -1213,7 +1211,7 @@ func appendSegmentWriter(path string, seedMinTS, seedMaxTS int64) (*SegmentWrite
 		return nil, 0, fmt.Errorf("append segment: open %s: %w", path, err)
 	}
 
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	enc, err := newSegmentEncoder()
 	if err != nil {
 		_ = f.Close()
 		return nil, 0, fmt.Errorf("append segment: zstd encoder: %w", err)
