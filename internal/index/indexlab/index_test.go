@@ -14,7 +14,6 @@ func TestIndexesMatchLinearOracle(t *testing.T) {
 	t.Parallel()
 
 	for _, dataset := range DatasetNames {
-		dataset := dataset
 		t.Run(dataset, func(t *testing.T) {
 			t.Parallel()
 
