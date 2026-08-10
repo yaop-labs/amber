@@ -91,6 +91,7 @@ func TestRandomIntervalsMatchLinearOracle(t *testing.T) {
 	t.Parallel()
 
 	for seed := range uint64(32) {
+		// #nosec G404
 		rng := rand.New(rand.NewPCG(seed, seed^0xa0761d6478bd642f))
 		ranges := make([]index.SegmentTimeRange, 500)
 		for i := range ranges {
