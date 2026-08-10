@@ -35,6 +35,7 @@ func GenerateDataset(name string, count int, seed uint64) ([]index.SegmentTimeRa
 	if count < 0 {
 		return nil, fmt.Errorf("indexlab: negative segment count %d", count)
 	}
+	// #nosec G404
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 	ranges := make([]index.SegmentTimeRange, count)
 
