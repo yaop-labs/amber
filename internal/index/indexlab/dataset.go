@@ -125,6 +125,7 @@ func GenerateQueries(ranges []index.SegmentTimeRange, count int, seed uint64) []
 	}
 	sorted := append([]index.SegmentTimeRange(nil), ranges...)
 	sortRanges(sorted)
+	// #nosec G404
 	rng := rand.New(rand.NewPCG(seed, seed^0xd1b54a32d192ed03))
 	queries := make([]Query, count)
 
