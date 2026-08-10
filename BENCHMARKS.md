@@ -20,9 +20,6 @@ and any regression budget. Full mixed-signal/RSS campaigns remain environment-
 dependent and should run on the release host or CI benchmark runner.
 The black-box system harness and cross-product campaigns live in
 [yaop-labs/amber-benchmarks](https://github.com/yaop-labs/amber-benchmarks).
-Implementation-level experiments that need access to Amber internals remain in
-this repository. The sparse time-index experiment and its current results are
-documented in [SPARSE_INDEX_EXPERIMENT.md](https://dmedovich.com/posts/learning-index-still-cooking.html).
 
 ## v0.4.0 release verification — 2026-07-25
 
