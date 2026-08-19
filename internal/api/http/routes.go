@@ -21,6 +21,12 @@ type RoutesDeps struct {
 	Executor   *query.Executor
 	LogManager *storage.SegmentManager
 	LogSparse  *index.SparseIndex
+	// SpanManager/SpanSparse mirror LogManager/LogSparse for the trace
+	// stream. Both are optional (nil is fine): the admin stats handler
+	// omits the "spans_segments" section rather than reporting a zeroed
+	// manager as if it were real state.
+	SpanManager *storage.SegmentManager
+	SpanSparse  *index.SparseIndex
 	// MetricStore is the embedded metricsengine store for all metric shapes
 	// (counters, gauges, histograms). nil disables /v1/metrics ingest and the
 	// metric query endpoints.
@@ -107,7 +113,7 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 	mux.Handle("GET /api/v1/metrics/stats", auth(NewMetricsStatsHandler(deps.MetricStore, deps.Logger)))
 	mux.Handle("GET /api/v1/metrics/quantile", auth(NewMetricsQuantileHandler(deps.MetricStore, deps.Logger)))
 
-	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.Batcher, deps.Logger)
+	adminH := NewAdminHandler(deps.LogManager, deps.LogSparse, deps.SpanManager, deps.SpanSparse, deps.Batcher, deps.Logger)
 	if deps.Status != nil {
 		mux.Handle("GET /api/v1/admin/status", auth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(w, http.StatusOK, deps.Status())

@@ -1,0 +1,25 @@
+{
+  "next_segment_id": 3,
+  "segments": [
+    {
+      "id": 1,
+      "file_name": "seg_00000001.alog",
+      "min_ts": 0,
+      "max_ts": 0,
+      "record_count": 0,
+      "size_bytes": 52,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 2,
+      "file_name": "seg_00000002.alog",
+      "min_ts": 0,
+      "max_ts": 0,
+      "record_count": 0,
+      "size_bytes": 52,
+      "sealed": true,
+      "local_present": true
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "next_segment_id": 7,
+  "segments": [
+    {
+      "id": 1,
+      "file_name": "seg_00000001.alog",
+      "min_ts": 1786898706220812771,
+      "max_ts": 1786898726122077663,
+      "record_count": 100000,
+      "size_bytes": 9467555,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 2,
+      "file_name": "seg_00000002.alog",
+      "min_ts": 1786898726215201137,
+      "max_ts": 1786898746120391073,
+      "record_count": 100000,
+      "size_bytes": 9475467,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 3,
+      "file_name": "seg_00000003.alog",
+      "min_ts": 0,
+      "max_ts": 0,
+      "record_count": 0,
+      "size_bytes": 52,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 4,
+      "file_name": "seg_00000004.alog",
+      "min_ts": 1786899774328531546,
+      "max_ts": 1786899824227868126,
+      "record_count": 100000,
+      "size_bytes": 9583202,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 5,
+      "file_name": "seg_00000005.alog",
+      "min_ts": 1786899824325374544,
+      "max_ts": 1786899874227086473,
+      "record_count": 100000,
+      "size_bytes": 9589167,
+      "sealed": true,
+      "local_present": true
+    },
+    {
+      "id": 6,
+      "file_name": "seg_00000006.alog",
+      "min_ts": 0,
+      "max_ts": 0,
+      "record_count": 0,
+      "size_bytes": 52,
+      "sealed": true,
+      "local_present": true
+    }
+  ]
+}

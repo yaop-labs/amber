@@ -306,6 +306,8 @@ func run() error {
 		Executor:    stack.Executor,
 		LogManager:  stack.LogManager,
 		LogSparse:   stack.LogSparse,
+		SpanManager: stack.SpanManager,
+		SpanSparse:  stack.SpanSparse,
 		MetricStore: stack.MetricStore,
 		OTLPJournal: stack.OTLPJournal,
 		AdmitIngest: stack.AdmitIngest,
