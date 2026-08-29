@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
+	"time"
+)
 
 // Options configures a Store: flush and compaction triggers, cardinality and
 // label limits, retention, and an injectable clock. The zero value disables the
@@ -22,6 +25,8 @@ type Options struct {
 	// (320 MiB + 384 MiB). Deriving the value from a process memory limit
 	// is the caller's job; the store only honors the number.
 	CacheBudget int64
+	// SharedWAL uses amber's process-wide WAL. Nil keeps the legacy private WAL.
+	SharedWAL *sharedwal.WAL
 }
 
 // Config is a Store directory paired with its Options, for OpenConfigured.

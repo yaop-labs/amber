@@ -1,6 +1,6 @@
 // Package engine ties the metrics WAL, the in-memory head, and the flush
 // protocol together. Appends are durable on return (WAL fsync precedes the head
-// update); a flush snapshots the head into a block and truncates the WAL under
+// update); a flush snapshots the head into a block and checkpoints the WAL under
 // a gate that excludes concurrent appends so no acknowledged sample is lost.
 package engine
 
@@ -16,13 +16,16 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/wal"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 // Options configures a metrics engine. A zero WALPath runs the engine purely
 // in memory with no durability.
 type Options struct {
 	WALPath string
-	// WALFlushInterval bounds how long AppendBatch waits for a batched fsync.
+	// SharedWAL uses amber's process-wide segmented WAL instead of a private
+	// metrics WAL file. It is mutually exclusive with WALPath.
+	SharedWAL        *sharedwal.WAL
 	WALFlushInterval time.Duration
 }
 
@@ -96,11 +99,22 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 		declared:   make(map[index.SeriesID]struct{}),
 		sketchHead: make(map[index.SeriesID]*sketchBuf),
 	}
-	if opts.WALPath != "" {
-		// RecoverReplay tolerates a corrupt or torn tail (crash mid-write):
-		// it replays the valid prefix and truncates the garbage in place so
-		// the WAL stays appendable and replayable. A hard error here would
-		// make the store unopenable after any torn write.
+	if opts.SharedWAL != nil && opts.WALPath != "" {
+		return nil, errors.New("engine: SharedWAL and WALPath are mutually exclusive")
+	}
+	if opts.SharedWAL != nil {
+		stats, err := wal.RecoverReplayShared(opts.SharedWAL, e.replayRecord)
+		if err != nil {
+			return nil, err
+		}
+		e.walRecovery = stats
+		w, err := wal.NewShared(opts.SharedWAL)
+		if err != nil {
+			return nil, err
+		}
+		e.wal = w
+		e.committer = newCommitter(w, opts.WALFlushInterval)
+	} else if opts.WALPath != "" {
 		stats, err := wal.RecoverReplay(opts.WALPath, e.replayRecord)
 		if err != nil {
 			return nil, err
@@ -272,7 +286,7 @@ func (e *Engine) PrepareFlushBlock(path string) error {
 	return nil
 }
 
-// CommitFlush resets the head and truncates the WAL, then releases the gate
+// CommitFlush resets the head and checkpoints the WAL, then releases the gate
 // taken by PrepareFlushBlock.
 func (e *Engine) CommitFlush() error {
 	defer e.releaseGate()
@@ -318,10 +332,29 @@ func (e *Engine) commitFlushLocked() error {
 	e.walMu.Lock()
 	e.declared = make(map[index.SeriesID]struct{})
 	e.walMu.Unlock()
-	if e.wal != nil {
+	if e.wal != nil && e.wal.Shared() == nil {
 		return e.wal.Truncate()
 	}
 	return nil
+}
+
+// LastWALSeq returns the highest sequence written by this metrics stream.
+// For the shared WAL this is used to advance the metrics checkpoint only
+// after the corresponding block and manifest have been made durable.
+func (e *Engine) LastWALSeq() uint64 {
+	if e.wal == nil {
+		return 0
+	}
+	return e.wal.LastWrittenSeq()
+}
+
+// CheckpointWAL advances the shared metrics WAL checkpoint. Legacy WALs are
+// already truncated by CommitFlush and need no second checkpoint operation.
+func (e *Engine) CheckpointWAL() error {
+	if e.wal == nil || e.wal.Shared() == nil {
+		return nil
+	}
+	return e.wal.Truncate()
 }
 
 func (e *Engine) BufferedSeries() int {
@@ -360,6 +393,17 @@ func (e *Engine) WALRecoveryStats() wal.RecoverStats {
 // UnknownWALSeries counts replayed samples skipped because their series ID
 // could not be resolved to labels (WAL series record and catalog both
 // missing). Zero in normal operation.
+// HasWALRecords reports whether the engine's WAL stream currently contains records.
+func (e *Engine) HasWALRecords() (bool, error) {
+	if e.wal == nil {
+		return false, nil
+	}
+	if e.wal.Shared() != nil {
+		return wal.HasRecordsShared(e.wal.Shared())
+	}
+	return wal.HasRecords(e.wal.Path())
+}
+
 func (e *Engine) UnknownWALSeries() int {
 	return e.walUnknownSeries
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/selfobs"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 // RotationPolicy decides when the active segment is sealed and a new one
@@ -35,7 +36,7 @@ var SegmentSidecarExts = []string{"", ".bidx", ".fidx", ".filt", ".fts.filt", ".
 // SegmentManager owns the active segment and WAL and drives the durability
 // protocol: it appends to the WAL, writes to the active segment, rotates and
 // seals full segments (building their index sidecars on one background worker),
-// and checkpoints/truncates the WAL. It is safe for concurrent use.
+// and checkpoints/reclaims its WAL stream. It is safe for concurrent use.
 type SegmentManager struct {
 	mu             sync.RWMutex
 	dir            string
@@ -136,13 +137,34 @@ func (sm *SegmentManager) SetOnSeal(fn func(meta SegmentMeta)) {
 // the active segment by truncating it to the last fsynced size and replaying
 // the WAL tail, and starts the seal worker.
 func OpenSegmentManager(dir string, policy RotationPolicy) (*SegmentManager, error) {
+	return openSegmentManager(dir, policy, nil, 0)
+}
+
+// OpenSegmentManagerWithSharedWAL opens a log/span segment manager using the
+// shared amber WAL. The shared WAL remains owned by the caller (runtime).
+func OpenSegmentManagerWithSharedWAL(dir string, policy RotationPolicy, shared *sharedwal.WAL, stream sharedwal.Stream) (*SegmentManager, error) {
+	if shared == nil {
+		return nil, errors.New("segmgr: shared WAL is nil")
+	}
+	facade, err := NewSharedWAL(shared, stream)
+	if err != nil {
+		return nil, err
+	}
+	return openSegmentManager(dir, policy, facade, stream)
+}
+
+func openSegmentManager(dir string, policy RotationPolicy, supplied *WAL, _ sharedwal.Stream) (*SegmentManager, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("segmgr: mkdir %s: %w", dir, err)
 	}
 
-	wal, err := OpenWAL(dir)
-	if err != nil {
-		return nil, fmt.Errorf("segmgr: open wal: %w", err)
+	wal := supplied
+	var err error
+	if wal == nil {
+		wal, err = OpenWAL(dir)
+		if err != nil {
+			return nil, fmt.Errorf("segmgr: open wal: %w", err)
+		}
 	}
 
 	meta, err := loadMeta(dir)

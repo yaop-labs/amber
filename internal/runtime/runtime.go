@@ -28,6 +28,7 @@ import (
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/retention"
 	"github.com/yaop-labs/amber/internal/storage"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 	"github.com/yaop-labs/amber/metricsengine"
 )
 
@@ -294,6 +295,7 @@ type Stack struct {
 	Batcher     *ingest.Batcher
 	OTLPJournal *otlpv4.Journal
 	DiskGuard   *diskguard.Guard
+	sharedWAL   *sharedwal.WAL
 
 	// MetricStore is nil when metrics are disabled.
 	MetricStore *metricsengine.Store
@@ -477,14 +479,43 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		MaxBytes:   cfg.Storage.SegmentMaxBytes,
 	}
 
-	logManager, err := storage.OpenSegmentManager(logDir, policy)
+	sharedActive, err := sharedWALState(cfg.DataDir)
 	if err != nil {
+		return nil, fmt.Errorf("runtime: inspect shared WAL: %w", err)
+	}
+	legacyPresent := legacyWALPresent(logDir, spanDir, cfg.Metrics.Dir, cfg.DataDir)
+	if sharedActive && legacyPresent {
+		return nil, errors.New("runtime: both shared WAL and legacy WAL data are present; refusing ambiguous mixed-durability startup")
+	}
+	if !sharedActive && legacyPresent {
+		if err := migrateLegacyWALs(logDir, spanDir, cfg.Metrics.Dir, cfg.DataDir, policy); err != nil {
+			return nil, fmt.Errorf("runtime: migrate legacy WALs: %w", err)
+		}
+	}
+
+	var shared *sharedwal.WAL
+	shared, err = sharedwal.Open(filepath.Join(cfg.DataDir, "wal"), sharedwal.Options{})
+	if err == nil {
+		sharedActive = true
+	}
+	if err != nil {
+		return nil, fmt.Errorf("runtime: open shared wal: %w", err)
+	}
+
+	logManager, err := storage.OpenSegmentManagerWithSharedWAL(logDir, policy, shared, sharedwal.StreamLog)
+	if err != nil {
+		if shared != nil {
+			_ = shared.Close()
+		}
 		return nil, fmt.Errorf("runtime: open log segment manager: %w", err)
 	}
 
-	spanManager, err := storage.OpenSegmentManager(spanDir, policy)
+	spanManager, err := storage.OpenSegmentManagerWithSharedWAL(spanDir, policy, shared, sharedwal.StreamSpan)
 	if err != nil {
 		_ = logManager.Close()
+		if shared != nil {
+			_ = shared.Close()
+		}
 		return nil, fmt.Errorf("runtime: open span segment manager: %w", err)
 	}
 
@@ -571,12 +602,13 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		ready:       ready, closeDone: make(chan struct{}), bootstrapDone: make(chan struct{}),
 		degradedReasons: make(map[string]uint64),
 		DiskGuard:       diskAdmission,
+		sharedWAL:       shared,
 	}
 	if backupStateErr != nil {
 		s.markDegraded("backup_state_corrupt")
 		cfg.Logger.Warn("backup operational state is invalid", "err", backupStateErr)
 	}
-	s.walRepairEvents = logManager.WALCorruptRecords() + spanManager.WALCorruptRecords()
+	s.walRepairEvents = shared.CorruptRecords()
 	if s.walRepairEvents > 0 {
 		s.markDegradedN("wal_tail_repaired", s.walRepairEvents)
 	}
@@ -643,7 +675,7 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 				cacheBudget = effectiveLimit / 2
 			}
 		}
-		ms, err := metricsengine.OpenStoreWithOptions(metricsDir, metricsengine.StoreOptions{
+		metricOpts := metricsengine.StoreOptions{
 			FlushInterval:       cfg.Metrics.FlushInterval,
 			MaxBufferedSamples:  cfg.Metrics.MaxBufferedSamples,
 			MaxActiveSeries:     cfg.Metrics.MaxActiveSeries,
@@ -651,7 +683,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			Retention:           cfg.Metrics.Retention,
 			CompactionMinBlocks: cfg.Metrics.CompactionMinBlocks,
 			CacheBudget:         cacheBudget,
-		})
+		}
+		metricOpts.SharedWAL = shared
+		ms, err := metricsengine.OpenStoreWithOptions(metricsDir, metricOpts)
 		if err != nil {
 			if logUp != nil {
 				logUp.Stop()
@@ -661,6 +695,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 			}
 			_ = logManager.Close()
 			_ = spanManager.Close()
+			if shared != nil {
+				_ = shared.Close()
+			}
 			return nil, fmt.Errorf("runtime: open metric store: %w", err)
 		}
 		if ms.WALRecoveryStats().TruncatedBytes > 0 {
@@ -685,6 +722,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		_ = logManager.Close()
 		_ = spanManager.Close()
+		if shared != nil {
+			_ = shared.Close()
+		}
 		return nil, fmt.Errorf("runtime: open OTLP v4 journal: %w", err)
 	}
 	if stats, statsErr := otlpJournal.Stats(); statsErr != nil {
@@ -700,6 +740,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		_ = logManager.Close()
 		_ = spanManager.Close()
+		if shared != nil {
+			_ = shared.Close()
+		}
 		return nil, fmt.Errorf("runtime: read OTLP v4 journal stats: %w", statsErr)
 	} else if stats.WALCorruptRecords > 0 {
 		s.walRepairEvents += stats.WALCorruptRecords
@@ -718,6 +761,9 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		}
 		_ = logManager.Close()
 		_ = spanManager.Close()
+		if shared != nil {
+			_ = shared.Close()
+		}
 		return nil, fmt.Errorf("runtime: initial OTLP v4 journal retention: %w", pruneErr)
 	}
 	batcher.SetReplaySink(otlpJournal)
@@ -921,12 +967,97 @@ func (s *Stack) close() error {
 	if err := s.SpanManager.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("runtime: close span manager: %w", err))
 	}
+	if s.sharedWAL != nil {
+		if err := s.sharedWAL.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("runtime: close shared WAL: %w", err))
+		}
+	}
 	// All workers and file owners have terminated at this point, so releasing
 	// the lock is safe even when one component reported a terminal error.
 	if err := s.lock.Release(); err != nil {
 		errs = append(errs, fmt.Errorf("runtime: release dir lock: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+func migrateLegacyWALs(logDir, spanDir, metricDir, dataRoot string, policy storage.RotationPolicy) error {
+	// Legacy storage WALs are migrated by first asking their existing
+	// SegmentManagers to make all acknowledged/replayed data durable in sealed
+	// segments. Close is deliberately used rather than copying WAL bytes: on a
+	// crash halfway through this routine, the remaining legacy WALs are still
+	// authoritative and the migration simply resumes on the next start. The
+	// shared WAL is created only after all legacy streams have reached a durable
+	// store state, so there is no mixed-format window to reconcile.
+	for _, item := range []struct{ dir, label string }{{logDir, "logs"}, {spanDir, "spans"}} {
+		path := filepath.Join(item.dir, "amber.wal")
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) || (err == nil && info.Size() == 0) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %s WAL: %w", item.label, err)
+		}
+		sm, err := storage.OpenSegmentManager(item.dir, policy)
+		if err != nil {
+			return fmt.Errorf("open legacy %s store: %w", item.label, err)
+		}
+		if err := sm.Close(); err != nil {
+			return fmt.Errorf("close legacy %s store: %w", item.label, err)
+		}
+	}
+	if metricDir == "" {
+		metricDir = filepath.Join(dataRoot, "metrics")
+	}
+	metricWAL := filepath.Join(metricDir, "head.wal")
+	info, err := os.Stat(metricWAL)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && info.Size() == 0) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect metrics WAL: %w", err)
+	}
+	ms, err := metricsengine.OpenStore(metricDir)
+	if err != nil {
+		return fmt.Errorf("open legacy metrics store: %w", err)
+	}
+	if err := ms.Close(); err != nil {
+		return fmt.Errorf("close legacy metrics store: %w", err)
+	}
+	return nil
+}
+
+func legacyWALPresent(logDir, spanDir, metricDir, dataRoot string) bool {
+	paths := []string{
+		filepath.Join(logDir, "amber.wal"),
+		filepath.Join(spanDir, "amber.wal"),
+	}
+	if metricDir == "" {
+		metricDir = filepath.Join(dataRoot, "metrics")
+	}
+	paths = append(paths, filepath.Join(metricDir, "head.wal"))
+	for _, p := range paths {
+		if info, err := os.Stat(p); err == nil && info.Size() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func sharedWALState(dataRoot string) (bool, error) {
+	dir := filepath.Join(dataRoot, "wal")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".awl" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func validateOTLPV4Root(root string) error {
