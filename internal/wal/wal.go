@@ -90,6 +90,7 @@ func (c Checkpoints) Get(s Stream) uint64 {
 		return 0
 	}
 }
+
 func (c *Checkpoints) Set(s Stream, seq uint64) {
 	switch s {
 	case StreamLog:
@@ -131,7 +132,7 @@ func Open(dir string, opts Options) (*WAL, error) {
 	if opts.SegmentBytes <= 0 {
 		opts.SegmentBytes = defaultSegmentBytes
 	}
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, err
 	}
 	w := &WAL{dir: dir, segmentBytes: opts.SegmentBytes, nextSeq: 1}
@@ -242,12 +243,15 @@ func (w *WAL) Bytes() (int64, error) {
 func (w *WAL) Append(stream Stream, payload []byte) (uint64, error) {
 	return w.AppendBatch(stream, [][]byte{payload})
 }
+
 func (w *WAL) AppendBatch(stream Stream, payloads [][]byte) (uint64, error) {
 	return w.appendBatch(stream, payloads, true)
 }
+
 func (w *WAL) AppendBatchUnsynced(stream Stream, payloads [][]byte) (uint64, error) {
 	return w.appendBatch(stream, payloads, false)
 }
+
 func (w *WAL) appendBatch(stream Stream, payloads [][]byte, syncNow bool) (uint64, error) {
 	if !validStream(stream) {
 		return 0, fmt.Errorf("wal: invalid stream %d", stream)
@@ -324,6 +328,7 @@ func (w *WAL) syncLocked() error {
 	}
 	return nil
 }
+
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -349,7 +354,7 @@ func (w *WAL) Replay(stream Stream, fn func(seq uint64, payload []byte) error) (
 	}
 	var maxSeq uint64
 	for _, path := range files {
-		f, err := os.OpenFile(path, os.O_RDWR, 0600)
+		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 		if err != nil {
 			return stats, err
 		}
@@ -590,6 +595,7 @@ func (w *WAL) Rotate() error {
 	}
 	return w.rotateLocked()
 }
+
 func (w *WAL) rotateLocked() error {
 	if err := w.syncLocked(); err != nil {
 		return err
@@ -599,7 +605,7 @@ func (w *WAL) rotateLocked() error {
 	}
 	w.segmentID++
 	path := filepath.Join(w.dir, segmentFileName(w.segmentID))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -728,7 +734,7 @@ func (w *WAL) recoverSegments() error {
 
 func scanSegment(path string, isLast bool, prevSeq uint64) (int64, [streamCount + 1]uint64, uint64, error) {
 	var out [streamCount + 1]uint64
-	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return 0, out, 0, err
 	}
@@ -806,7 +812,7 @@ func scanSegment(path string, isLast bool, prevSeq uint64) (int64, [streamCount 
 
 func (w *WAL) openAppend() error {
 	path := filepath.Join(w.dir, segmentFileName(w.segmentID))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -866,6 +872,7 @@ func (w *WAL) loadCheckpoints() error {
 	w.checkpoints.Metrics = binary.LittleEndian.Uint64(data[22:30])
 	return nil
 }
+
 func (w *WAL) persistCheckpointsLocked() error {
 	var data [30]byte
 	binary.LittleEndian.PutUint32(data[0:4], checkpointMagic)
@@ -874,10 +881,10 @@ func (w *WAL) persistCheckpointsLocked() error {
 	binary.LittleEndian.PutUint64(data[14:22], w.checkpoints.Span)
 	binary.LittleEndian.PutUint64(data[22:30], w.checkpoints.Metrics)
 	tmp := checkpointPath(w.dir) + ".tmp"
-	if err := os.WriteFile(tmp, data[:], 0600); err != nil {
+	if err := os.WriteFile(tmp, data[:], 0o600); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(tmp, os.O_RDWR, 0600)
+	f, err := os.OpenFile(tmp, os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}

@@ -119,9 +119,7 @@ func (w *WAL) Append(record Record) error {
 // the WAL.
 func (w *WAL) AppendBatch(records []Record) error {
 	if w.shared != nil {
-		seqs, err := w.appendShared(records, true)
-		_ = seqs
-		return err
+		return w.appendShared(records, true)
 	}
 	if len(records) == 0 {
 		return nil
@@ -153,8 +151,7 @@ func (w *WAL) AppendBatch(records []Record) error {
 // The caller must call Sync before treating the records as durable.
 func (w *WAL) AppendBatchUnsynced(records []Record) error {
 	if w.shared != nil {
-		_, err := w.appendShared(records, false)
-		return err
+		return w.appendShared(records, false)
 	}
 	if len(records) == 0 {
 		return nil
@@ -181,15 +178,15 @@ func (w *WAL) AppendBatchUnsynced(records []Record) error {
 
 // Sync flushes any pending writes to disk. Paired with AppendBatchUnsynced
 // for group commit: many unsynced writes followed by one Sync.
-func (w *WAL) appendShared(records []Record, syncNow bool) (uint64, error) {
+func (w *WAL) appendShared(records []Record, syncNow bool) error {
 	if len(records) == 0 {
-		return 0, nil
+		return nil
 	}
 	payloads := make([][]byte, len(records))
 	for i, record := range records {
 		encoded, err := encodeRecord(record)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		payloads[i] = encoded
 	}
@@ -200,10 +197,11 @@ func (w *WAL) appendShared(records []Record, syncNow bool) (uint64, error) {
 	} else {
 		seq, err = w.shared.AppendBatchUnsynced(w.stream, payloads)
 	}
-	if err == nil {
-		w.sharedLastWritten.Store(seq + uint64(len(payloads)) - 1)
+	if err != nil {
+		return err
 	}
-	return seq, err
+	w.sharedLastWritten.Store(seq + uint64(len(payloads)) - 1)
+	return nil
 }
 
 func (w *WAL) Sync() error {

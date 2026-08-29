@@ -1,8 +1,9 @@
 package store
 
 import (
-	sharedwal "github.com/yaop-labs/amber/internal/wal"
 	"time"
+
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 // Options configures a Store: flush and compaction triggers, cardinality and

@@ -495,9 +495,6 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	var shared *sharedwal.WAL
 	shared, err = sharedwal.Open(filepath.Join(cfg.DataDir, "wal"), sharedwal.Options{})
-	if err == nil {
-		sharedActive = true
-	}
 	if err != nil {
 		return nil, fmt.Errorf("runtime: open shared wal: %w", err)
 	}
@@ -1027,10 +1024,11 @@ func migrateLegacyWALs(logDir, spanDir, metricDir, dataRoot string, policy stora
 }
 
 func legacyWALPresent(logDir, spanDir, metricDir, dataRoot string) bool {
-	paths := []string{
+	paths := make([]string, 0, 3)
+	paths = append(paths,
 		filepath.Join(logDir, "amber.wal"),
 		filepath.Join(spanDir, "amber.wal"),
-	}
+	)
 	if metricDir == "" {
 		metricDir = filepath.Join(dataRoot, "metrics")
 	}
