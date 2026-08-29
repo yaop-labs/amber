@@ -129,6 +129,7 @@ func OpenWAL(dir string) (*WAL, error) {
 
 // SetNextSeq seeds the seq counter; should be called once at startup before
 // any Write, after the manager has consulted durable meta and replayed.
+
 // NewSharedWAL wraps the shared segmented WAL for one storage stream.
 // The returned facade does not own the shared WAL and therefore does not close it.
 func NewSharedWAL(shared *sharedwal.WAL, stream sharedwal.Stream) (*WAL, error) {

@@ -447,6 +447,7 @@ func (e *Engine) WALRecoveryStats() wal.RecoverStats {
 // UnknownWALSeries counts replayed samples skipped because their series ID
 // could not be resolved to labels (WAL series record and catalog both
 // missing). Zero in normal operation.
+
 // HasWALRecords reports whether the engine's WAL stream currently contains records.
 func (e *Engine) HasWALRecords() (bool, error) {
 	if e.sharedWAL != nil {
