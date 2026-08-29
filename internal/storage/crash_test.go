@@ -77,7 +77,7 @@ func writeMarker(dir string, count int) {
 	final := filepath.Join(dir, markerFile)
 
 	data, _ := json.Marshal(count)
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
 	// Rename is atomic on Linux: marker is always a valid count.
@@ -123,7 +123,22 @@ func TestSegmentManager_CrashDurability(t *testing.T) {
 	}
 
 	// Give it time to write a meaningful number of records.
-	time.Sleep(300 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := os.Stat(filepath.Join(dir, markerFile))
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("stat durable marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("crash writer did not produce durable marker within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	// SIGKILL - no cleanup, no deferred Close.
 	if err := cmd.Process.Kill(); err != nil {
