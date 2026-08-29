@@ -85,7 +85,7 @@ func BenchmarkStoreSelectHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.LabelEqual("job", "target"))
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		series, err := st.Select(selector, query.Options{})
 		if err != nil {
@@ -102,7 +102,7 @@ func BenchmarkStoreSumByLabelHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.MetricName("bench_gauge"))
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		sum, err := st.SumByLabel(selector, query.Options{}, "job")
 		if err != nil {
@@ -119,7 +119,7 @@ func BenchmarkStoreRateByLabelHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.MetricName("bench_gauge"))
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		rates, err := st.RateByLabel(selector, query.Options{}, "job")
 		if err != nil {
@@ -139,7 +139,7 @@ func BenchmarkStoreRateByLabelRangeStepsHighCardinality(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -159,7 +159,7 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality(b *testing.B) 
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -247,7 +247,7 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockMaxGapHighCardinality(b *testi
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -267,7 +267,7 @@ func BenchmarkStoreAggregateByLabelRangeStepsHighCardinality(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -287,7 +287,7 @@ func BenchmarkStoreAggregateByLabelRangeStepsMultiBlockHighCardinality(b *testin
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -307,7 +307,7 @@ func BenchmarkStoreAggregateByLabelRangeStepsSequentialBlocksHighCardinality(b *
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
@@ -327,7 +327,7 @@ func BenchmarkStoreAggregateByLabelRangeStepsBucketBlocks(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	
+
 	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 63_000, 127_000, 64*time.Second, "job")
 		if err != nil {
