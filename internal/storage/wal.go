@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 const (
@@ -70,6 +72,10 @@ type WAL struct {
 	// records appended past it would be silently lost. Either way the durable
 	// state is unknowable; no further append may be acknowledged. Guarded by mu.
 	failed error
+
+	shared            *sharedwal.WAL
+	stream            sharedwal.Stream
+	sharedLastWritten atomic.Uint64
 }
 
 // failStop records a fatal writer error; every subsequent write returns it.
@@ -91,6 +97,9 @@ func (w *WAL) SetLogger(log *slog.Logger) {
 // CorruptRecords returns the number of malformed records observed during the
 // most recent (or any prior) Replay. Useful for surfacing as a metric.
 func (w *WAL) CorruptRecords() uint64 {
+	if w.shared != nil {
+		return w.shared.CorruptRecords()
+	}
 	return w.corruptCount.Load()
 }
 
@@ -120,7 +129,22 @@ func OpenWAL(dir string) (*WAL, error) {
 
 // SetNextSeq seeds the seq counter; should be called once at startup before
 // any Write, after the manager has consulted durable meta and replayed.
+
+// NewSharedWAL wraps the shared segmented WAL for one storage stream.
+// The returned facade does not own the shared WAL and therefore does not close it.
+func NewSharedWAL(shared *sharedwal.WAL, stream sharedwal.Stream) (*WAL, error) {
+	if shared == nil {
+		return nil, errors.New("wal: shared WAL is nil")
+	}
+	w := &WAL{shared: shared, stream: stream, log: slog.Default()}
+	w.sharedLastWritten.Store(shared.LastStreamSeq(stream))
+	return w, nil
+}
+
 func (w *WAL) SetNextSeq(seq uint64) {
+	if w.shared != nil {
+		return
+	}
 	if seq < 1 {
 		seq = 1
 	}
@@ -129,11 +153,21 @@ func (w *WAL) SetNextSeq(seq uint64) {
 
 // NextSeq returns the seq the next write will receive.
 func (w *WAL) NextSeq() uint64 {
+	if w.shared != nil {
+		return w.shared.LastStreamSeq(w.stream) + 1
+	}
 	return w.nextSeq.Load()
 }
 
 // Write appends a single record and returns its assigned seq.
 func (w *WAL) Write(payload []byte) (uint64, error) {
+	if w.shared != nil {
+		seq, err := w.shared.Append(w.stream, payload)
+		if err == nil {
+			w.sharedLastWritten.Store(seq)
+		}
+		return seq, err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -164,6 +198,16 @@ func (w *WAL) Write(payload []byte) (uint64, error) {
 // (8-byte LE ts || data) payload. Its on-disk representation is identical to
 // Write called with that concatenated payload.
 func (w *WAL) WriteTS(ts int64, data []byte) (uint64, error) {
+	if w.shared != nil {
+		p := make([]byte, 8+len(data))
+		binary.LittleEndian.PutUint64(p[:8], uint64(ts))
+		copy(p[8:], data)
+		seq, err := w.shared.Append(w.stream, p)
+		if err == nil {
+			w.sharedLastWritten.Store(seq)
+		}
+		return seq, err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -217,6 +261,26 @@ func (w *WAL) WriteTS(ts int64, data []byte) (uint64, error) {
 // []byte{8+len(data)} per record via makeWALPayload (~8% of processBatch
 // allocs at batch=256).
 func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
+	if w.shared != nil {
+		if len(items) == 0 {
+			return 0, nil
+		}
+		payloads := make([][]byte, len(items))
+		for i, item := range items {
+			if err := validateWALPayloadSize(8 + len(item.Data)); err != nil {
+				return 0, fmt.Errorf("wal: batch item %d: %w", i, err)
+			}
+			p := make([]byte, 8+len(item.Data))
+			binary.LittleEndian.PutUint64(p[:8], uint64(item.TS))
+			copy(p[8:], item.Data)
+			payloads[i] = p
+		}
+		seq, err := w.shared.AppendBatch(w.stream, payloads)
+		if err == nil {
+			w.sharedLastWritten.Store(seq + uint64(len(items)) - 1)
+		}
+		return seq, err
+	}
 	if len(items) == 0 {
 		return 0, nil
 	}
@@ -284,6 +348,16 @@ func (w *WAL) WriteBatchTS(items []BatchItem) (uint64, error) {
 // WriteBatch appends a batch of records under a single fsync, returning the
 // seq of the first record (subsequent records are sequential).
 func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
+	if w.shared != nil {
+		if len(payloads) == 0 {
+			return 0, nil
+		}
+		seq, err := w.shared.AppendBatch(w.stream, payloads)
+		if err == nil {
+			w.sharedLastWritten.Store(seq + uint64(len(payloads)) - 1)
+		}
+		return seq, err
+	}
 	if len(payloads) == 0 {
 		return 0, nil
 	}
@@ -319,6 +393,46 @@ func (w *WAL) WriteBatch(payloads [][]byte) (uint64, error) {
 	}
 
 	return firstSeq, nil
+}
+
+// WriteBatchUnsynced appends without fsync when using the shared WAL.
+func (w *WAL) WriteBatchUnsynced(payloads [][]byte) (uint64, error) {
+	if w.shared == nil {
+		if len(payloads) == 0 {
+			return 0, nil
+		}
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.failed != nil {
+			return 0, w.failed
+		}
+		for i, p := range payloads {
+			if err := validateWALPayloadSize(len(p)); err != nil {
+				return 0, fmt.Errorf("wal: batch item %d: %w", i, err)
+			}
+		}
+		first, err := w.writeRecord(payloads[0])
+		if err != nil {
+			return 0, w.failStop(err)
+		}
+		for _, p := range payloads[1:] {
+			if _, err := w.writeRecord(p); err != nil {
+				return 0, w.failStop(err)
+			}
+		}
+		if err := w.buf.Flush(); err != nil {
+			return 0, w.failStop(fmt.Errorf("wal: batch flush: %w", err))
+		}
+		return first, nil
+	}
+	if len(payloads) == 0 {
+		return 0, nil
+	}
+	seq, err := w.shared.AppendBatchUnsynced(w.stream, payloads)
+	if err == nil {
+		w.sharedLastWritten.Store(seq + uint64(len(payloads)) - 1)
+	}
+	return seq, err
 }
 
 func (w *WAL) writeRecord(payload []byte) (uint64, error) {
@@ -363,6 +477,10 @@ func (w *WAL) Replay(fn func(payload []byte) error) (int, error) {
 // and payload. After replay, NextSeq is advanced past the largest seq seen
 // so subsequent writes stay monotonic.
 func (w *WAL) ReplayWithSeq(fn func(seq uint64, payload []byte) error) (int, error) {
+	if w.shared != nil {
+		stats, err := w.shared.Replay(w.stream, fn)
+		return stats.Records, err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -473,6 +591,9 @@ func (w *WAL) repairTail(lastGoodOffset int64) error {
 // segment. It refuses to run on a failed writer to avoid destroying the only
 // copy of acknowledged-but-unsynced records.
 func (w *WAL) Truncate() error {
+	if w.shared != nil {
+		return w.shared.Checkpoint(w.stream, w.sharedLastWritten.Load())
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -501,6 +622,9 @@ func (w *WAL) Truncate() error {
 
 // Size returns the current on-disk size of the WAL file in bytes.
 func (w *WAL) Size() (int64, error) {
+	if w.shared != nil {
+		return w.shared.Bytes()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -513,6 +637,9 @@ func (w *WAL) Size() (int64, error) {
 
 // Close flushes the buffer, fsyncs, and closes the file.
 func (w *WAL) Close() error {
+	if w.shared != nil {
+		return nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

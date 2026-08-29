@@ -24,12 +24,15 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/query"
 	"github.com/yaop-labs/amber/internal/metricsengine/wal"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
-var ErrNoSamples = errors.New("store: no buffered samples to flush")
-var ErrInvalidLabels = errors.New("store: invalid labels")
-var ErrLabelLimitExceeded = errors.New("store: label limit exceeded")
-var ErrActiveSeriesLimitExceeded = errors.New("store: active series limit exceeded")
+var (
+	ErrNoSamples                 = errors.New("store: no buffered samples to flush")
+	ErrInvalidLabels             = errors.New("store: invalid labels")
+	ErrLabelLimitExceeded        = errors.New("store: label limit exceeded")
+	ErrActiveSeriesLimitExceeded = errors.New("store: active series limit exceeded")
+)
 
 // Store is the durable metrics store: it wraps the append engine with the
 // on-disk catalog, block manifest, directory and resident caches, retention,
@@ -151,22 +154,47 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 			return nil, err
 		}
 	}
-	e, err := engine.OpenWithRegistry(catalog.Registry(), engine.Options{WALPath: filepath.Join(dir, "head.wal")})
-	if err != nil {
-		return nil, err
+	engineOpts := engine.Options{WALPath: filepath.Join(dir, "head.wal")}
+	if opts.SharedWAL != nil {
+		engineOpts.WALPath = ""
+		engineOpts.SharedWAL = opts.SharedWAL
 	}
 	manifest, err := loadManifest(dir)
 	if err != nil {
 		return nil, err
 	}
-	if err := recoverPendingFlushes(dir, &manifest, filepath.Join(dir, "head.wal")); err != nil {
+	legacyWALPath := filepath.Join(dir, "head.wal")
+	if opts.SharedWAL != nil {
+		if err := recoverPendingFlushes(dir, &manifest,
+			func() (bool, error) { return opts.SharedWAL.HasStreamRecords(sharedwal.StreamMetrics) },
+			func() error {
+				return opts.SharedWAL.Checkpoint(sharedwal.StreamMetrics, opts.SharedWAL.LastStreamSeq(sharedwal.StreamMetrics))
+			},
+		); err != nil {
+			return nil, err
+		}
+	}
+	e, err := engine.OpenWithRegistry(catalog.Registry(), engineOpts)
+	if err != nil {
 		return nil, err
+	}
+	if opts.SharedWAL == nil {
+		if err := recoverPendingFlushes(dir, &manifest,
+			func() (bool, error) { return wal.HasRecords(legacyWALPath) }, nil); err != nil {
+			return nil, err
+		}
 	}
 	allowGlobFallback := true
 	if len(manifest.Blocks) == 0 {
-		hasWALRecords, err := wal.HasRecords(filepath.Join(dir, "head.wal"))
-		if err != nil {
-			return nil, err
+		var hasWALRecords bool
+		var walErr error
+		if opts.SharedWAL != nil {
+			hasWALRecords, walErr = opts.SharedWAL.HasStreamRecords(sharedwal.StreamMetrics)
+		} else {
+			hasWALRecords, walErr = wal.HasRecords(legacyWALPath)
+		}
+		if walErr != nil {
+			return nil, walErr
 		}
 		if hasWALRecords {
 			allowGlobFallback = false
@@ -192,7 +220,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		if err := saveCatalog(dir, catalog); err != nil {
 			return nil, err
 		}
-		e, err = engine.OpenWithRegistry(catalog.Registry(), engine.Options{WALPath: filepath.Join(dir, "head.wal")})
+		e, err = engine.OpenWithRegistry(catalog.Registry(), engineOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -464,6 +492,13 @@ func (s *Store) Flush() (string, error) {
 	if err := saveManifest(s.dir, s.manifest); err != nil {
 		return "", err
 	}
+	// Shared WAL reclamation must happen only after the manifest that
+	// publishes these durable blocks is persisted. CommitFlush intentionally
+	// leaves the shared metrics WAL intact until this point so a crash between
+	// block creation and manifest publication remains recoverable.
+	if err := s.engine.CheckpointWAL(); err != nil {
+		return "", err
+	}
 	if meta.SeriesCount == 0 {
 		// Sketch-only flush: drop the empty scalar block.
 		_ = os.Remove(path)
@@ -518,7 +553,7 @@ func clearFlushPendingMarker(blockPath string) error {
 	return syncDir(filepath.Dir(blockPath))
 }
 
-func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error {
+func recoverPendingFlushes(dir string, manifest *Manifest, hasWALRecords func() (bool, error), checkpoint func() error) error {
 	markers, err := filepath.Glob(filepath.Join(dir, "*"+flushPendingSuffix))
 	if err != nil {
 		return err
@@ -531,7 +566,7 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 	for _, meta := range manifest.Blocks {
 		known[meta.Path] = struct{}{}
 	}
-	hasWALRecords, err := wal.HasRecords(walPath)
+	hasRecords, err := hasWALRecords()
 	if err != nil {
 		return err
 	}
@@ -541,12 +576,17 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 		base := strings.TrimSuffix(filepath.Base(marker), flushPendingSuffix)
 		blockPath := filepath.Join(dir, base)
 		if _, ok := known[base]; ok {
+			if checkpoint != nil && hasRecords {
+				if err := checkpoint(); err != nil {
+					return err
+				}
+			}
 			_ = os.Remove(marker)
 			continue
 		}
 		stateBytes, _ := os.ReadFile(marker)
 		state := strings.TrimSpace(string(stateBytes))
-		committed := state == "committed" || !hasWALRecords
+		committed := state == "committed" || !hasRecords
 		if !committed {
 			_ = os.Remove(blockPath)
 			_ = os.Remove(marker)
@@ -590,6 +630,11 @@ func recoverPendingFlushes(dir string, manifest *Manifest, walPath string) error
 		manifest.Blocks = append(manifest.Blocks, adopted)
 		known[base] = struct{}{}
 		changed = true
+		if checkpoint != nil && hasRecords {
+			if err := checkpoint(); err != nil {
+				return err
+			}
+		}
 		_ = os.Remove(marker)
 	}
 	if changed {

@@ -232,8 +232,8 @@ func TestWAL_Replay_Order(t *testing.T) {
 	wal, _ := newTestWAL(t)
 
 	const n = 100
-	for i := 0; i < n; i++ {
-		wal.Write([]byte(fmt.Sprintf("record-%03d", i)))
+	for i := range n {
+		wal.Write(fmt.Appendf(nil, "record-%03d", i))
 	}
 
 	var got []string
@@ -451,7 +451,7 @@ func TestWAL_ConcurrentWrites(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func(id int) {
 			for j := 0; j < perGoroutine; j++ {
-				payload := []byte(fmt.Sprintf("g%d-r%d", id, j))
+				payload := fmt.Appendf(nil, "g%d-r%d", id, j)
 				if _, err := wal.Write(payload); err != nil {
 					t.Errorf("concurrent Write: %v", err)
 				}

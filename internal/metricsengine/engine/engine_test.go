@@ -14,7 +14,57 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/block"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/wal"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
+
+func TestSharedWALUsesSharedFraming(t *testing.T) {
+	dir := t.TempDir()
+	w, err := sharedwal.Open(filepath.Join(dir, "wal"), sharedwal.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := Open(Options{SharedWAL: w})
+	if err != nil {
+		_ = w.Close()
+		t.Fatal(err)
+	}
+	if _, err := e.Append(model.LabelSet{{Name: "job", Value: "api"}}, model.MetricTypeGauge, 1000, 7); err != nil {
+		_ = e.Close()
+		_ = w.Close()
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		_ = w.Close()
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err = sharedwal.Open(filepath.Join(dir, "wal"), sharedwal.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	var seen int
+	stats, err := w.Replay(sharedwal.StreamMetrics, func(_ uint64, payload []byte) error {
+		rec, err := decodeRecord(payload)
+		if err != nil {
+			return err
+		}
+		if rec.kind != kindSeries && rec.kind != kindSample {
+			t.Fatalf("record kind = %d", rec.kind)
+		}
+		seen++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Records != 2 || seen != 2 {
+		t.Fatalf("replayed records = %d/%d, want 2", stats.Records, seen)
+	}
+}
 
 func TestWALReplay(t *testing.T) {
 	dir := t.TempDir()

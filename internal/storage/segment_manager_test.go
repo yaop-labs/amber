@@ -556,8 +556,8 @@ func TestSegmentManager_Checkpoint_NoLossNoDuplicate(t *testing.T) {
 	sm1.active.blockSize = 256
 
 	const n = 300
-	for i := 0; i < n; i++ {
-		data := []byte(fmt.Sprintf("rec-%05d", i))
+	for i := range n {
+		data := fmt.Appendf(nil, "rec-%05d", i)
 		ts := int64(i + 1)
 		if err := sm1.Write(data, ts); err != nil {
 			t.Fatalf("Write[%d]: %v", i, err)
@@ -614,7 +614,7 @@ func TestSegmentManager_Checkpoint_NoLossNoDuplicate(t *testing.T) {
 	if dupes > 0 {
 		t.Errorf("%d records duplicated after recovery", dupes)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if seen[fmt.Sprintf("rec-%05d", i)] == 0 {
 			t.Errorf("record %d lost", i)
 		}

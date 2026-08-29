@@ -85,8 +85,8 @@ func BenchmarkStoreSelectHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.LabelEqual("job", "target"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		series, err := st.Select(selector, query.Options{})
 		if err != nil {
 			b.Fatal(err)
@@ -102,8 +102,8 @@ func BenchmarkStoreSumByLabelHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.MetricName("bench_gauge"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		sum, err := st.SumByLabel(selector, query.Options{}, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -119,8 +119,8 @@ func BenchmarkStoreRateByLabelHighCardinality(b *testing.B) {
 	selector := index.NewSelector(index.MetricName("bench_gauge"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		rates, err := st.RateByLabel(selector, query.Options{}, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -139,8 +139,8 @@ func BenchmarkStoreRateByLabelRangeStepsHighCardinality(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -159,8 +159,8 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockHighCardinality(b *testing.B) 
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -247,8 +247,8 @@ func BenchmarkStoreRateByLabelRangeStepsMultiBlockMaxGapHighCardinality(b *testi
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.RateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -267,8 +267,8 @@ func BenchmarkStoreAggregateByLabelRangeStepsHighCardinality(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -287,8 +287,8 @@ func BenchmarkStoreAggregateByLabelRangeStepsMultiBlockHighCardinality(b *testin
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -307,8 +307,8 @@ func BenchmarkStoreAggregateByLabelRangeStepsSequentialBlocksHighCardinality(b *
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 4000, 9000, time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -327,8 +327,8 @@ func BenchmarkStoreAggregateByLabelRangeStepsBucketBlocks(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		steps, err := st.AggregateByLabelRangeSteps(rangeSelector, 63_000, 127_000, 64*time.Second, "job")
 		if err != nil {
 			b.Fatal(err)
@@ -438,9 +438,9 @@ func buildBenchStoreBlocks(b *testing.B, seriesCount int, samplesPerSeries int, 
 		_ = st.Close()
 	})
 
-	for blockIndex := 0; blockIndex < blockCount; blockIndex++ {
+	for blockIndex := range blockCount {
 		samples := make([]model.Sample, 0, seriesCount*samplesPerSeries/blockCount)
-		for series := 0; series < seriesCount; series++ {
+		for series := range seriesCount {
 			job := "other"
 			if series%100 == 0 {
 				job = "target"

@@ -155,6 +155,7 @@ func (w *WAL) AppendBatchUnsynced(records []Record) error {
 
 // Sync flushes any pending writes to disk. Paired with AppendBatchUnsynced
 // for group commit: many unsynced writes followed by one Sync.
+
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -375,6 +376,7 @@ type RecoverStats struct {
 	// dropped (and, for RecoverReplay, physically truncated). 0 means the
 	// file ended cleanly.
 	TruncatedBytes int64
+	CorruptRecords uint64
 }
 
 // Replay calls fn for every valid record in order. A corrupted or torn tail
@@ -471,6 +473,7 @@ func replayValid(path string, fn func(Record) error, repair bool) (RecoverStats,
 		return stats, err
 	}
 	stats.TruncatedBytes = info.Size() - validEnd
+	stats.CorruptRecords = 1
 
 	if repair && stats.TruncatedBytes > 0 {
 		if err := file.Truncate(validEnd); err != nil {

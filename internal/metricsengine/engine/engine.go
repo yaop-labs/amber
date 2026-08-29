@@ -1,6 +1,6 @@
 // Package engine ties the metrics WAL, the in-memory head, and the flush
 // protocol together. Appends are durable on return (WAL fsync precedes the head
-// update); a flush snapshots the head into a block and truncates the WAL under
+// update); a flush snapshots the head into a block and checkpoints the WAL under
 // a gate that excludes concurrent appends so no acknowledged sample is lost.
 package engine
 
@@ -16,13 +16,16 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
 	"github.com/yaop-labs/amber/internal/metricsengine/wal"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 // Options configures a metrics engine. A zero WALPath runs the engine purely
 // in memory with no durability.
 type Options struct {
 	WALPath string
-	// WALFlushInterval bounds how long AppendBatch waits for a batched fsync.
+	// SharedWAL uses amber's process-wide segmented WAL instead of a private
+	// metrics WAL file. It is mutually exclusive with WALPath.
+	SharedWAL        *sharedwal.WAL
 	WALFlushInterval time.Duration
 }
 
@@ -33,6 +36,8 @@ type Engine struct {
 	registry  *index.Registry
 	head      *head.Head
 	wal       *wal.WAL
+	walPath   string
+	sharedWAL *sharedwal.WAL
 	committer *committer
 
 	// flushGate excludes flushes from in-flight appends. An append holds the
@@ -96,12 +101,38 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 		declared:   make(map[index.SeriesID]struct{}),
 		sketchHead: make(map[index.SeriesID]*sketchBuf),
 	}
-	if opts.WALPath != "" {
-		// RecoverReplay tolerates a corrupt or torn tail (crash mid-write):
-		// it replays the valid prefix and truncates the garbage in place so
-		// the WAL stays appendable and replayable. A hard error here would
-		// make the store unopenable after any torn write.
-		stats, err := wal.RecoverReplay(opts.WALPath, e.replayRecord)
+	if opts.SharedWAL != nil && opts.WALPath != "" {
+		return nil, errors.New("engine: SharedWAL and WALPath are mutually exclusive")
+	}
+	if opts.SharedWAL != nil {
+		stats, err := opts.SharedWAL.Replay(sharedwal.StreamMetrics, func(_ uint64, payload []byte) error {
+			rec, err := decodeRecord(payload)
+			if err != nil {
+				return err
+			}
+			return e.replayRecord(rec)
+		})
+		if err != nil {
+			return nil, err
+		}
+		e.walRecovery = wal.RecoverStats{Records: stats.Records, TruncatedBytes: stats.TruncatedBytes, CorruptRecords: stats.CorruptRecords}
+		e.sharedWAL = opts.SharedWAL
+		e.committer = newCommitter(func(records []record) error {
+			payloads := make([][]byte, len(records))
+			for i, rec := range records {
+				payload, err := encodeRecord(rec)
+				if err != nil {
+					return err
+				}
+				payloads[i] = payload
+			}
+			_, err := e.sharedWAL.AppendBatchUnsynced(sharedwal.StreamMetrics, payloads)
+			return err
+		}, e.sharedWAL.Sync, opts.WALFlushInterval)
+	} else if opts.WALPath != "" {
+		stats, err := wal.RecoverReplay(opts.WALPath, func(legacy wal.Record) error {
+			return e.replayRecord(fromLegacyRecord(legacy))
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -111,37 +142,74 @@ func OpenWithRegistry(registry *index.Registry, opts Options) (*Engine, error) {
 			return nil, err
 		}
 		e.wal = w
-		e.committer = newCommitter(w, opts.WALFlushInterval)
+		e.walPath = opts.WALPath
+		e.committer = newCommitter(func(records []record) error {
+			legacy := make([]wal.Record, 0, len(records))
+			for _, rec := range records {
+				legacy = append(legacy, legacyRecord(rec))
+			}
+			return w.AppendBatchUnsynced(legacy)
+		}, w.Sync, opts.WALFlushInterval)
 	}
 	return e, nil
 }
 
-// replayRecord applies one WAL record during open.
-func (e *Engine) replayRecord(record wal.Record) error {
-	switch record.Kind {
+func fromLegacyRecord(r wal.Record) record {
+	kind := kindSample
+	switch r.Kind {
 	case wal.KindSeries:
-		id := index.SeriesID(record.ID)
-		e.registry.Import(id, record.Labels)
+		kind = kindSeries
+	case wal.KindLegacySample:
+		kind = kindLegacySample
+	case wal.KindSketchExp:
+		kind = kindSketchExp
+	case wal.KindSketchExplicit:
+		kind = kindSketchExplicit
+	}
+	return record{kind: kind, id: r.ID, labels: r.Labels, typ: r.Type, timestamp: r.Timestamp, value: r.Value, payload: r.Payload}
+}
+
+func legacyRecord(r record) wal.Record {
+	kind := wal.KindSample
+	switch r.kind {
+	case kindSeries:
+		kind = wal.KindSeries
+	case kindSample:
+		kind = wal.KindSample
+	case kindSketchExp:
+		kind = wal.KindSketchExp
+	case kindSketchExplicit:
+		kind = wal.KindSketchExplicit
+	}
+	return wal.Record{Kind: kind, ID: r.id, Labels: r.labels, Type: r.typ, Timestamp: r.timestamp, Value: r.value, Payload: r.payload}
+}
+
+// replayRecord applies one WAL record during open.
+func (e *Engine) replayRecord(record record) error {
+	switch record.kind {
+	case kindSeries:
+		id := index.SeriesID(record.id)
+		e.registry.Import(id, record.labels)
 		// The series record is still in the WAL after replay (truncate only
 		// happens on flush), so it stays declared for this generation.
 		e.declared[id] = struct{}{}
 		return nil
-	case wal.KindSample:
-		id := index.SeriesID(record.ID)
+	case kindSample:
+		id := index.SeriesID(record.id)
 		labels, ok := e.registry.Labels(id)
 		if !ok {
 			e.walUnknownSeries++
 			return nil
 		}
-		e.head.AppendWithID(id, labels, record.Type, record.Timestamp, record.Value)
+		e.head.AppendWithID(id, labels, record.typ, record.timestamp, record.value)
 		return nil
-	case wal.KindLegacySample:
-		e.head.Append(record.Labels, record.Type, record.Timestamp, record.Value)
+	case kindLegacySample:
+		e.head.Append(record.labels, record.typ, record.timestamp, record.value)
 		return nil
-	case wal.KindSketchExp, wal.KindSketchExplicit:
+	case kindSketchExp, kindSketchExplicit:
 		return e.replaySketchRecord(record)
 	default:
-		return fmt.Errorf("engine: unknown WAL record kind %d", record.Kind)
+		return fmt.Errorf("engine: unknown WAL record kind %d", record.kind)
 	}
 }
 
@@ -187,7 +255,7 @@ func (e *Engine) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 	// of goroutine interleaving. The fsync wait happens after the lock is
 	// released, so concurrent appenders still share one group commit.
 	e.walMu.Lock()
-	records := make([]wal.Record, 0, len(samples))
+	records := make([]record, 0, len(samples))
 	for i, sample := range samples {
 		labels := sample.Labels.Canonical()
 		id := e.registry.GetOrCreateAt(labels, sample.Timestamp)
@@ -195,14 +263,14 @@ func (e *Engine) AppendBatch(samples []model.Sample) ([]index.SeriesID, error) {
 		canonical[i] = labels
 		if _, ok := e.declared[id]; !ok {
 			e.declared[id] = struct{}{}
-			records = append(records, wal.Record{Kind: wal.KindSeries, ID: uint64(id), Labels: labels})
+			records = append(records, record{kind: kindSeries, id: uint64(id), labels: labels})
 		}
-		records = append(records, wal.Record{
-			Kind:      wal.KindSample,
-			ID:        uint64(id),
-			Type:      sample.Type,
-			Timestamp: sample.Timestamp,
-			Value:     sample.Value,
+		records = append(records, record{
+			kind:      kindSample,
+			id:        uint64(id),
+			typ:       sample.Type,
+			timestamp: sample.Timestamp,
+			value:     sample.Value,
 		})
 	}
 	seq, err := e.committer.enqueue(records)
@@ -272,7 +340,7 @@ func (e *Engine) PrepareFlushBlock(path string) error {
 	return nil
 }
 
-// CommitFlush resets the head and truncates the WAL, then releases the gate
+// CommitFlush resets the head and checkpoints the WAL, then releases the gate
 // taken by PrepareFlushBlock.
 func (e *Engine) CommitFlush() error {
 	defer e.releaseGate()
@@ -324,6 +392,25 @@ func (e *Engine) commitFlushLocked() error {
 	return nil
 }
 
+// LastWALSeq returns the highest sequence written by this metrics stream.
+// For the shared WAL this is used to advance the metrics checkpoint only
+// after the corresponding block and manifest have been made durable.
+func (e *Engine) LastWALSeq() uint64 {
+	if e.sharedWAL == nil {
+		return 0
+	}
+	return e.sharedWAL.LastStreamSeq(sharedwal.StreamMetrics)
+}
+
+// CheckpointWAL advances the shared metrics WAL checkpoint. Legacy WALs are
+// already truncated by CommitFlush and need no second checkpoint operation.
+func (e *Engine) CheckpointWAL() error {
+	if e.sharedWAL == nil {
+		return nil
+	}
+	return e.sharedWAL.Checkpoint(sharedwal.StreamMetrics, e.LastWALSeq())
+}
+
 func (e *Engine) BufferedSeries() int {
 	return e.head.Len()
 }
@@ -360,6 +447,18 @@ func (e *Engine) WALRecoveryStats() wal.RecoverStats {
 // UnknownWALSeries counts replayed samples skipped because their series ID
 // could not be resolved to labels (WAL series record and catalog both
 // missing). Zero in normal operation.
+
+// HasWALRecords reports whether the engine's WAL stream currently contains records.
+func (e *Engine) HasWALRecords() (bool, error) {
+	if e.sharedWAL != nil {
+		return e.sharedWAL.HasStreamRecords(sharedwal.StreamMetrics)
+	}
+	if e.wal != nil {
+		return wal.HasRecords(e.walPath)
+	}
+	return false, nil
+}
+
 func (e *Engine) UnknownWALSeries() int {
 	return e.walUnknownSeries
 }

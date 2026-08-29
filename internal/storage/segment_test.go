@@ -70,7 +70,7 @@ func TestSegmentWriter_RecordCount(t *testing.T) {
 	sw, _ := OpenSegmentWriter(path)
 
 	for i := 0; i < 10; i++ {
-		sw.WriteRecord([]byte(fmt.Sprintf("record-%d", i)), nowNano())
+		sw.WriteRecord(fmt.Appendf(nil, "record-%d", i), nowNano())
 	}
 
 	if sw.RecordCount() != 10 {
@@ -152,7 +152,7 @@ func TestSegment_RoundTrip_MultipleRecords(t *testing.T) {
 	base := time.Now().UnixNano()
 
 	for i := 0; i < n; i++ {
-		records[i] = []byte(fmt.Sprintf("log entry number %d with some content", i))
+		records[i] = fmt.Appendf(nil, "log entry number %d with some content", i)
 		timestamps[i] = base + int64(i)*int64(time.Millisecond)
 	}
 
@@ -254,7 +254,7 @@ func TestSegment_Footer_BlockOffsets(t *testing.T) {
 	sw.blockSize = 100
 
 	base := nowNano()
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		data := bytes.Repeat([]byte("x"), 20)
 		sw.WriteRecord(data, base+int64(i))
 	}
