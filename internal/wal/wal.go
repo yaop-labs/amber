@@ -861,7 +861,8 @@ func (w *WAL) loadCheckpoints() error {
 	if err != nil {
 		return err
 	}
-	if len(data) != 4+2+6*8 {
+	const checkpointSize = 4 + 2 + 3*8
+	if len(data) != checkpointSize {
 		return fmt.Errorf("wal: invalid checkpoints file")
 	}
 	if binary.LittleEndian.Uint32(data[0:4]) != checkpointMagic || binary.LittleEndian.Uint16(data[4:6]) != checkpointVersion {

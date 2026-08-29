@@ -4,15 +4,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/yaop-labs/amber/internal/metricsengine/wal"
 )
 
 // committer batches WAL fsync calls across concurrent writers.
 // Append returns after the caller's sequence is covered by a completed Sync.
 type committer struct {
-	wal           *wal.WAL
-	flushInterval time.Duration
+	appendBatchUnsynced func([]record) error
+	sync                func() error
+	flushInterval       time.Duration
 
 	mu sync.Mutex
 	// nextSeq is assigned to the next append. tick advances syncedSeq to
@@ -28,15 +27,16 @@ type committer struct {
 	done           chan struct{} // closed by the goroutine on exit
 }
 
-func newCommitter(w *wal.WAL, flushInterval time.Duration) *committer {
+func newCommitter(appendBatchUnsynced func([]record) error, syncFn func() error, flushInterval time.Duration) *committer {
 	if flushInterval <= 0 {
 		flushInterval = 5 * time.Millisecond
 	}
 	c := &committer{
-		wal:           w,
-		flushInterval: flushInterval,
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
+		appendBatchUnsynced: appendBatchUnsynced,
+		sync:                syncFn,
+		flushInterval:       flushInterval,
+		stop:                make(chan struct{}),
+		done:                make(chan struct{}),
 	}
 	c.pending = sync.NewCond(&c.mu)
 	go c.run()
@@ -46,7 +46,7 @@ func newCommitter(w *wal.WAL, flushInterval time.Duration) *committer {
 // Append writes records to the WAL and waits until they are fsynced.
 // On error, the caller should treat ingest as failed and leave in-memory state
 // unchanged.
-func (c *committer) Append(records []wal.Record) error {
+func (c *committer) Append(records []record) error {
 	seq, err := c.enqueue(records)
 	if err != nil {
 		return err
@@ -58,7 +58,7 @@ func (c *committer) Append(records []wal.Record) error {
 // the sequence to pass to waitSynced. Callers that must control file order
 // across goroutines (series-before-sample) serialize their enqueue calls and
 // wait outside the serializing lock, preserving group commit.
-func (c *committer) enqueue(records []wal.Record) (uint64, error) {
+func (c *committer) enqueue(records []record) (uint64, error) {
 	if len(records) == 0 {
 		return 0, nil
 	}
@@ -76,7 +76,7 @@ func (c *committer) enqueue(records []wal.Record) (uint64, error) {
 	mySeq := c.nextSeq
 	c.mu.Unlock()
 
-	if err := c.wal.AppendBatchUnsynced(records); err != nil {
+	if err := c.appendBatchUnsynced(records); err != nil {
 		// Publish the sequence so later syncs can advance waiters past a
 		// failed append.
 		c.mu.Lock()
@@ -158,7 +158,7 @@ func (c *committer) tick() error {
 	if target <= already {
 		return nil
 	}
-	err := c.wal.Sync()
+	err := c.sync()
 	if err != nil {
 		c.fail(err)
 		return err

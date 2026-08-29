@@ -17,6 +17,7 @@ import (
 	"github.com/yaop-labs/amber/internal/otlpv4"
 	"github.com/yaop-labs/amber/internal/query"
 	"github.com/yaop-labs/amber/internal/storage"
+	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 func TestStatusReportsDegradedReasonsAndClosing(t *testing.T) {
@@ -44,7 +45,7 @@ func TestStatusReportsDegradedReasonsAndClosing(t *testing.T) {
 	}
 }
 
-func TestStatusReportsMetricsWALRepair(t *testing.T) {
+func TestStatusReportsSharedWALRepair(t *testing.T) {
 	dataDir := t.TempDir()
 	journal, err := otlpv4.OpenJournal(dataDir, storage.DefaultRotationPolicy)
 	if err != nil {
@@ -53,11 +54,30 @@ func TestStatusReportsMetricsWALRepair(t *testing.T) {
 	if err := journal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	metricsDir := filepath.Join(dataDir, "metrics")
-	if err := os.MkdirAll(metricsDir, 0o755); err != nil {
+	walDir := filepath.Join(dataDir, "wal")
+	w, err := sharedwal.Open(walDir, sharedwal.Options{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(metricsDir, "head.wal"), []byte{1, 2, 3}, 0o644); err != nil {
+	// A valid metrics record followed by a torn shared-WAL tail exercises
+	// recovery of the single process-wide WAL, not the retired head.wal file.
+	seriesPayload := []byte{1, 1, 1, 3, 'j', 'o', 'b', 3, 'a', 'p', 'i'}
+	if _, err := w.Append(sharedwal.StreamMetrics, seriesPayload); err != nil {
+		_ = w.Close()
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(walDir, "wal-00000001.awl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{1, 2, 3}); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,8 +94,8 @@ func TestStatusReportsMetricsWALRepair(t *testing.T) {
 	}()
 
 	got := stack.Status()
-	if !got.Degraded || !statusHasReason(got, "metrics_wal_tail_repaired", 1) {
-		t.Fatalf("status = %+v, want metrics_wal_tail_repaired degraded reason", got)
+	if !got.Degraded || !statusHasReason(got, "wal_tail_repaired", 1) {
+		t.Fatalf("status = %+v, want wal_tail_repaired degraded reason", got)
 	}
 }
 

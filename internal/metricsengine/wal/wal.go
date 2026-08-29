@@ -12,10 +12,8 @@ import (
 	"io"
 	"os"
 	"sync"
-	"sync/atomic"
 
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
-	sharedwal "github.com/yaop-labs/amber/internal/wal"
 )
 
 const maxRecordSize = 16 << 20
@@ -74,10 +72,6 @@ type WAL struct {
 	// appended past it would be silently lost. Either way the durable state
 	// is unknowable; no further append may be acknowledged. Guarded by mu.
 	failed error
-
-	shared            *sharedwal.WAL
-	stream            sharedwal.Stream
-	sharedLastWritten atomic.Uint64
 }
 
 // failStop records a fatal writer error; every subsequent append returns it.
@@ -99,17 +93,6 @@ func Open(path string) (*WAL, error) {
 	return &WAL{path: path, file: file}, nil
 }
 
-// NewShared returns a metrics WAL facade backed by the shared amber WAL.
-// The shared WAL is owned by the runtime, not by this facade.
-func NewShared(shared *sharedwal.WAL) (*WAL, error) {
-	if shared == nil {
-		return nil, errors.New("wal: shared WAL is nil")
-	}
-	w := &WAL{shared: shared, stream: sharedwal.StreamMetrics}
-	w.sharedLastWritten.Store(shared.LastStreamSeq(sharedwal.StreamMetrics))
-	return w, nil
-}
-
 func (w *WAL) Append(record Record) error {
 	return w.AppendBatch([]Record{record})
 }
@@ -118,9 +101,6 @@ func (w *WAL) Append(record Record) error {
 // nil return means the batch is durable. A write or fsync failure fail-stops
 // the WAL.
 func (w *WAL) AppendBatch(records []Record) error {
-	if w.shared != nil {
-		return w.appendShared(records, true)
-	}
 	if len(records) == 0 {
 		return nil
 	}
@@ -150,9 +130,6 @@ func (w *WAL) AppendBatch(records []Record) error {
 // AppendBatchUnsynced writes records without fsync.
 // The caller must call Sync before treating the records as durable.
 func (w *WAL) AppendBatchUnsynced(records []Record) error {
-	if w.shared != nil {
-		return w.appendShared(records, false)
-	}
 	if len(records) == 0 {
 		return nil
 	}
@@ -178,36 +155,8 @@ func (w *WAL) AppendBatchUnsynced(records []Record) error {
 
 // Sync flushes any pending writes to disk. Paired with AppendBatchUnsynced
 // for group commit: many unsynced writes followed by one Sync.
-func (w *WAL) appendShared(records []Record, syncNow bool) error {
-	if len(records) == 0 {
-		return nil
-	}
-	payloads := make([][]byte, len(records))
-	for i, record := range records {
-		encoded, err := encodeRecord(record)
-		if err != nil {
-			return err
-		}
-		payloads[i] = encoded
-	}
-	var seq uint64
-	var err error
-	if syncNow {
-		seq, err = w.shared.AppendBatch(w.stream, payloads)
-	} else {
-		seq, err = w.shared.AppendBatchUnsynced(w.stream, payloads)
-	}
-	if err != nil {
-		return err
-	}
-	w.sharedLastWritten.Store(seq + uint64(len(payloads)) - 1)
-	return nil
-}
 
 func (w *WAL) Sync() error {
-	if w.shared != nil {
-		return w.shared.Sync()
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.failed != nil {
@@ -390,9 +339,6 @@ func (r *byteReader) str() string {
 // Truncate resets the WAL to empty, called after a flush durably commits its
 // records to a block. It refuses to run on a failed writer.
 func (w *WAL) Truncate() error {
-	if w.shared != nil {
-		return w.shared.Checkpoint(sharedwal.StreamMetrics, w.sharedLastWritten.Load())
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	// A failed writer may hold acked records the disk never got; truncating
@@ -411,21 +357,7 @@ func (w *WAL) Truncate() error {
 	return nil
 }
 
-// Shared returns the shared WAL when this facade uses one.
-func (w *WAL) Shared() *sharedwal.WAL { return w.shared }
-
-// LastWrittenSeq returns the last sequence allocated for this metrics stream.
-// It is zero for a legacy WAL facade because that format does not expose a
-// durable global sequence to the shared checkpoint layer.
-func (w *WAL) LastWrittenSeq() uint64 { return w.sharedLastWritten.Load() }
-
-// Path returns the legacy WAL path, or empty for shared WAL.
-func (w *WAL) Path() string { return w.path }
-
 func (w *WAL) Close() error {
-	if w.shared != nil {
-		return nil
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file == nil {
@@ -463,32 +395,6 @@ func Replay(path string, fn func(Record) error) error {
 // future replays. Use this (not Replay) before opening the WAL for append.
 func RecoverReplay(path string, fn func(Record) error) (RecoverStats, error) {
 	return replayValid(path, fn, true)
-}
-
-// RecoverReplayShared replays only metrics records from the shared WAL.
-func RecoverReplayShared(w *sharedwal.WAL, fn func(Record) error) (RecoverStats, error) {
-	if w == nil {
-		return RecoverStats{}, errors.New("wal: shared WAL is nil")
-	}
-	var stats RecoverStats
-	rs, err := w.Replay(sharedwal.StreamMetrics, func(_ uint64, payload []byte) error {
-		rec, err := decodeRecord(payload)
-		if err != nil {
-			return err
-		}
-		stats.Records++
-		return fn(rec)
-	})
-	stats.TruncatedBytes = rs.TruncatedBytes
-	stats.CorruptRecords = rs.CorruptRecords
-	return stats, err
-}
-
-func HasRecordsShared(w *sharedwal.WAL) (bool, error) {
-	if w == nil {
-		return false, errors.New("wal: shared WAL is nil")
-	}
-	return w.HasStreamRecords(sharedwal.StreamMetrics)
 }
 
 func replayValid(path string, fn func(Record) error, repair bool) (RecoverStats, error) {

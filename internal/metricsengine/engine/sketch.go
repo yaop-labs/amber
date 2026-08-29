@@ -11,7 +11,6 @@ import (
 	"github.com/yaop-labs/amber/internal/metricsengine/histogram"
 	"github.com/yaop-labs/amber/internal/metricsengine/index"
 	"github.com/yaop-labs/amber/internal/metricsengine/model"
-	"github.com/yaop-labs/amber/internal/metricsengine/wal"
 )
 
 // SketchSample is one histogram tick to ingest: exactly one of Exp/Explicit
@@ -62,7 +61,7 @@ func (e *Engine) AppendSketches(samples []SketchSample) ([]index.SeriesID, error
 	canonical := make([]model.LabelSet, len(samples))
 
 	e.walMu.Lock()
-	records := make([]wal.Record, 0, len(samples))
+	records := make([]record, 0, len(samples))
 	for i, s := range samples {
 		labels := s.Labels.Canonical()
 		id := e.registry.GetOrCreateAt(labels, s.Timestamp)
@@ -70,15 +69,15 @@ func (e *Engine) AppendSketches(samples []SketchSample) ([]index.SeriesID, error
 		canonical[i] = labels
 		if _, ok := e.declared[id]; !ok {
 			e.declared[id] = struct{}{}
-			records = append(records, wal.Record{Kind: wal.KindSeries, ID: uint64(id), Labels: labels})
+			records = append(records, record{kind: kindSeries, id: uint64(id), labels: labels})
 		}
-		rec := wal.Record{ID: uint64(id), Timestamp: s.Timestamp}
+		rec := record{id: uint64(id), timestamp: s.Timestamp}
 		if s.Exp != nil {
-			rec.Kind = wal.KindSketchExp
-			rec.Payload = histogram.AppendSketch(nil, s.Exp)
+			rec.kind = kindSketchExp
+			rec.payload = histogram.AppendSketch(nil, s.Exp)
 		} else {
-			rec.Kind = wal.KindSketchExplicit
-			rec.Payload = histogram.EncodeExplicitTick(s.Explicit)
+			rec.kind = kindSketchExplicit
+			rec.payload = histogram.EncodeExplicitTick(s.Explicit)
 		}
 		records = append(records, rec)
 	}
@@ -112,23 +111,23 @@ func (e *Engine) appendSketchLocked(id index.SeriesID, labels model.LabelSet, s 
 }
 
 // replaySketchRecord applies one sketch WAL record during open.
-func (e *Engine) replaySketchRecord(record wal.Record) error {
-	id := index.SeriesID(record.ID)
+func (e *Engine) replaySketchRecord(record record) error {
+	id := index.SeriesID(record.id)
 	labels, ok := e.registry.Labels(id)
 	if !ok {
 		e.walUnknownSeries++
 		return nil
 	}
-	s := SketchSample{Labels: labels, Timestamp: record.Timestamp}
-	switch record.Kind {
-	case wal.KindSketchExp:
-		sk, _, err := histogram.DecodeSketch(record.Payload)
+	s := SketchSample{Labels: labels, Timestamp: record.timestamp}
+	switch record.kind {
+	case kindSketchExp:
+		sk, _, err := histogram.DecodeSketch(record.payload)
 		if err != nil {
 			return err
 		}
 		s.Exp = sk
-	case wal.KindSketchExplicit:
-		h, err := histogram.DecodeExplicitTick(record.Payload)
+	case kindSketchExplicit:
+		h, err := histogram.DecodeExplicitTick(record.payload)
 		if err != nil {
 			return err
 		}

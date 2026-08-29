@@ -166,7 +166,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	legacyWALPath := filepath.Join(dir, "head.wal")
 	if opts.SharedWAL != nil {
 		if err := recoverPendingFlushes(dir, &manifest,
-			func() (bool, error) { return wal.HasRecordsShared(opts.SharedWAL) },
+			func() (bool, error) { return opts.SharedWAL.HasStreamRecords(sharedwal.StreamMetrics) },
 			func() error {
 				return opts.SharedWAL.Checkpoint(sharedwal.StreamMetrics, opts.SharedWAL.LastStreamSeq(sharedwal.StreamMetrics))
 			},
@@ -189,7 +189,7 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		var hasWALRecords bool
 		var walErr error
 		if opts.SharedWAL != nil {
-			hasWALRecords, walErr = wal.HasRecordsShared(opts.SharedWAL)
+			hasWALRecords, walErr = opts.SharedWAL.HasStreamRecords(sharedwal.StreamMetrics)
 		} else {
 			hasWALRecords, walErr = wal.HasRecords(legacyWALPath)
 		}
