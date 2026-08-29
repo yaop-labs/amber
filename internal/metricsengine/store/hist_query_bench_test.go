@@ -142,7 +142,7 @@ func BenchmarkHistogramQuantile_qm3(b *testing.B) {
 	f := buildHistFixture(b)
 	sel := index.NewSelector(index.MetricName("request_latency_seconds"))
 	tr := histogram.TimeRange{Start: f.lastTS - 5*60_000, End: f.lastTS}
-	
+
 	for b.Loop() {
 		if _, err := f.st.HistogramQuantile(sel, 0.99, tr); err != nil {
 			b.Fatal(err)
@@ -159,7 +159,7 @@ func BenchmarkHistogramQuantileBy_qm3(b *testing.B) {
 	sel := index.NewSelector(index.MetricName("request_latency_seconds"))
 	tr := histogram.TimeRange{Start: f.lastTS - 5*60_000, End: f.lastTS}
 	by := []string{"service"}
-	
+
 	for b.Loop() {
 		out, err := f.st.HistogramQuantileBy(sel, 0.99, tr, by)
 		if err != nil {

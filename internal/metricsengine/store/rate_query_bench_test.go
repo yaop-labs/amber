@@ -167,7 +167,7 @@ func BenchmarkRateByLabelRange_qm1(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("service", time.Minute)
 	warmCaches(b, func() error { _, err := f.st.RateByLabelRange(rs, f.lastTS, by); return err })
-	
+
 	for b.Loop() {
 		out, err := f.st.RateByLabelRange(rs, f.lastTS, by)
 		if err != nil {
@@ -185,7 +185,7 @@ func BenchmarkRateByLabelRange_qm4(b *testing.B) {
 	f := buildFixture(b)
 	rs, by := benchRangeSelector("route", time.Minute)
 	warmCaches(b, func() error { _, err := f.st.RateByLabelRange(rs, f.lastTS, by); return err })
-	
+
 	for b.Loop() {
 		out, err := f.st.RateByLabelRange(rs, f.lastTS, by)
 		if err != nil {
@@ -207,7 +207,7 @@ func BenchmarkRateByLabelRangeSteps_qm2(b *testing.B) {
 	from := f.lastTS - 5*60_000
 	step := 45 * time.Second
 	warmCaches(b, func() error { _, err := f.st.RateByLabelRangeSteps(rs, from, f.lastTS, step, by); return err })
-	
+
 	for b.Loop() {
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, f.lastTS, step, by)
 		if err != nil {
@@ -235,7 +235,7 @@ func BenchmarkRateByLabelRangeSteps_qm2_campaign(b *testing.B) {
 		step = time.Second
 	}
 	warmCaches(b, func() error { _, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by); return err })
-	
+
 	for b.Loop() {
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by)
 		if err != nil {
@@ -262,7 +262,7 @@ func BenchmarkRateByLabelRangeSteps_qm2_campaign_cold(b *testing.B) {
 	if step < time.Second {
 		step = time.Second
 	}
-	
+
 	for b.Loop() {
 		f.st.testResetCaches()
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, to, step, by)
@@ -282,7 +282,7 @@ func BenchmarkRateByLabelRangeSteps_qm2_wide(b *testing.B) {
 	rs, by := benchRangeSelector("service", time.Minute)
 	from := f.baseTS
 	step := 45 * time.Second
-	
+
 	for b.Loop() {
 		steps, err := f.st.RateByLabelRangeSteps(rs, from, f.lastTS, step, by)
 		if err != nil {

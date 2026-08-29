@@ -61,7 +61,6 @@ func BenchmarkStats_I1Shape(b *testing.B) {
 		}
 	}
 
-	
 	for b.Loop() {
 		if _, err := st.Stats(); err != nil {
 			b.Fatal(err)
